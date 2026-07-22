@@ -17,9 +17,10 @@ tokio.workspace = true
 reqwest.workspace = true
 corrode-core.workspace = true
 
-# Embedded graph+vector store. Optional so the base workspace builds without the
-# heavy vendored compile (mimalloc, LMDB/heed, the HelixQL compiler). Enable with
-# `--features helix` for the real in-process embed.
+# Embedded graph+vector store, pinned via the git submodule at third_party/helix-db
+# (tag v2.3.5). Optional so the base workspace builds without the heavy vendored
+# compile. Enable with `--features helix`. NOTE: upstream helix-db uses native-tls,
+# so `--features helix` needs system OpenSSL + pkg-config at build time (see CLAUDE.md).
 [dependencies.helix-db]
 path = "../../third_party/helix-db/helix-db"
 optional = true
