@@ -17,12 +17,16 @@ pub struct Client {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
+    max_output_tokens: u32,
 }
 
 #[derive(Serialize)]
 struct ResponsesRequest<'a> {
     model: &'a str,
     input: &'a str,
+    /// Hard cap on generated tokens. Without it a slow model generates until EOS
+    /// and one subagent can hog the GPU for minutes, starving the rest of the swarm.
+    max_output_tokens: u32,
     // ponytail: hipfire carries scheduler priority on the internal WorkloadSpec,
     // but the exact HTTP wire field for per-request priority isn't a stable
     // documented header yet — passing it in `metadata` and confirming against the
@@ -50,10 +54,17 @@ struct ModelEntry {
 
 impl Client {
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
+        // ponytail: one cap for every call. Split per-role (a planner wants more
+        // than a research skim) once we tune it.
+        let max_output_tokens = std::env::var("CORRODE_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into(),
             api_key,
+            max_output_tokens,
         }
     }
 
@@ -78,6 +89,7 @@ impl Client {
         let req = ResponsesRequest {
             model,
             input,
+            max_output_tokens: self.max_output_tokens,
             metadata: serde_json::json!({ "hipfire_priority": priority.as_u8() }),
         };
         let mut rb = self
