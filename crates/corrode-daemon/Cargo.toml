@@ -1,0 +1,33 @@
+[package]
+name = "corrode-daemon"
+version = "0.0.0"
+edition.workspace = true
+# AGPL-3.0, NOT Apache: the `helix` feature links HelixDB's helix_engine in-process,
+# and HelixDB is AGPL-3.0. In-process linking makes this binary a derivative work,
+# so the daemon inherits AGPL (network-use clause included, since it serves the web
+# UI). corrode-core and corrode-web link nothing GPL and stay Apache-2.0.
+license = "AGPL-3.0"
+description = "The Corrode agent daemon: hipfire swarm, graph<->git VFS, embedded HelixDB."
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+corrode-core.workspace = true
+
+# Embedded graph+vector store. Optional so the base workspace builds without the
+# heavy vendored compile (mimalloc, LMDB/heed, the HelixQL compiler). Enable with
+# `--features helix` for the real in-process embed.
+[dependencies.helix-db]
+path = "../../third_party/helix-db/helix-db"
+optional = true
+
+[features]
+default = []
+helix = ["dep:helix-db"]
+
+[[bin]]
+name = "corrode-daemon"
+path = "src/main.rs"

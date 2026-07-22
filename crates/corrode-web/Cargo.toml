@@ -1,0 +1,14 @@
+[package]
+name = "corrode-web"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true  # Apache-2.0: serves the UI and proxies to the daemon; links no GPL.
+description = "Web server: serves the Corrode wasm webui and bridges it to the daemon."
+
+[dependencies]
+corrode-core.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "corrode-web"
+path = "src/main.rs"
