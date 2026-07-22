@@ -86,9 +86,15 @@ phase 1 asks the orchestration model for a JSON plan; phase 2 (`parse_plan` +
 `to_tasks`) turns it into role-tagged `Task`s, each on its role's model and a band
 derived from the role (`band_for`: orchestration→Realtime, architect/coder/review→
 Default, research→Opportunistic). Then the swarm fans them out. Empty/unparseable
-plan degrades to one coder task on the raw prompt. Not yet done: prepending a
-shared context prefix to every subtask so hipfire batches them prefix-shared for
-KV reuse (the `ponytail:` in `orchestration_prompt`).
+plan degrades to one coder task on the raw prompt.
+
+Every prompt in a turn — the orchestration call and each subagent — begins with a
+byte-identical **context prefix** (`Daemon::context_prefix`), so hipfire batches
+them prefix-shared and reuses KV when they land on the same model. The divergent
+role/task goes in the tail; nothing role-specific precedes the prefix. The
+`to_tasks` test guards this invariant. Remaining ponytail: the prefix is a shallow
+VFS root listing — the graph-backed VFS will supply richer, relevance-ranked
+context (hipfire embeddings/rerank picking nodes) without changing the sharing shape.
 
 ## Licensing — read before touching the daemon
 

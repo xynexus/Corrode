@@ -115,13 +115,17 @@ impl Daemon {
     /// each on its role's model and band. If the model returns nothing parseable,
     /// degrade to a single coder task on the raw prompt.
     async fn plan(&self, text: &str, priority: Priority) -> anyhow::Result<Vec<Task>> {
+        // Built once and shared, byte-identical, by the planning call and every
+        // subagent, so hipfire batches them prefix-shared and reuses KV.
+        let prefix = self.context_prefix();
+
         let orch_model = self
             .roles
             .model_for(Role::Orchestration)
             .unwrap_or_default()
             .to_string();
         let plan_task = Task {
-            prompt: planner::orchestration_prompt(text),
+            prompt: planner::orchestration_prompt(&prefix, text),
             priority,
             model: orch_model,
         };
@@ -137,20 +141,42 @@ impl Daemon {
 
         let plan = planner::parse_plan(&plan_text);
         if plan.is_empty() {
-            // ponytail: degrade to one coder task on the raw prompt so a plan the
-            // model couldn't structure still gets attempted rather than dropped.
-            Ok(vec![Task {
-                prompt: text.to_string(),
-                priority,
-                model: self
-                    .roles
-                    .model_for(Role::Coder)
-                    .unwrap_or_default()
-                    .to_string(),
-            }])
+            // ponytail: degrade to one coder task on the raw prompt (still behind
+            // the shared prefix) so a plan the model couldn't structure still gets
+            // attempted rather than dropped.
+            Ok(planner::to_tasks(
+                vec![planner::PlannedSubtask {
+                    role: Role::Coder,
+                    prompt: text.to_string(),
+                }],
+                &self.roles,
+                &prefix,
+            ))
         } else {
-            Ok(planner::to_tasks(plan, &self.roles))
+            Ok(planner::to_tasks(plan, &self.roles, &prefix))
         }
+    }
+
+    /// The shared context prefix prepended to every prompt in a Prompt turn.
+    ///
+    /// ponytail: a shallow repo digest (VFS root listing) plus a fixed preamble.
+    /// The graph-backed VFS will supply richer, relevance-ranked context here
+    /// (hipfire embeddings/rerank picking which nodes) — but the KV-sharing shape
+    /// is already right: identical bytes across the whole swarm, task in the tail.
+    fn context_prefix(&self) -> String {
+        let mut s = String::from(
+            "You are a subagent in the Corrode coding-agent swarm working on a shared \
+repository. Repository root:\n",
+        );
+        match self.vfs.list("") {
+            Ok(entries) => {
+                for e in entries {
+                    s.push_str(&format!("  {} ({} bytes)\n", e.path, e.bytes));
+                }
+            }
+            Err(_) => s.push_str("  (listing unavailable)\n"),
+        }
+        s
     }
 }
 
