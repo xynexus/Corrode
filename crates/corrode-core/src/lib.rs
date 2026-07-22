@@ -83,6 +83,10 @@ pub enum ProjectionMode {
 pub struct FileNodeView {
     /// git-compliant path, e.g. `src/swarm.rs`.
     pub path: String,
+    /// True for a directory entry. Files and dirs both appear in a listing, and a
+    /// FUSE mount / the explorer must tell them apart (an empty file also has 0
+    /// bytes, so size can't stand in for kind).
+    pub is_dir: bool,
     pub bytes: u64,
     /// Backing HelixDB node id, so the explorer can pivot file -> graph.
     pub node_id: Option<String>,

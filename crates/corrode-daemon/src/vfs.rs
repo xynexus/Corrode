@@ -80,6 +80,7 @@ impl Vfs for PassthroughVfs {
                 };
                 entries.push(FileNodeView {
                     path: rel,
+                    is_dir: meta.is_dir(),
                     bytes: if meta.is_file() { meta.len() } else { 0 },
                     node_id: None, // ponytail: set once entries are backed by graph nodes.
                     mode: None,    // ponytail: passthrough can't know; set by the graph-backed VFS.
@@ -98,6 +99,7 @@ impl Vfs for PassthroughVfs {
             let meta = std::fs::metadata(&full)?;
             Ok(FileNodeView {
                 path,
+                is_dir: meta.is_dir(),
                 bytes: if meta.is_file() { meta.len() } else { 0 },
                 node_id: None,
                 mode: None,
