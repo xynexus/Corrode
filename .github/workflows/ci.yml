@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # The optional helix-db path dependency's manifest must resolve even for
           # the base build (it isn't compiled unless --features helix). No nested
