@@ -28,9 +28,29 @@ corrode-core.workspace = true
 path = "../../third_party/helix-db/helix-db"
 optional = true
 
+# FUSE mount of the Vfs, so git and subagent shells see the graph<->git projection
+# as a real filesystem. Pure-protocol crate (no libfuse-dev); needs fusermount3 at
+# runtime. `unprivileged` lets the daemon mount without root (via fusermount3).
+# Optional — off by default, like helix.
+[dependencies.fuse3]
+version = "0.9"
+features = ["tokio-runtime", "unprivileged"]
+optional = true
+
+# Pulled in only by the `fuse` feature: `bytes` for ReplyData, `libc` for errno
+# constants and getuid/getgid on the mount owner.
+[dependencies.bytes]
+version = "1"
+optional = true
+
+[dependencies.libc]
+version = "0.2"
+optional = true
+
 [features]
 default = []
 helix = ["dep:helix-db"]
+fuse = ["dep:fuse3", "dep:bytes", "dep:libc"]
 
 [[bin]]
 name = "corrode-daemon"

@@ -10,6 +10,8 @@
 //! there).
 
 mod daemon;
+#[cfg(feature = "fuse")]
+mod fuse;
 mod graph;
 mod hipfire;
 mod planner;
@@ -59,6 +61,22 @@ async fn main() -> anyhow::Result<()> {
     let graph = open_graph();
     let vfs = Box::new(PassthroughVfs::new(&repo_root));
     let daemon = Daemon::new(Swarm::new(client, 32), roles, graph, vfs);
+
+    // Optional FUSE mount of the repo VFS (--features fuse, CORRODE_MOUNT=<dir>), so
+    // git and subagent shells see the projection as a real tree. Runs alongside the
+    // daemon; a second passthrough over the same root is fine (it's stateless).
+    // ponytail: share one Arc<dyn Vfs> between the loop and the mount once the
+    // graph-backed VFS carries state the two must agree on.
+    #[cfg(feature = "fuse")]
+    if let Ok(mountpoint) = std::env::var("CORRODE_MOUNT") {
+        let mount_vfs = std::sync::Arc::new(PassthroughVfs::new(&repo_root));
+        tokio::spawn(async move {
+            if let Err(e) = fuse::mount(mount_vfs, &mountpoint).await {
+                eprintln!("FUSE mount at {mountpoint} ended: {e}");
+            }
+        });
+        eprintln!("FUSE: mounting repo VFS at {}", std::env::var("CORRODE_MOUNT").unwrap());
+    }
 
     server::serve(daemon, &addr).await
 }
