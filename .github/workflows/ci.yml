@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The optional helix-db path dependency's manifest must resolve even for
+          # the base build (it isn't compiled unless --features helix). No nested
+          # submodules, so a shallow, non-recursive fetch is enough.
+          submodules: true
+      # ubuntu-latest ships a stable Rust toolchain; no setup step needed.
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked

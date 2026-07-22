@@ -1,5 +1,8 @@
 # Corrode
 
+[![CI](https://github.com/xynexus/Corrode/actions/workflows/ci.yml/badge.svg)](https://github.com/xynexus/Corrode/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0%20%26%20AGPL--3.0-blue)](LICENSE)
+
 A swarming coding agent built on the [hipfire](../hipfire) inference daemon, with
 an embedded [HelixDB](https://github.com/HelixDB/helix-db) graph+vector store.
 
