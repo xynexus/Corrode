@@ -8,6 +8,7 @@
 //! built), and the VFS.
 
 use crate::graph::GraphStore;
+use crate::planner;
 use crate::roles::{Role, RoleModels};
 use crate::swarm::{Swarm, Task};
 use crate::vfs::Vfs;
@@ -52,7 +53,18 @@ impl Daemon {
     async fn handle(&self, cmd: AgentCommand, events: &mpsc::Sender<AgentEvent>) {
         match cmd {
             AgentCommand::Prompt { text, priority } => {
-                for (id, result) in self.swarm.run(self.plan_prompt(&text, priority)).await {
+                let tasks = match self.plan(&text, priority).await {
+                    Ok(tasks) => tasks,
+                    Err(e) => {
+                        let _ = events
+                            .send(AgentEvent::Error {
+                                message: format!("planning failed: {e}"),
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                for (id, result) in self.swarm.run(tasks).await {
                     let ev = match result {
                         Ok(text) => AgentEvent::SubagentOutput { id: id as u64, text },
                         Err(e) => AgentEvent::Error { message: e.to_string() },
@@ -96,24 +108,49 @@ impl Daemon {
         }
     }
 
-    /// Turn a prompt into swarm tasks.
+    /// Decompose a prompt into role-tagged swarm tasks.
     ///
-    /// ponytail: one task on the orchestration model. The real planner — the reason
-    /// this is a *swarm* — has the orchestration model decompose the prompt into
-    /// many role-tagged subagents (research/architect/coder/review), each on its
-    /// role's model and priority band, sharing a context prefix for KV reuse. The
-    /// loop above already fans out whatever this returns.
-    fn plan_prompt(&self, text: &str, priority: Priority) -> Vec<Task> {
-        let model = self
+    /// Phase 1: the orchestration model produces a plan (at the request's band).
+    /// Phase 2: [`planner::parse_plan`] + [`planner::to_tasks`] turn it into tasks,
+    /// each on its role's model and band. If the model returns nothing parseable,
+    /// degrade to a single coder task on the raw prompt.
+    async fn plan(&self, text: &str, priority: Priority) -> anyhow::Result<Vec<Task>> {
+        let orch_model = self
             .roles
             .model_for(Role::Orchestration)
             .unwrap_or_default()
             .to_string();
-        vec![Task {
-            prompt: text.to_string(),
+        let plan_task = Task {
+            prompt: planner::orchestration_prompt(text),
             priority,
-            model,
-        }]
+            model: orch_model,
+        };
+        let plan_text = self
+            .swarm
+            .run(vec![plan_task])
+            .await
+            .into_iter()
+            .next()
+            .map(|(_, r)| r)
+            .transpose()?
+            .unwrap_or_default();
+
+        let plan = planner::parse_plan(&plan_text);
+        if plan.is_empty() {
+            // ponytail: degrade to one coder task on the raw prompt so a plan the
+            // model couldn't structure still gets attempted rather than dropped.
+            Ok(vec![Task {
+                prompt: text.to_string(),
+                priority,
+                model: self
+                    .roles
+                    .model_for(Role::Coder)
+                    .unwrap_or_default()
+                    .to_string(),
+            }])
+        } else {
+            Ok(planner::to_tasks(plan, &self.roles))
+        }
     }
 }
 

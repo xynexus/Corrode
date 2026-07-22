@@ -40,6 +40,19 @@ impl Role {
             Role::Review => "review",
         }
     }
+
+    /// Parse a role name (case-insensitive). Unknown -> None; callers decide the
+    /// fallback (the planner defaults unknown roles to Coder).
+    pub fn from_str(s: &str) -> Option<Role> {
+        match s.trim().to_lowercase().as_str() {
+            "research" => Some(Role::Research),
+            "orchestration" => Some(Role::Orchestration),
+            "architect" => Some(Role::Architect),
+            "coder" => Some(Role::Coder),
+            "review" => Some(Role::Review),
+            _ => None,
+        }
+    }
 }
 
 /// Resolved `role -> model id`. Every role is populated after [`RoleModels::resolve`].

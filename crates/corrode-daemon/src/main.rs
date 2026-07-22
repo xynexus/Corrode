@@ -12,6 +12,7 @@
 mod daemon;
 mod graph;
 mod hipfire;
+mod planner;
 mod roles;
 mod swarm;
 mod vfs;
