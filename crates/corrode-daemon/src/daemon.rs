@@ -92,7 +92,7 @@ impl Daemon {
                 let _ = events.send(ev).await;
             }
             AgentCommand::ListDir { path } => {
-                let ev = match self.vfs.list(&path) {
+                let ev = match self.vfs.list(&path).await {
                     Ok(entries) => AgentEvent::DirListing { path, entries },
                     Err(e) => AgentEvent::Error { message: e.to_string() },
                 };
@@ -117,7 +117,7 @@ impl Daemon {
     async fn plan(&self, text: &str, priority: Priority) -> anyhow::Result<Vec<Task>> {
         // Built once and shared, byte-identical, by the planning call and every
         // subagent, so hipfire batches them prefix-shared and reuses KV.
-        let prefix = self.context_prefix();
+        let prefix = self.context_prefix().await;
 
         let orch_model = self
             .roles
@@ -163,12 +163,12 @@ impl Daemon {
     /// The graph-backed VFS will supply richer, relevance-ranked context here
     /// (hipfire embeddings/rerank picking which nodes) — but the KV-sharing shape
     /// is already right: identical bytes across the whole swarm, task in the tail.
-    fn context_prefix(&self) -> String {
+    async fn context_prefix(&self) -> String {
         let mut s = String::from(
             "You are a subagent in the Corrode coding-agent swarm working on a shared \
 repository. Repository root:\n",
         );
-        match self.vfs.list("") {
+        match self.vfs.list("").await {
             Ok(entries) => {
                 for e in entries {
                     s.push_str(&format!("  {} ({} bytes)\n", e.path, e.bytes));
