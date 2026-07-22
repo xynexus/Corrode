@@ -63,4 +63,41 @@ pub mod embedded {
             anyhow::bail!("doc_search: not implemented yet")
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A fresh, process-unique store directory that doesn't yet exist —
+        /// `HelixGraphStorage::new` does its own `create_dir_all`.
+        fn scratch_dir(tag: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!("corrode-helix-{}-{tag}", std::process::id()))
+        }
+
+        #[test]
+        fn open_creates_store_persists_and_serves_as_graphstore() {
+            let dir = scratch_dir("open");
+            std::fs::remove_dir_all(&dir).ok(); // start clean if a prior run crashed
+            let path = dir.to_str().unwrap();
+
+            // Opening in-process actually initializes the LMDB env + tables — this is
+            // the real proof that vendored helix_engine links and runs, not a stub.
+            let store = HelixStore::open(path).expect("open fresh store");
+            assert!(dir.is_dir(), "open should have created the store dir");
+
+            // Reopening the same path must succeed against the existing env (persistence).
+            drop(store);
+            let reopened = HelixStore::open(path).expect("reopen existing store");
+
+            // It satisfies the daemon's trait object, the way the Daemon actually holds it.
+            let store: Box<dyn GraphStore> = Box::new(reopened);
+            // ponytail: neighbors/doc_search are still stubs — assert the seam is wired
+            // (real handle, error surfaces through the trait). Flip these to positive
+            // assertions when the traversal_core / vector_core queries land.
+            assert!(store.neighbors("does-not-exist").is_err());
+            assert!(store.doc_search("anything", 4).is_err());
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
 }

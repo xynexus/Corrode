@@ -7,3 +7,6 @@ description = "Shared protocol types between the Corrode daemon, web server, and
 
 [dependencies]
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
