@@ -43,6 +43,40 @@ impl TryFrom<u8> for Priority {
     }
 }
 
+/// Why a Rust file that should have been *composed* (regenerated from graph nodes)
+/// instead fell back to verbatim flat+overlay: its parse -> regenerate round-trip
+/// wasn't byte-identical. Typed (not a free-text string) so fallbacks *aggregate* —
+/// "30 of 37 fallbacks are `MacroExpansion`" is the weak-projector signal. A growing
+/// fallback set is surfaced deliberately, never a silent degrade.
+// ponytail: no producer yet — emitted by the composed-Rust ingest round-trip check
+// (parse -> regenerate -> diff) when the graph-backed VFS lands. See the design memo.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FallbackReason {
+    /// `#[rustfmt::skip]` — the region is intentionally non-canonical.
+    RustfmtSkip,
+    /// A macro invocation whose expansion the projector can't reproduce verbatim.
+    MacroExpansion,
+    /// A raw/byte string literal that didn't survive regeneration byte-for-byte.
+    RawStringMismatch,
+    /// Attribute placement rustfmt won't canonicalize to the projector's form.
+    AttributePlacement,
+    /// Uncategorized divergence — carries the first byte offset where regeneration
+    /// diverged from the original, i.e. the file to go read.
+    UnknownDivergence { first_diff_offset: u64 },
+}
+
+/// How the VFS backs a given file. `Composed` is Rust regenerated from graph nodes
+/// with a verified byte-identical round-trip; `Overlay` is the *native* flat-node +
+/// function-overlay mode (C/C++/Python/Bash/Markdown), source of truth on disk;
+/// `OverlayFallback` is Rust that attempted composition but failed its round-trip
+/// and dropped to overlay — the reason is what makes the fallback set visible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectionMode {
+    Composed,
+    Overlay,
+    OverlayFallback(FallbackReason),
+}
+
 /// A file materialized by the VFS from a graph node — what the repo/graph explorer
 /// renders and what a subagent shell sees on disk.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,6 +86,10 @@ pub struct FileNodeView {
     pub bytes: u64,
     /// Backing HelixDB node id, so the explorer can pivot file -> graph.
     pub node_id: Option<String>,
+    /// How the VFS backs this file, so the explorer can flag which Rust files
+    /// silently dropped to overlay. `None` until the graph-backed VFS sets it
+    /// (the filesystem passthrough can't know), mirroring `node_id`.
+    pub mode: Option<ProjectionMode>,
 }
 
 /// A HelixDB graph node projected for the explorer (graph view side of the UI).
@@ -88,4 +126,48 @@ pub enum AgentEvent {
     /// Explorer: entries under a listed directory.
     DirListing { path: String, entries: Vec<FileNodeView> },
     Error { message: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_mode_round_trips_through_json() {
+        // The explorer parses this off the wire, so every variant — including the
+        // nested reason with its payload — must survive serialize -> deserialize.
+        let cases = [
+            ProjectionMode::Composed,
+            ProjectionMode::Overlay,
+            ProjectionMode::OverlayFallback(FallbackReason::RustfmtSkip),
+            ProjectionMode::OverlayFallback(FallbackReason::MacroExpansion),
+            ProjectionMode::OverlayFallback(FallbackReason::RawStringMismatch),
+            ProjectionMode::OverlayFallback(FallbackReason::AttributePlacement),
+            ProjectionMode::OverlayFallback(FallbackReason::UnknownDivergence {
+                first_diff_offset: 4096,
+            }),
+        ];
+        for mode in cases {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: ProjectionMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, back, "round-trip changed {json}");
+        }
+    }
+
+    #[test]
+    fn projection_mode_wire_shape_is_externally_tagged() {
+        // Pin the exact JSON the webui contract depends on; a stray serde attribute
+        // (rename/tagging change) would break the front-end silently otherwise.
+        assert_eq!(
+            serde_json::to_string(&ProjectionMode::Composed).unwrap(),
+            r#""Composed""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ProjectionMode::OverlayFallback(
+                FallbackReason::UnknownDivergence { first_diff_offset: 7 }
+            ))
+            .unwrap(),
+            r#"{"OverlayFallback":{"UnknownDivergence":{"first_diff_offset":7}}}"#
+        );
+    }
 }

@@ -68,6 +68,7 @@ impl Vfs for PassthroughVfs {
                 path: rel,
                 bytes: if meta.is_file() { meta.len() } else { 0 },
                 node_id: None, // ponytail: set once entries are backed by graph nodes.
+                mode: None,    // ponytail: passthrough can't know; set by the graph-backed VFS.
             });
         }
         entries.sort_by(|a, b| a.path.cmp(&b.path));
