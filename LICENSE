@@ -1,0 +1,44 @@
+Corrode — licensing
+
+This repository is multi-licensed by component. Each crate declares its own
+license in its Cargo.toml; this file explains the split and why it exists. Full
+license texts are in LICENSE-APACHE (Apache-2.0) and LICENSE-AGPL-3.0 (AGPL-3.0).
+
+Summary
+-------
+
+  Component                     License        SPDX
+  ---------                     -------        ----
+  crates/corrode-core           Apache-2.0     Apache-2.0
+  crates/corrode-web            Apache-2.0     Apache-2.0
+  crates/corrode-daemon         AGPL-3.0       AGPL-3.0-only
+  third_party/helix-db          AGPL-3.0       (submodule; upstream HelixDB)
+  third_party/helix-skills      MIT            (vendored; upstream HelixDB)
+
+Why the daemon is AGPL-3.0
+--------------------------
+
+corrode-daemon links HelixDB (third_party/helix-db, AGPL-3.0) in-process via its
+`helix_engine` when built with `--features helix`. In-process linking makes the
+daemon a derivative work of an AGPL program, so the daemon — and any binary built
+from it — is governed by AGPL-3.0. AGPL's network clause applies: if you run a
+modified corrode-daemon and let users interact with it over a network (it serves
+the web UI), you must offer those users the daemon's corresponding source.
+
+corrode-core and corrode-web link nothing under the GPL and are Apache-2.0. Keep
+them that way — do not add helix-db (or any GPL dependency) to them.
+
+If AGPL is unacceptable for your use, the options are a commercial HelixDB
+license, or replacing the in-process embed with a separate HelixDB process the
+daemon talks to over a socket (no in-process linking, so no derivative work).
+
+Third-party components
+----------------------
+
+  third_party/helix-db     HelixDB, (C) HelixDB authors, AGPL-3.0. Included as a
+                           git submodule pinned to tag v2.3.5; see its own LICENSE.
+  third_party/helix-skills HelixDB agent skills, MIT. Vendored; each skill retains
+                           its MIT header and attribution.
+
+Contributions to this repository are accepted under the license of the crate they
+touch (Apache-2.0 for core/web, AGPL-3.0 for the daemon).
