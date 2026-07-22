@@ -28,13 +28,17 @@ pub fn App() -> impl IntoView {
 
     let cmd_tx = ws::spawn_agent(agent_ws_url(), shared.clone(), log, entries);
 
-    // Hand the egui panels the canvas once Leptos has mounted it.
+    // Hand the egui panels the canvas (once Leptos mounts it) plus the command
+    // sender, so terminal keystrokes flow back out as `TerminalInput`.
     let canvas_ref = NodeRef::<html::Canvas>::new();
-    Effect::new(move |_| {
-        if let Some(canvas) = canvas_ref.get() {
-            egui_panel::start(canvas, shared.clone());
-        }
-    });
+    {
+        let egui_tx = cmd_tx.clone();
+        Effect::new(move |_| {
+            if let Some(canvas) = canvas_ref.get() {
+                egui_panel::start(canvas, shared.clone(), egui_tx.clone());
+            }
+        });
+    }
 
     let prompt = RwSignal::new(String::new());
 
