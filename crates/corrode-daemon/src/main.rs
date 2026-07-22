@@ -5,18 +5,21 @@
 //! GraphRAG). It exposes an API (websocket/HTTP, `corrode_core` messages) that the
 //! separate `corrode-web` server drives on behalf of the wasm webui.
 //!
-//! This entry point is still the smoke path: it fans out one three-band task set.
-//! The real daemon loop (accept `AgentCommand`, plan, swarm, stream `AgentEvent`)
-//! is the next build.
+//! This entry point drives the command loop over an in-process channel pair — a
+//! stand-in for the `corrode-web` websocket bridge. It feeds a few sample
+//! `AgentCommand`s, then prints the `AgentEvent`s the daemon streams back.
 
+mod daemon;
 mod graph;
 mod hipfire;
 mod swarm;
 mod vfs;
 
+use corrode_core::{AgentCommand, Priority};
+use daemon::Daemon;
 use hipfire::{Client, DEFAULT_BASE_URL};
-use corrode_core::Priority;
-use swarm::{Swarm, Task};
+use swarm::Swarm;
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,33 +29,39 @@ async fn main() -> anyhow::Result<()> {
     let model = std::env::var("CORRODE_MODEL").unwrap_or_else(|_| "qwen3.5:9b".to_string());
 
     // ponytail: HelixDB opens here once wired — `graph::embedded::HelixStore::open(path)`
-    // behind `--features helix`. Store path from CORRODE_GRAPH_DIR. Left out of the
-    // smoke path so the default build stays light.
+    // behind `--features helix` (path from CORRODE_GRAPH_DIR) — and gets handed to
+    // `Daemon::new` so DocQuery/VFS handlers can reach it.
 
-    let client = Client::new(base_url, api_key);
-    let swarm = Swarm::new(client, model, 32);
+    let daemon = Daemon::new(Swarm::new(Client::new(base_url, api_key), model, 32));
 
-    let tasks = vec![
-        Task {
-            prompt: "Say READY.".into(),
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+
+    // Stand-in for the web bridge: enqueue sample commands, then close the channel
+    // so the loop drains and exits.
+    for cmd in [
+        AgentCommand::Prompt {
+            text: "Say READY.".into(),
             priority: Priority::Realtime,
         },
-        Task {
-            prompt: "Summarize this repo in one line.".into(),
-            priority: Priority::Default,
+        AgentCommand::TerminalInput {
+            session: "demo".into(),
+            data: b"echo hi\n".to_vec(),
         },
-        Task {
-            prompt: "Speculatively list refactors worth exploring.".into(),
-            priority: Priority::Opportunistic,
+        AgentCommand::DocQuery {
+            question: "What is Corrode?".into(),
         },
-    ];
-
-    for (i, result) in swarm.run(tasks).await {
-        match result {
-            Ok(text) => println!("[{i}] {text}"),
-            Err(e) => eprintln!("[{i}] error: {e}"),
-        }
+    ] {
+        cmd_tx.send(cmd).await?;
     }
+    drop(cmd_tx);
+
+    let loop_handle = tokio::spawn(async move { daemon.run(cmd_rx, ev_tx).await });
+
+    while let Some(event) = ev_rx.recv().await {
+        println!("{event:?}");
+    }
+    loop_handle.await?;
     Ok(())
 }
 
