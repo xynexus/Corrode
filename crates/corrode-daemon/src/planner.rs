@@ -22,19 +22,27 @@ use serde::Deserialize;
 /// ponytail: fixed cap; make it budget-aware once we track per-request cost.
 const MAX_SUBTASKS: usize = 8;
 
-/// Instruction handed to the orchestration model. Asks for a strict JSON plan.
-///
-/// ponytail: no shared context prefix yet. The KV-reuse win (see CLAUDE.md) comes
-/// from prepending the same repo/context digest to every subtask prompt so hipfire
-/// batches them prefix-shared — add that when the VFS feeds real context in.
-pub fn orchestration_prompt(user_prompt: &str) -> String {
+/// Instruction handed to the orchestration model, behind the shared context
+/// prefix. Placing `context_prefix` first — byte-identical to every subtask's
+/// prefix (see [`to_tasks`]) — lets hipfire batch the planning call and the
+/// subagents prefix-shared and reuse their KV cache, when they land on the same
+/// model. Only the tail (instructions, then the user request) diverges.
+pub fn orchestration_prompt(context_prefix: &str, user_prompt: &str) -> String {
     format!(
-        "You are the orchestrator of a coding-agent swarm. Decompose the user's \
-request into a small set of subtasks, each assigned to one role from: research, \
-architect, coder, review. Reply with ONLY a JSON array, no prose, each element \
+        "{context_prefix}\n\n\
+You are the orchestrator of a coding-agent swarm. Decompose the user's request \
+into a small set of subtasks, each assigned to one role from: research, architect, \
+coder, review. Reply with ONLY a JSON array, no prose, each element \
 {{\"role\": <role>, \"task\": <self-contained instruction>}}. Use at most {MAX_SUBTASKS} \
 subtasks.\n\nUser request:\n{user_prompt}"
     )
+}
+
+/// Compose one subagent prompt: the shared prefix, then the divergent role+task
+/// tail. The prefix must be byte-identical across the whole swarm for KV reuse, so
+/// nothing role-specific goes before it.
+fn subagent_prompt(context_prefix: &str, role: Role, task: &str) -> String {
+    format!("{context_prefix}\n\n[role: {}]\n{task}", role.as_str())
 }
 
 #[derive(Deserialize)]
@@ -89,13 +97,14 @@ pub fn band_for(role: Role) -> Priority {
     }
 }
 
-/// Map planned subtasks to runnable swarm tasks (role -> model, role -> band).
-pub fn to_tasks(plan: Vec<PlannedSubtask>, roles: &RoleModels) -> Vec<Task> {
+/// Map planned subtasks to runnable swarm tasks (role -> model, role -> band),
+/// each prompt built as `context_prefix` + role/task tail so the swarm shares KV.
+pub fn to_tasks(plan: Vec<PlannedSubtask>, roles: &RoleModels, context_prefix: &str) -> Vec<Task> {
     plan.into_iter()
         .map(|s| Task {
             model: roles.model_for(s.role).unwrap_or_default().to_string(),
             priority: band_for(s.role),
-            prompt: s.prompt,
+            prompt: subagent_prompt(context_prefix, s.role, &s.prompt),
         })
         .collect()
 }
@@ -118,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn to_tasks_assigns_role_model_and_band() {
+    fn to_tasks_assigns_role_model_band_and_shares_prefix() {
         let roles = {
             let mut r = RoleModels::default();
             r.0.insert(Role::Coder, "coder-model".to_string());
@@ -129,11 +138,20 @@ mod tests {
             PlannedSubtask { role: Role::Coder, prompt: "x".into() },
             PlannedSubtask { role: Role::Research, prompt: "y".into() },
         ];
-        let tasks = to_tasks(plan, &roles);
+        let prefix = "SHARED-CONTEXT-DIGEST";
+        let tasks = to_tasks(plan, &roles, prefix);
+
         assert_eq!(tasks[0].model, "coder-model");
         assert_eq!(tasks[0].priority, Priority::Default);
         assert_eq!(tasks[1].model, "research-model");
         assert_eq!(tasks[1].priority, Priority::Opportunistic); // research fills idle
+
+        // KV-reuse invariant: every subagent prompt begins with the identical
+        // prefix; only the tail (role/task) differs.
+        assert!(tasks.iter().all(|t| t.prompt.starts_with(prefix)));
+        assert!(tasks[0].prompt.contains("[role: coder]"));
+        assert!(tasks[1].prompt.contains("[role: research]"));
+        assert_ne!(tasks[0].prompt, tasks[1].prompt);
     }
 
     #[test]
