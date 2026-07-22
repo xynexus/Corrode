@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Corrode — dev bridge</title>
+<style>
+  body { font: 14px ui-monospace, monospace; margin: 2rem; background:#111417; color:#e7ecef; }
+  h1 { font-size: 1rem; color:#2dd4bf; }
+  input, button { font: inherit; padding: 6px 8px; background:#171b20; color:#e7ecef; border:1px solid #29313a; border-radius:6px; }
+  button { color:#2dd4bf; cursor:pointer; }
+  #log { white-space: pre-wrap; margin-top:1rem; border-top:1px solid #29313a; padding-top:1rem; }
+  .ev { color:#9aa5af; } .err { color:#ef4444; }
+</style>
+<h1>corrode-web · dev bridge</h1>
+<p class="ev">Placeholder page — NOT the wasm webui. It only proves the browser → web → daemon → hipfire pipe.</p>
+<div>
+  <input id="prompt" size="48" placeholder="prompt for the swarm" value="Reply with exactly: READY" />
+  <button onclick="sendPrompt()">Prompt</button>
+  <button onclick="send({ListDir:{path:''}})">ListDir</button>
+  <button onclick="send({DocQuery:{question:'What is Corrode?'}})">DocQuery</button>
+</div>
+<div id="log"></div>
+<script>
+  const log = (m, cls) => { const d = document.createElement('div'); d.textContent = m; if (cls) d.className = cls; document.getElementById('log').prepend(d); };
+  const ws = new WebSocket(`ws://${location.host}/agent`);
+  ws.onopen = () => log('connected to /agent', 'ev');
+  ws.onclose = () => log('disconnected', 'err');
+  ws.onmessage = (e) => { const ev = JSON.parse(e.data); log(JSON.stringify(ev), ev.Error ? 'err' : 'ev'); };
+  const send = (cmd) => ws.readyState === 1 ? ws.send(JSON.stringify(cmd)) : log('not connected', 'err');
+  // Priority is the raw scheduler band: 0 realtime / 64 default / 255 opportunistic.
+  const sendPrompt = () => send({ Prompt: { text: document.getElementById('prompt').value, priority: 0 } });
+</script>

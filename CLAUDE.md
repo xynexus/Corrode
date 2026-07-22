@@ -39,22 +39,33 @@ third_party/helix-skills# vendored HelixDB agent skills (MIT); Rust-relevant one
 cargo build                                  # base workspace (no HelixDB compile)
 cargo test                                   # unit tests
 cargo test -p corrode-daemon <name>          # single test
-cargo run -p corrode-daemon                  # smoke swarm against hipfire
+cargo run -p corrode-daemon                  # serve the daemon ws at ws://127.0.0.1:7878/agent
 cargo build -p corrode-daemon --features helix   # HEAVY: compiles vendored HelixDB (mimalloc/LMDB/HelixQL). Enables the real in-process store.
-cargo run  -p corrode-web                    # web server stub
+cargo run  -p corrode-web                    # serve UI on http://127.0.0.1:8787, proxy /agent -> daemon
 ```
+
+Run the pair: start `corrode-daemon` (needs `hipfire serve` up for role resolution),
+then `corrode-web`, then open http://127.0.0.1:8787 — the dev page drives the
+swarm over the bridge.
 
 Env: `HIPFIRE_BASE_URL` (default `http://127.0.0.1:11435`), `HIPFIRE_API_KEY`,
 `CORRODE_MODEL` (offline fallback model for all roles), `CORRODE_ROLES` (path to a
 JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`),
-`CORRODE_GRAPH_DIR` (HelixDB path under `--features helix`). A running
-`hipfire serve` is needed for `cargo run` to do anything real.
+`CORRODE_GRAPH_DIR` (HelixDB path under `--features helix`),
+`CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
+`CORRODE_WEB_ADDR` (web bind, default `127.0.0.1:8787`), `CORRODE_DAEMON_URL`
+(daemon ws the web proxies to). A running `hipfire serve` is needed for the
+daemon to resolve roles at startup.
 
-## Command loop & daemon state
+## Command loop, transport & daemon state
 
 `daemon.rs` is the transport-agnostic loop: drain `AgentCommand` off an mpsc
-channel, dispatch, stream `AgentEvent` back — same loop for the in-process demo in
-`main` and the future `corrode-web` websocket bridge. The `Daemon` owns the
+channel, dispatch, stream `AgentEvent` back. `server.rs` puts it on a WebSocket —
+the daemon serves `/agent`, bridging each connection's frames to a per-connection
+channel pair over the shared `Daemon`. `corrode-web` serves the UI and *proxies*
+`/agent` to the daemon (browser → web → daemon), keeping the daemon private; the
+same loop serves both. Frames are the serde-JSON encoding of the enums (externally
+tagged, e.g. `{"Prompt":{"text":"...","priority":0}}`). The `Daemon` owns the
 host-side state handlers reach via `&self`: the `Swarm`, the `RoleModels`
 assignments, an `Option<Box<dyn GraphStore>>` (HelixDB; `None` without
 `--features helix`), and a `Box<dyn Vfs>`. Dispatch: `Prompt`→swarm, `ListDir`→vfs
