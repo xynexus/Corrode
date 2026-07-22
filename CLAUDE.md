@@ -54,8 +54,10 @@ JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`),
 `CORRODE_GRAPH_DIR` (HelixDB path under `--features helix`),
 `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
 `CORRODE_WEB_ADDR` (web bind, default `127.0.0.1:8787`), `CORRODE_DAEMON_URL`
-(daemon ws the web proxies to). A running `hipfire serve` is needed for the
-daemon to resolve roles at startup.
+(daemon ws the web proxies to), `CORRODE_MAX_TOKENS` (per-call output cap,
+default 1024). The hipfire background daemon must be up (`hipfire start`, not just
+`serve` — `serve` is only the HTTP frontend) for the daemon to resolve roles and
+generate.
 
 ## Command loop, transport & daemon state
 
