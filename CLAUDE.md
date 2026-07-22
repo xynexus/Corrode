@@ -26,7 +26,7 @@ written yet. Grep `ponytail:` for every deliberate seam and its upgrade trigger.
 
 ```
 crates/corrode-core     # shared wire types (Priority, AgentCommand/Event, node DTOs). Links nothing heavy; wasm-safe.
-crates/corrode-daemon   # the agent (AGPL-3.0 — see below). modules: daemon (command loop), swarm, roles, hipfire, vfs, graph
+crates/corrode-daemon   # the agent (AGPL-3.0 — see below). modules: daemon (command loop), planner, swarm, roles, hipfire, vfs, graph
 crates/corrode-web      # web server stub (Apache-2.0)
 webui/                  # wasm front-end seam (out of the cargo workspace; its own trunk/wasm-pack build)
 third_party/helix-db    # git submodule: HelixDB pinned at v2.3.5 (AGPL-3.0), linked in-process behind the `helix` feature
@@ -66,8 +66,18 @@ assignments, an `Option<Box<dyn GraphStore>>` (HelixDB; `None` without
 models. At startup the daemon calls `list_models` on hipfire and resolves
 assignments: a `CORRODE_ROLES` override wins if it names a served model, else a
 default pick (first served non-embedding/non-image model). If hipfire is
-unreachable, all roles fall back to `CORRODE_MODEL`. `plan_prompt` currently emits
-one task on the orchestration model — the real multi-role planner grows there.
+unreachable, all roles fall back to `CORRODE_MODEL`.
+
+## Planner
+
+`planner.rs` is the two-phase swarm decomposition, driven by `Daemon::plan`:
+phase 1 asks the orchestration model for a JSON plan; phase 2 (`parse_plan` +
+`to_tasks`) turns it into role-tagged `Task`s, each on its role's model and a band
+derived from the role (`band_for`: orchestration→Realtime, architect/coder/review→
+Default, research→Opportunistic). Then the swarm fans them out. Empty/unparseable
+plan degrades to one coder task on the raw prompt. Not yet done: prepending a
+shared context prefix to every subtask so hipfire batches them prefix-shared for
+KV reuse (the `ponytail:` in `orchestration_prompt`).
 
 ## Licensing — read before touching the daemon
 
