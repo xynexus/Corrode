@@ -1,38 +1,111 @@
-//! Embedded virtual file system: the HelixDB graph presented as a git-compliant tree.
+//! Virtual file system: the interface the explorer and subagents see the repo through.
 //!
-//! The graph — held in the daemon's embedded HelixDB store ([`crate::graph`]) — is
-//! the source of truth (nodes = files/symbols, edges = references, ownership,
-//! call/import relations). The VFS projects a slice of that graph as an ordinary
-//! directory tree so any git-aware tool — including the swarm's own subagents
-//! shelling out — sees a normal working copy. Writes flow the other way: a file
-//! edit is diffed back into node/edge mutations on the graph.
+//! The target design is graph<->git: the HelixDB graph ([`crate::graph`]) is the
+//! source of truth, and the VFS projects a slice of it as a git-compliant tree so
+//! any git-aware tool sees a normal working copy, while writes fold back into graph
+//! mutations. The trait below is that seam — `list`/`read`/`write` over
+//! git-compliant paths.
 //!
-//! Two retrieval paths feed context selection: HelixDB's own vector search
-//! (GraphRAG, for docs) and hipfire's first-class `/v1/embeddings` + `/v1/rerank`
-//! for code. The projected tree is what keeps all of it *git-compliant*: subagents
-//! diff, stage, and blame against real paths while the graph stays the authority.
-#![allow(dead_code)] // ponytail: unwired seam; remove once the first Vfs impl lands.
+//! Methods take `&self`: the daemon shares one VFS across the command loop, and
+//! writes land in the store/filesystem, not in per-instance state.
 
-use std::path::Path;
+use corrode_core::FileNodeView;
+use std::path::PathBuf;
 
-/// A node materialized as a file in the projected tree.
-#[derive(Clone, Debug)]
-pub struct FileNode {
-    /// git-compliant path, e.g. `src/swarm.rs`.
-    pub path: String,
-    pub contents: Vec<u8>,
+pub trait Vfs: Send + Sync {
+    /// Entries directly under `dir` (explorer one-level listing).
+    fn list(&self, dir: &str) -> anyhow::Result<Vec<FileNodeView>>;
+    // ponytail: read/write have no loop caller yet; wired with ReadFile/WriteFile
+    // commands when the explorer's file open/edit lands. Covered by the vfs test.
+    /// Full contents of a file path.
+    #[allow(dead_code)]
+    fn read(&self, path: &str) -> anyhow::Result<Vec<u8>>;
+    /// Write a file path (the edit/"absorb" direction).
+    #[allow(dead_code)]
+    fn write(&self, path: &str, contents: &[u8]) -> anyhow::Result<()>;
 }
 
-/// Translates between the graph database and a git-compliant file tree.
+/// Passthrough VFS over a real directory tree, rooted at `root`.
 ///
-/// ponytail: trait with a single concern and no impl yet — this is the seam the
-/// scaffold exists to name. The first real impl picks a graph store (the "add
-/// when" for that decision is: once we know the query shape retrieval needs).
-/// Don't pull in a graph DB dependency before then.
-pub trait Vfs {
-    /// Project the graph slice reachable from `root` into concrete files.
-    fn project(&self, root: &str) -> anyhow::Result<Vec<FileNode>>;
+/// ponytail: a real-but-plain stand-in so the explorer and subagents have live
+/// files today. It is NOT the graph projection — it reads/writes the host
+/// filesystem directly. The HelixDB-backed `Vfs` (project graph nodes as files,
+/// absorb edits as node/edge mutations) supersedes it; this exists so nothing
+/// downstream has to wait for that. Paths are confined under `root`.
+pub struct PassthroughVfs {
+    root: PathBuf,
+}
 
-    /// Fold an edited file back into graph mutations (the reverse translation).
-    fn absorb(&mut self, path: &Path, contents: &[u8]) -> anyhow::Result<()>;
+impl PassthroughVfs {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Join a VFS path onto the root, rejecting escapes (`..`, absolute paths).
+    fn resolve(&self, path: &str) -> anyhow::Result<PathBuf> {
+        let rel = path.trim_start_matches('/');
+        if rel.split('/').any(|c| c == "..") {
+            anyhow::bail!("path escapes VFS root: {path}");
+        }
+        Ok(self.root.join(rel))
+    }
+}
+
+impl Vfs for PassthroughVfs {
+    fn list(&self, dir: &str) -> anyhow::Result<Vec<FileNodeView>> {
+        let base = self.resolve(dir)?;
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&base)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if dir.is_empty() || dir == "/" {
+                name
+            } else {
+                format!("{}/{}", dir.trim_end_matches('/'), name)
+            };
+            entries.push(FileNodeView {
+                path: rel,
+                bytes: if meta.is_file() { meta.len() } else { 0 },
+                node_id: None, // ponytail: set once entries are backed by graph nodes.
+            });
+        }
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(entries)
+    }
+
+    fn read(&self, path: &str) -> anyhow::Result<Vec<u8>> {
+        Ok(std::fs::read(self.resolve(path)?)?)
+    }
+
+    fn write(&self, path: &str, contents: &[u8]) -> anyhow::Result<()> {
+        let full = self.resolve(path)?;
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(std::fs::write(full, contents)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passthrough_write_list_read_roundtrip_and_rejects_escape() {
+        let root = std::env::temp_dir().join(format!("corrode-vfs-{}", std::process::id()));
+        let vfs = PassthroughVfs::new(&root);
+
+        vfs.write("sub/a.txt", b"hello").unwrap();
+        assert_eq!(vfs.read("sub/a.txt").unwrap(), b"hello");
+
+        let listing = vfs.list("sub").unwrap();
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].path, "sub/a.txt");
+        assert_eq!(listing[0].bytes, 5);
+
+        assert!(vfs.read("../etc/passwd").is_err());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

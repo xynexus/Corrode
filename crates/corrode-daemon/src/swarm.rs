@@ -22,15 +22,16 @@ use corrode_core::Priority;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// One unit of work handed to the swarm.
+/// One unit of work handed to the swarm. Carries its own model, because different
+/// subagent roles run on different models (see [`crate::roles`]).
 pub struct Task {
     pub prompt: String,
     pub priority: Priority,
+    pub model: String,
 }
 
 pub struct Swarm {
     client: Arc<Client>,
-    model: String,
     // ponytail: courtesy local cap so a runaway fan-out doesn't flood the daemon
     // socket. The real admission control is hipfire's resource budget — raise or
     // remove this once we measure the daemon handling the backpressure cleanly.
@@ -38,10 +39,9 @@ pub struct Swarm {
 }
 
 impl Swarm {
-    pub fn new(client: Client, model: impl Into<String>, max_inflight: usize) -> Self {
+    pub fn new(client: Client, max_inflight: usize) -> Self {
         Self {
             client: Arc::new(client),
-            model: model.into(),
             inflight: Arc::new(Semaphore::new(max_inflight)),
         }
     }
@@ -52,11 +52,10 @@ impl Swarm {
         let mut handles = Vec::with_capacity(tasks.len());
         for (i, task) in tasks.into_iter().enumerate() {
             let client = Arc::clone(&self.client);
-            let model = self.model.clone();
             let permit = Arc::clone(&self.inflight);
             handles.push(tokio::spawn(async move {
                 let _guard = permit.acquire_owned().await.expect("semaphore not closed");
-                let out = client.respond(&model, &task.prompt, task.priority).await;
+                let out = client.respond(&task.model, &task.prompt, task.priority).await;
                 (i, out)
             }));
         }

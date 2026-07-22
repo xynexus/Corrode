@@ -37,6 +37,17 @@ pub struct ResponsesReply {
     pub output_text: String,
 }
 
+#[derive(Deserialize)]
+struct ModelsReply {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
 impl Client {
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
         Self {
@@ -44,6 +55,17 @@ impl Client {
             base_url: base_url.into(),
             api_key,
         }
+    }
+
+    /// The models hipfire currently serves (`GET /v1/models`), by id. Role
+    /// assignment resolves against this list.
+    pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        let mut rb = self.http.get(format!("{}/v1/models", self.base_url));
+        if let Some(key) = &self.api_key {
+            rb = rb.bearer_auth(key);
+        }
+        let reply: ModelsReply = rb.send().await?.error_for_status()?.json().await?;
+        Ok(reply.data.into_iter().map(|m| m.id).collect())
     }
 
     /// One completion over `/v1/responses` at the given priority band.

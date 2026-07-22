@@ -15,9 +15,13 @@
 use corrode_core::GraphNodeView;
 
 /// The daemon's view of the embedded store. Kept as a trait so the swarm/VFS code
-/// and its tests don't drag the (heavy, feature-gated) HelixDB compile in.
-pub trait GraphStore {
+/// and its tests don't drag the (heavy, feature-gated) HelixDB compile in, and so
+/// the daemon can hold it as `Option<Box<dyn GraphStore>>` (None until opened).
+pub trait GraphStore: Send + Sync {
     /// Nodes directly reachable from `id` — one hop of the explorer's graph view.
+    // ponytail: no caller in the base build yet; wired with a ListNeighbors command
+    // when the webui graph explorer lands.
+    #[allow(dead_code)]
     fn neighbors(&self, id: &str) -> anyhow::Result<Vec<GraphNodeView>>;
 
     /// GraphRAG: vector-search docs, then walk the graph for grounding. Returns the

@@ -1,22 +1,40 @@
 //! The daemon command loop: drain `AgentCommand`s, dispatch each, stream
 //! `AgentEvent`s back. Transport-agnostic on purpose — it speaks mpsc channels, so
 //! the same loop serves the in-process demo in `main` today and the `corrode-web`
-//! websocket bridge later, without change. Wiring an HTTP framework is `corrode-web`'s
-//! job, once it has this loop to bridge to.
+//! websocket bridge later, without change.
+//!
+//! The daemon owns the host-side state the handlers reach through `&self`: the
+//! swarm, the role->model assignments, the embedded graph store (HelixDB, when
+//! built), and the VFS.
 
+use crate::graph::GraphStore;
+use crate::roles::{Role, RoleModels};
 use crate::swarm::{Swarm, Task};
+use crate::vfs::Vfs;
 use corrode_core::{AgentCommand, AgentEvent, Priority};
 use tokio::sync::mpsc;
 
 pub struct Daemon {
     swarm: Swarm,
-    // ponytail: HelixStore (graph/GraphRAG) and the VFS land here next, behind the
-    // same &self so handlers can reach them. DocQuery/terminal stay stubbed until then.
+    roles: RoleModels,
+    /// Embedded HelixDB. `None` unless built with `--features helix` and opened.
+    graph: Option<Box<dyn GraphStore>>,
+    vfs: Box<dyn Vfs>,
 }
 
 impl Daemon {
-    pub fn new(swarm: Swarm) -> Self {
-        Self { swarm }
+    pub fn new(
+        swarm: Swarm,
+        roles: RoleModels,
+        graph: Option<Box<dyn GraphStore>>,
+        vfs: Box<dyn Vfs>,
+    ) -> Self {
+        Self {
+            swarm,
+            roles,
+            graph,
+            vfs,
+        }
     }
 
     /// Run until the command channel closes. Dropping the sender ends the loop,
@@ -34,25 +52,39 @@ impl Daemon {
     async fn handle(&self, cmd: AgentCommand, events: &mpsc::Sender<AgentEvent>) {
         match cmd {
             AgentCommand::Prompt { text, priority } => {
-                for (id, result) in self.swarm.run(plan_prompt(&text, priority)).await {
+                for (id, result) in self.swarm.run(self.plan_prompt(&text, priority)).await {
                     let ev = match result {
                         Ok(text) => AgentEvent::SubagentOutput { id: id as u64, text },
                         Err(e) => AgentEvent::Error { message: e.to_string() },
                     };
-                    // Consumer gone = nobody's listening; stop pushing at it.
                     if events.send(ev).await.is_err() {
-                        return;
+                        return; // consumer gone
                     }
                 }
             }
             AgentCommand::DocQuery { question } => {
-                // ponytail: GraphRAG over HelixDB — needs `--features helix` and an
-                // open HelixStore on `self`. Report honestly until that's wired.
-                let _ = events
-                    .send(AgentEvent::Error {
-                        message: format!("DocQuery not wired yet (needs HelixDB): {question}"),
-                    })
-                    .await;
+                let ev = match &self.graph {
+                    Some(g) => match g.doc_search(&question, 8) {
+                        // ponytail: grounding ids only for now; the GraphRAG answer
+                        // (retrieve -> synthesize via hipfire) fills `text` next.
+                        Ok(ids) => AgentEvent::DocAnswer {
+                            text: String::new(),
+                            grounded_on: ids,
+                        },
+                        Err(e) => AgentEvent::Error { message: e.to_string() },
+                    },
+                    None => AgentEvent::Error {
+                        message: "DocQuery unavailable: build with --features helix and open a graph store".into(),
+                    },
+                };
+                let _ = events.send(ev).await;
+            }
+            AgentCommand::ListDir { path } => {
+                let ev = match self.vfs.list(&path) {
+                    Ok(entries) => AgentEvent::DirListing { path, entries },
+                    Err(e) => AgentEvent::Error { message: e.to_string() },
+                };
+                let _ = events.send(ev).await;
             }
             AgentCommand::TerminalInput { session, data } => {
                 // ponytail: echo, so the wasm terminal has a live byte-pipe to build
@@ -63,33 +95,49 @@ impl Daemon {
             }
         }
     }
-}
 
-/// Turn a prompt into swarm tasks.
-///
-/// ponytail: one task at the requested band. The real planner — the reason this is
-/// a *swarm* — decomposes a prompt into many prioritized subagents (foreground
-/// Realtime, speculative Opportunistic) sharing a context prefix for KV reuse.
-/// That's the next thing to grow here; the loop above already fans out whatever
-/// this returns.
-fn plan_prompt(text: &str, priority: Priority) -> Vec<Task> {
-    vec![Task {
-        prompt: text.to_string(),
-        priority,
-    }]
+    /// Turn a prompt into swarm tasks.
+    ///
+    /// ponytail: one task on the orchestration model. The real planner — the reason
+    /// this is a *swarm* — has the orchestration model decompose the prompt into
+    /// many role-tagged subagents (research/architect/coder/review), each on its
+    /// role's model and priority band, sharing a context prefix for KV reuse. The
+    /// loop above already fans out whatever this returns.
+    fn plan_prompt(&self, text: &str, priority: Priority) -> Vec<Task> {
+        let model = self
+            .roles
+            .model_for(Role::Orchestration)
+            .unwrap_or_default()
+            .to_string();
+        vec![Task {
+            prompt: text.to_string(),
+            priority,
+            model,
+        }]
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hipfire::Client;
+    use crate::vfs::PassthroughVfs;
 
-    // Exercises the real loop for the two variants that don't touch hipfire: the
-    // terminal must echo its bytes, and DocQuery must report itself unwired rather
+    fn test_daemon() -> Daemon {
+        Daemon::new(
+            Swarm::new(Client::new("http://127.0.0.1:1", None), 1),
+            RoleModels::uniform("test-model"),
+            None,
+            Box::new(PassthroughVfs::new(std::env::temp_dir())),
+        )
+    }
+
+    // Exercises the real loop for the variants that don't touch hipfire: terminal
+    // echoes its bytes, and DocQuery reports itself unavailable (no graph) rather
     // than hang or panic. Guards the dispatch/match, not the network.
     #[tokio::test]
     async fn loop_routes_terminal_and_docquery_without_hipfire() {
-        let daemon = Daemon::new(Swarm::new(Client::new("http://127.0.0.1:1", None), "m", 1));
+        let daemon = test_daemon();
         let (ctx, crx) = mpsc::channel(8);
         let (etx, mut erx) = mpsc::channel(8);
 
@@ -104,7 +152,7 @@ mod tests {
         })
         .await
         .unwrap();
-        drop(ctx); // close the loop
+        drop(ctx);
 
         daemon.run(crx, etx).await;
 
