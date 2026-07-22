@@ -1,0 +1,28 @@
+[package]
+name = "corrode-webui"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Corrode wasm front-end: virtual terminal, repo/graph explorer, agent interface."
+
+# Detach from the native root workspace: this crate builds on its own wasm target
+# via trunk and must never be pulled into `cargo build` at the repo root.
+[workspace]
+
+[dependencies]
+# DOM shell: explorers + agent interface. CSR only — corrode-web is a stateless
+# asset server + ws bridge, so there is no SSR/hydrate story here.
+leptos = { version = "0.8", features = ["csr"] }
+# Canvas panels (virtual terminal + graph explorer) via egui, mounted on a Leptos
+# <canvas>. eframe drives the egui web runner; glow = WebGL (no wgpu weight).
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.35"
+# WebSocket to /agent, carrying corrode_core::{AgentCommand, AgentEvent} as JSON.
+gloo-net = { version = "0.6", features = ["websocket"] }
+futures = "0.3"
+wasm-bindgen-futures = "0.4"
+serde_json = "1"
+console_error_panic_hook = "0.1"
+# Wire types shared with the daemon (links nothing native -> compiles to wasm).
+corrode-core = { path = "../crates/corrode-core" }
+web-sys = { version = "0.3", features = ["Window", "Location", "HtmlCanvasElement"] }

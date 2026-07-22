@@ -1,0 +1,15 @@
+[build]
+target = "index.html"
+# Trunk stages the wasm bundle here; corrode-web embeds/serves this dir.
+dist = "dist"
+
+[serve]
+address = "127.0.0.1"
+port = 8080
+
+# Dev convenience: forward the app's /agent websocket to a running corrode-web
+# (which in turn proxies to the daemon), so `trunk serve` alone drives the swarm.
+[[proxy]]
+rewrite = "/agent"
+backend = "ws://127.0.0.1:8787/agent"
+ws = true

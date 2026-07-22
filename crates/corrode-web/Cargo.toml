@@ -13,6 +13,9 @@ tokio.workspace = true
 axum.workspace = true
 futures-util.workspace = true
 tokio-tungstenite.workspace = true
+# Serve the trunk-built webui bundle (webui/dist). In debug it reads from disk
+# (pick up `trunk build` without recompiling); in release it embeds -> one binary.
+rust-embed = { version = "8", features = ["mime-guess"] }
 
 [[bin]]
 name = "corrode-web"

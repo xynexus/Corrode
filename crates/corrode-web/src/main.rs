@@ -11,16 +11,24 @@
 
 use axum::extract::ws::{Message as AxMsg, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::{Html, Response};
+use axum::http::{header, StatusCode, Uri};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
+use rust_embed::RustEmbed;
 use std::sync::Arc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-/// ponytail: dev placeholder served at `/`. Swap for the built wasm webui bundle
-/// (a static dir) when it exists.
+/// The trunk-built webui bundle. Empty until `trunk build` runs in `webui/` (the
+/// dir holds a `.gitkeep` so this compiles on a fresh clone); `static_handler`
+/// falls back to the dev placeholder below when a requested asset is absent.
+#[derive(RustEmbed)]
+#[folder = "../../webui/dist"]
+struct WebUi;
+
+/// Dev placeholder served at `/` when no webui bundle is embedded yet.
 const INDEX: &str = include_str!("../index.html");
 
 #[tokio::main]
@@ -32,14 +40,29 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let app = Router::new()
-        .route("/", get(|| async { Html(INDEX) }))
         .route("/agent", get(agent_proxy))
+        .fallback(static_handler)
         .with_state(daemon_url);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("corrode-web on http://{}  (proxying /agent -> daemon)", listener.local_addr()?);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Serve the embedded webui bundle; `/` -> index.html. Unknown asset falls back to
+/// the dev placeholder at the root, or 404 for a sub-path.
+async fn static_handler(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    match WebUi::get(path) {
+        Some(content) => {
+            let mime = content.metadata.mimetype().to_string();
+            ([(header::CONTENT_TYPE, mime.as_str())], content.data.into_owned()).into_response()
+        }
+        None if path == "index.html" => Html(INDEX).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn agent_proxy(ws: WebSocketUpgrade, State(url): State<Arc<String>>) -> Response {
