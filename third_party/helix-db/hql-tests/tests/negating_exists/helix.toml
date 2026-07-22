@@ -1,9 +1,0 @@
-[project]
-name = "negating_exists"
-queries = "."
-
-[local.dev]
-port = 6969
-build_mode = "dev"
-
-[cloud]

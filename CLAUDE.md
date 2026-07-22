@@ -29,7 +29,7 @@ crates/corrode-core     # shared wire types (Priority, AgentCommand/Event, node 
 crates/corrode-daemon   # the agent (AGPL-3.0 — see below). modules: hipfire, swarm, vfs, graph
 crates/corrode-web      # web server stub (Apache-2.0)
 webui/                  # wasm front-end seam (out of the cargo workspace; its own trunk/wasm-pack build)
-third_party/helix-db    # vendored HelixDB v2.3.5 (AGPL-3.0), linked in-process behind the `helix` feature
+third_party/helix-db    # git submodule: HelixDB pinned at v2.3.5 (AGPL-3.0), linked in-process behind the `helix` feature
 third_party/helix-skills# vendored HelixDB agent skills (MIT); Rust-relevant ones symlinked into .claude/skills/
 ```
 
@@ -61,9 +61,11 @@ in-process link).
 
 ## HelixDB embedding
 
-Vendored at `third_party/helix-db` (tag v2.3.5 — the tag whose `helix_engine` is
-usable in-process; newer published crates are HTTP-client-only). The real embed
-is `graph::embedded::HelixStore::open(path)`, which calls:
+A git submodule at `third_party/helix-db`, **pinned to tag v2.3.5** (commit
+`17e7ecf`) — the tag whose `helix_engine` is usable in-process; newer published
+crates are HTTP-client-only. Clone with `git clone --recurse-submodules`, or run
+`git submodule update --init third_party/helix-db` after a plain clone. The real
+embed is `graph::embedded::HelixStore::open(path)`, which calls:
 
 ```rust
 HelixGraphStorage::new(path, Config::default(), VersionInfo::default())
@@ -77,10 +79,15 @@ When writing HelixQL/Rust-DSL queries against it, the vendored **helix skills**
 are symlinked into `.claude/skills/` (helix-query-rust, helix-query-optimize,
 helix-query-json-dynamic, helix-cli, helix-memory-system). Use them.
 
-Two vendored `Cargo.toml` edits exist (marked `# corrode:`): helix-db and its
-`metrics` crate switched from native-tls to rustls so workspace feature
-unification with the daemon's rustls reqwest doesn't pull in openssl. Re-apply if
-you re-vendor.
+**`--features helix` needs system OpenSSL + pkg-config** at build time. Upstream
+helix-db (via its always-on `helix-metrics` crate) uses `native-tls`, so the
+build links openssl regardless of features. This matches HelixDB's own build
+requirements and works out of the box on hosts with `libssl-dev`/`pkg-config`
+installed. The base workspace build needs none of this — helix-db is
+feature-gated and `exclude`d from the workspace, so it's untouched until you pass
+`--features helix`. (If you need an openssl-free pinned build, fork helix-db off
+v2.3.5, switch its and `metrics`' reqwest to `rustls-tls`, and point the submodule
+at the fork.)
 
 ## How hipfire's design constrains this codebase
 

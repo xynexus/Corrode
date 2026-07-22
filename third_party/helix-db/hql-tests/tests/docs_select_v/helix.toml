@@ -1,7 +1,0 @@
-[project]
-name = "docs_select_v"
-queries = "."
-
-[local.dev]
-port = 6969
-build_mode = "dev"
