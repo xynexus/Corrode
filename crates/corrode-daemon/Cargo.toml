@@ -17,6 +17,7 @@ tokio.workspace = true
 reqwest.workspace = true
 axum.workspace = true
 futures-util.workspace = true
+async-trait.workspace = true
 corrode-core.workspace = true
 
 # Embedded graph+vector store, pinned via the git submodule at third_party/helix-db

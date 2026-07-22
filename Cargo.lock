@@ -293,6 +293,7 @@ name = "corrode-daemon"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "corrode-core",
  "futures-util",
