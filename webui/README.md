@@ -46,3 +46,13 @@ open `corrode-web` (http://127.0.0.1:8787 — it serves the built `dist/`) or ru
 recompile after `trunk build`); in release it bakes the bundle into the binary.
 Until you run `trunk build`, `dist/` holds only `.gitkeep` and `corrode-web` serves
 its built-in placeholder page.
+
+## Browser requirement: WebGL
+
+The egui canvas (terminal + graph explorer) renders through eframe's **glow**
+backend, which needs **WebGL**. In a browser without it (e.g. a headless / no-GPU
+Chrome) the canvas stays blank and the console logs
+`egui runner failed: JsValue("WebGL isn't supported")` — the Leptos DOM shell
+(explorer, agent log, prompt) still works, but the terminal/graph panels won't.
+Use a GPU-capable desktop browser, or one with SwiftShader software WebGL enabled.
+(ponytail: a `wgpu`/WebGPU eframe backend is the alternative renderer, not wired.)
