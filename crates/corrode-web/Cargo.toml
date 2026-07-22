@@ -8,6 +8,11 @@ description = "Web server: serves the Corrode wasm webui and bridges it to the d
 [dependencies]
 corrode-core.workspace = true
 serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
 
 [[bin]]
 name = "corrode-web"
