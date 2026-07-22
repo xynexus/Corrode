@@ -26,7 +26,7 @@ written yet. Grep `ponytail:` for every deliberate seam and its upgrade trigger.
 
 ```
 crates/corrode-core     # shared wire types (Priority, AgentCommand/Event, node DTOs). Links nothing heavy; wasm-safe.
-crates/corrode-daemon   # the agent (AGPL-3.0 — see below). modules: hipfire, swarm, vfs, graph
+crates/corrode-daemon   # the agent (AGPL-3.0 — see below). modules: daemon (command loop), swarm, roles, hipfire, vfs, graph
 crates/corrode-web      # web server stub (Apache-2.0)
 webui/                  # wasm front-end seam (out of the cargo workspace; its own trunk/wasm-pack build)
 third_party/helix-db    # git submodule: HelixDB pinned at v2.3.5 (AGPL-3.0), linked in-process behind the `helix` feature
@@ -45,8 +45,29 @@ cargo run  -p corrode-web                    # web server stub
 ```
 
 Env: `HIPFIRE_BASE_URL` (default `http://127.0.0.1:11435`), `HIPFIRE_API_KEY`,
-`CORRODE_MODEL` (default `qwen3.5:9b`), `CORRODE_GRAPH_DIR` (HelixDB path, once
-wired). A running `hipfire serve` is needed for `cargo run` to do anything real.
+`CORRODE_MODEL` (offline fallback model for all roles), `CORRODE_ROLES` (path to a
+JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`),
+`CORRODE_GRAPH_DIR` (HelixDB path under `--features helix`). A running
+`hipfire serve` is needed for `cargo run` to do anything real.
+
+## Command loop & daemon state
+
+`daemon.rs` is the transport-agnostic loop: drain `AgentCommand` off an mpsc
+channel, dispatch, stream `AgentEvent` back — same loop for the in-process demo in
+`main` and the future `corrode-web` websocket bridge. The `Daemon` owns the
+host-side state handlers reach via `&self`: the `Swarm`, the `RoleModels`
+assignments, an `Option<Box<dyn GraphStore>>` (HelixDB; `None` without
+`--features helix`), and a `Box<dyn Vfs>`. Dispatch: `Prompt`→swarm, `ListDir`→vfs
+(real), `DocQuery`→graph (real when helix built), `TerminalInput`→echo (pty later).
+
+## Roles
+
+`roles.rs` maps swarm roles (research/orchestration/architect/coder/review) to
+models. At startup the daemon calls `list_models` on hipfire and resolves
+assignments: a `CORRODE_ROLES` override wins if it names a served model, else a
+default pick (first served non-embedding/non-image model). If hipfire is
+unreachable, all roles fall back to `CORRODE_MODEL`. `plan_prompt` currently emits
+one task on the orchestration model — the real multi-role planner grows there.
 
 ## Licensing — read before touching the daemon
 

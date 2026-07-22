@@ -72,6 +72,8 @@ pub enum AgentCommand {
     TerminalInput { session: String, data: Vec<u8> },
     /// GraphRAG documentation query over HelixDB's vector+graph store.
     DocQuery { question: String },
+    /// Explorer: list the VFS entries under a directory path.
+    ListDir { path: String },
 }
 
 /// daemon -> webui/web-server. Streamed events (websocket in practice).
@@ -83,5 +85,7 @@ pub enum AgentEvent {
     TerminalOutput { session: String, data: Vec<u8> },
     /// GraphRAG answer with the node ids it grounded on.
     DocAnswer { text: String, grounded_on: Vec<String> },
+    /// Explorer: entries under a listed directory.
+    DirListing { path: String, entries: Vec<FileNodeView> },
     Error { message: String },
 }
