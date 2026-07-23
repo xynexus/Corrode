@@ -38,6 +38,12 @@
       console.warn("[corrode] xterm WebGL addon unavailable, using default renderer:", e);
     }
 
+    // Swallow systemd's OSC 3008 "context" sequence (emitted by login shells via
+    // /etc/profile.d) — xterm.js doesn't recognize it and would print the payload.
+    if (term.parser && term.parser.registerOscHandler) {
+      term.parser.registerOscHandler(3008, function () { return true; });
+    }
+
     term.onData(function (d) { onData(d); });
 
     function report() {
