@@ -4,7 +4,20 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Corrode</title>
+
+    <!-- Vendored xterm.js + addons (copied to dist as-is), then loaded as classic
+         scripts so their UMD globals exist before the wasm module runs. -->
+    <link data-trunk rel="copy-file" href="assets/xterm.js" />
+    <link data-trunk rel="copy-file" href="assets/addon-fit.js" />
+    <link data-trunk rel="copy-file" href="assets/addon-webgl.js" />
+    <link data-trunk rel="copy-file" href="assets/corrode-term.js" />
+    <link data-trunk rel="css" href="assets/xterm.css" />
     <link data-trunk rel="rust" data-bin="corrode-webui" data-wasm-opt="z" />
+    <script src="xterm.js"></script>
+    <script src="addon-fit.js"></script>
+    <script src="addon-webgl.js"></script>
+    <script src="corrode-term.js"></script>
+
     <style>
       :root { color-scheme: dark; }
       * { box-sizing: border-box; }
@@ -38,8 +51,16 @@
       .tree li { padding: 2px 6px; border-radius: 4px; white-space: nowrap; }
       .tree li.dir { color: #cbd3dd; }
       .tree li:hover { background: #1c1f24; }
-      .canvas-wrap { background: #0c0d10; }
-      .egui-canvas { width: 100%; height: 100%; display: block; }
+
+      /* Center column: xterm terminal (top) + egui graph canvas (bottom). */
+      .center { background: #0c0d10; }
+      .terminal {
+        flex: 3; min-height: 0; padding: 6px 8px; overflow: hidden;
+        border-bottom: 1px solid #262a30;
+      }
+      .terminal .xterm, .terminal .xterm-viewport { height: 100% !important; }
+      .graph-canvas { flex: 2; width: 100%; min-height: 0; display: block; }
+
       .log { flex: 1; overflow: auto; padding: 8px 10px; font-family: ui-monospace, monospace; }
       .line { white-space: pre-wrap; word-break: break-word; padding: 1px 0; }
       .prompt { display: flex; gap: 6px; padding: 8px; border-top: 1px solid #262a30; }
