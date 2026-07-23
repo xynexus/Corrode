@@ -62,4 +62,19 @@
   window.corrodeTermWrite = function (data) {
     if (term) term.write(data);
   };
+
+  // corrodeRenderMath(el) — KaTeX auto-render over an element (agent console).
+  window.corrodeRenderMath = function (el) {
+    if (window.renderMathInElement) {
+      window.renderMathInElement(el, {
+        delimiters: [
+          { left: "$$", right: "$$", display: true },
+          { left: "$", right: "$", display: false },
+          { left: "\\[", right: "\\]", display: true },
+          { left: "\\(", right: "\\)", display: false },
+        ],
+        throwOnError: false,
+      });
+    }
+  };
 })();

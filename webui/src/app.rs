@@ -12,6 +12,17 @@ use crate::{egui_panel, term, ws};
 
 const SESSION: &str = "web";
 
+/// Render one agent message (Markdown, possibly with `$…$` LaTeX) to HTML. KaTeX
+/// renders the math afterward, over the mounted element.
+// ponytail: agent output is trusted here (local daemon); sanitize before inner_html
+// if untrusted content can reach it.
+fn md_to_html(md: &str) -> String {
+    use pulldown_cmark::{html, Parser};
+    let mut out = String::new();
+    html::push_html(&mut out, Parser::new(md));
+    out
+}
+
 /// Same-origin `/agent` websocket URL, `ws://` or `wss://` per the page scheme.
 fn agent_ws_url() -> String {
     let loc = web_sys::window().expect("window").location();
@@ -69,6 +80,24 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    // Agent console: render each message as Markdown -> HTML, then KaTeX over it.
+    // One effect owns both steps so innerHTML is set before math renders (no
+    // two-effect ordering race), and it auto-scrolls to the newest message.
+    let console_ref = NodeRef::<html::Div>::new();
+    Effect::new(move |_| {
+        let html = log
+            .get()
+            .iter()
+            .map(|m| format!("<div class=\"msg\">{}</div>", md_to_html(m)))
+            .collect::<String>();
+        if let Some(div) = console_ref.get() {
+            let el: web_sys::HtmlElement = div.unchecked_into();
+            el.set_inner_html(&html);
+            term::render_math(&el);
+            el.set_scroll_top(el.scroll_height());
+        }
+    });
+
     let prompt = RwSignal::new(String::new());
     let send_prompt = {
         let cmd_tx = cmd_tx.clone();
@@ -113,11 +142,7 @@ pub fn App() -> impl IntoView {
             </section>
 
             <section class="agent">
-                <div class="log">
-                    {move || log.get().into_iter().map(|line| view! {
-                        <div class="line">{line}</div>
-                    }).collect_view()}
-                </div>
+                <div node_ref=console_ref class="log"></div>
                 <div class="prompt">
                     <input
                         prop:value=move || prompt.get()

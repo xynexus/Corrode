@@ -12,10 +12,15 @@
     <link data-trunk rel="copy-file" href="assets/addon-webgl.js" />
     <link data-trunk rel="copy-file" href="assets/corrode-term.js" />
     <link data-trunk rel="css" href="assets/xterm.css" />
+    <!-- KaTeX (js + css + fonts) for the agent console's LaTeX. -->
+    <link data-trunk rel="copy-dir" href="assets/katex" />
+    <link rel="stylesheet" href="katex/katex.min.css" />
     <link data-trunk rel="rust" data-bin="corrode-webui" data-wasm-opt="z" />
     <script src="xterm.js"></script>
     <script src="addon-fit.js"></script>
     <script src="addon-webgl.js"></script>
+    <script src="katex/katex.min.js"></script>
+    <script src="katex/contrib/auto-render.min.js"></script>
     <script src="corrode-term.js"></script>
 
     <style>
@@ -61,8 +66,17 @@
       .terminal .xterm, .terminal .xterm-viewport { height: 100% !important; }
       .graph-canvas { flex: 2; width: 100%; min-height: 0; display: block; }
 
-      .log { flex: 1; overflow: auto; padding: 8px 10px; font-family: ui-monospace, monospace; }
-      .line { white-space: pre-wrap; word-break: break-word; padding: 1px 0; }
+      .log { flex: 1; overflow: auto; padding: 8px 10px; }
+      .log .msg { padding: 5px 0; border-bottom: 1px solid #1c1f24; }
+      .log .msg:last-child { border-bottom: 0; }
+      .log .msg :first-child { margin-top: 0; }
+      .log .msg :last-child { margin-bottom: 0; }
+      .log pre {
+        background: #0f1114; border: 1px solid #262a30; border-radius: 5px;
+        padding: 8px; overflow-x: auto; font-family: ui-monospace, monospace;
+      }
+      .log code { font-family: ui-monospace, monospace; }
+      .log .katex-display { margin: 6px 0; overflow-x: auto; overflow-y: hidden; }
       .prompt { display: flex; gap: 6px; padding: 8px; border-top: 1px solid #262a30; }
       .prompt input {
         flex: 1; background: #0f1114; color: #d7dbe0;

@@ -16,11 +16,19 @@ extern "C" {
 
     #[wasm_bindgen(js_name = corrodeTermWrite)]
     fn term_write(data: &[u8]);
+
+    #[wasm_bindgen(js_name = corrodeRenderMath)]
+    fn render_math_js(el: &HtmlElement);
 }
 
 /// Write pty output bytes into the terminal.
 pub fn write(data: &[u8]) {
     term_write(data);
+}
+
+/// Run KaTeX auto-render over `el` (renders `$…$` / `$$…$$` math in place).
+pub fn render_math(el: &HtmlElement) {
+    render_math_js(el);
 }
 
 /// Mount an xterm terminal on `mount`. `on_data` receives typed input (send as
