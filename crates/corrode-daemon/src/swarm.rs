@@ -19,6 +19,8 @@
 
 use crate::hipfire::Client;
 use corrode_core::Priority;
+use futures_util::stream::FuturesUnordered;
+use futures_util::Stream;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -46,26 +48,21 @@ impl Swarm {
         }
     }
 
-    /// Fan out every task concurrently. hipfire's scheduler orders them by band;
-    /// results come back in completion order paired with their originating index.
-    pub async fn run(&self, tasks: Vec<Task>) -> Vec<(usize, anyhow::Result<String>)> {
-        let mut handles = Vec::with_capacity(tasks.len());
+    /// Fan out every task concurrently, yielding each `(index, result)` **as it
+    /// completes** — a stream, not a batch — so the caller streams partial output
+    /// (the first subagent's answer doesn't wait on the slowest). hipfire's
+    /// scheduler still orders execution by band; the `inflight` semaphore caps
+    /// concurrent requests. The futures run as the returned stream is polled.
+    pub fn run(&self, tasks: Vec<Task>) -> impl Stream<Item = (usize, anyhow::Result<String>)> {
+        let futs = FuturesUnordered::new();
         for (i, task) in tasks.into_iter().enumerate() {
             let client = Arc::clone(&self.client);
-            let permit = Arc::clone(&self.inflight);
-            handles.push(tokio::spawn(async move {
-                let _guard = permit.acquire_owned().await.expect("semaphore not closed");
-                let out = client.respond(&task.model, &task.prompt, task.priority).await;
-                (i, out)
-            }));
+            let inflight = Arc::clone(&self.inflight);
+            futs.push(async move {
+                let _guard = inflight.acquire_owned().await.expect("semaphore not closed");
+                (i, client.respond(&task.model, &task.prompt, task.priority).await)
+            });
         }
-        let mut results = Vec::with_capacity(handles.len());
-        for h in handles {
-            match h.await {
-                Ok(pair) => results.push(pair),
-                Err(join) => results.push((usize::MAX, Err(anyhow::anyhow!(join)))),
-            }
-        }
-        results
+        futs
     }
 }
