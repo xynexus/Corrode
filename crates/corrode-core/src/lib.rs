@@ -112,6 +112,9 @@ pub enum AgentCommand {
     Prompt { text: String, priority: Priority },
     /// A keystroke chunk for the wasm virtual terminal's active session.
     TerminalInput { session: String, data: Vec<u8> },
+    /// Terminal geometry (also opens the session/pty on first receipt), so the
+    /// daemon's pty and the client's emulator agree on size for full-screen TUIs.
+    TerminalResize { session: String, cols: u16, rows: u16 },
     /// GraphRAG documentation query over HelixDB's vector+graph store.
     DocQuery { question: String },
     /// Explorer: list the VFS entries under a directory path.
