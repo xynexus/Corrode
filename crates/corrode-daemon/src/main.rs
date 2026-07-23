@@ -18,6 +18,7 @@ mod planner;
 mod roles;
 mod server;
 mod swarm;
+mod terminal;
 mod vfs;
 
 use daemon::Daemon;

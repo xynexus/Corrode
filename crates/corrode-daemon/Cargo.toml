@@ -19,6 +19,9 @@ axum.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true
 corrode-core.workspace = true
+# Real pty-backed terminal sessions (replaces the echo). Blocking I/O, bridged to
+# the async event channel by a per-session reader thread.
+portable-pty = "0.9"
 
 # Embedded graph+vector store, pinned via the git submodule at third_party/helix-db
 # (tag v2.3.5). Optional so the base workspace builds without the heavy vendored

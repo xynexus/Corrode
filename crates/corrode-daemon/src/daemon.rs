@@ -11,6 +11,7 @@ use crate::graph::GraphStore;
 use crate::planner;
 use crate::roles::{Role, RoleModels};
 use crate::swarm::{Swarm, Task};
+use crate::terminal::Terminals;
 use crate::vfs::Vfs;
 use corrode_core::{AgentCommand, AgentEvent, Priority};
 use tokio::sync::mpsc;
@@ -21,6 +22,8 @@ pub struct Daemon {
     /// Embedded HelixDB. `None` unless built with `--features helix` and opened.
     graph: Option<Box<dyn GraphStore>>,
     vfs: Box<dyn Vfs>,
+    /// Live pty-backed terminal sessions.
+    terminals: Terminals,
 }
 
 impl Daemon {
@@ -35,6 +38,7 @@ impl Daemon {
             roles,
             graph,
             vfs,
+            terminals: Terminals::new(),
         }
     }
 
@@ -99,11 +103,28 @@ impl Daemon {
                 let _ = events.send(ev).await;
             }
             AgentCommand::TerminalInput { session, data } => {
-                // ponytail: echo, so the wasm terminal has a live byte-pipe to build
-                // against. Swap for a portable-pty shell per session (real terminal).
-                let _ = events
-                    .send(AgentEvent::TerminalOutput { session, data })
-                    .await;
+                // Write keystrokes to the session's real pty; its output streams back
+                // as TerminalOutput from the session's reader thread.
+                if let Err(e) = self.terminals.input(&session, &data, events) {
+                    let _ = events
+                        .send(AgentEvent::Error {
+                            message: format!("terminal input: {e}"),
+                        })
+                        .await;
+                }
+            }
+            AgentCommand::TerminalResize {
+                session,
+                cols,
+                rows,
+            } => {
+                if let Err(e) = self.terminals.resize(&session, cols, rows, events) {
+                    let _ = events
+                        .send(AgentEvent::Error {
+                            message: format!("terminal resize: {e}"),
+                        })
+                        .await;
+                }
             }
         }
     }
@@ -195,21 +216,15 @@ mod tests {
         )
     }
 
-    // Exercises the real loop for the variants that don't touch hipfire: terminal
-    // echoes its bytes, and DocQuery reports itself unavailable (no graph) rather
-    // than hang or panic. Guards the dispatch/match, not the network.
+    // The hipfire-free dispatch path: DocQuery without a graph store reports itself
+    // unavailable (Error) rather than hanging or panicking. Guards the match, not the
+    // network. (The real pty terminal path is covered in `terminal.rs`.)
     #[tokio::test]
-    async fn loop_routes_terminal_and_docquery_without_hipfire() {
+    async fn loop_reports_docquery_unavailable_without_graph() {
         let daemon = test_daemon();
         let (ctx, crx) = mpsc::channel(8);
         let (etx, mut erx) = mpsc::channel(8);
 
-        ctx.send(AgentCommand::TerminalInput {
-            session: "s".into(),
-            data: b"hi".to_vec(),
-        })
-        .await
-        .unwrap();
         ctx.send(AgentCommand::DocQuery {
             question: "q".into(),
         })
@@ -219,10 +234,6 @@ mod tests {
 
         daemon.run(crx, etx).await;
 
-        assert!(matches!(
-            erx.recv().await.unwrap(),
-            AgentEvent::TerminalOutput { data, .. } if data == b"hi"
-        ));
         assert!(matches!(
             erx.recv().await.unwrap(),
             AgentEvent::Error { .. }
