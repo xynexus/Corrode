@@ -101,16 +101,25 @@ impl RoleModels {
     }
 }
 
-/// Default model for unassigned roles.
-///
-/// ponytail: crude — first served model whose id doesn't look like an embedding or
-/// image model (those can't drive a chat/coder role). No size/capability ranking;
-/// the real picker reads model metadata to match role to capability. Users pin
-/// exact models via `CORRODE_ROLES` in the meantime.
+/// Substrings that mark a model id as unable to drive a chat/coder role —
+/// embeddings and image/diffusion models. `list_models` yields only ids (no arch
+/// metadata), so this is necessarily name-based.
+// ponytail: name heuristic — a new image family with none of these markers would
+// still slip through. The real fix reads per-model arch from hipfire; until then,
+// pin exact models via `CORRODE_ROLES`.
+const NON_CHAT_MARKERS: &[&str] = &[
+    "embed",            // embedding models (EmbeddingGemma, ...)
+    ".dit",             // diffusion transformer (e.g. Krea-2-Turbo.dit)
+    "diffusion",
+    "krea", "flux", "sdxl", "sd3", "stable-diffusion", "-sd", "pixart", "kolors", "imagen",
+];
+
+/// Default model for unassigned roles: the first served model that isn't an
+/// embedding or image/diffusion model. No size/capability ranking yet.
 fn default_pick(available: &[String]) -> Option<&str> {
     let chatty = |id: &&String| {
         let l = id.to_lowercase();
-        !l.contains("embed") && !l.contains("-sd") && !l.starts_with("tiny-sd")
+        !NON_CHAT_MARKERS.iter().any(|m| l.contains(m))
     };
     available
         .iter()
@@ -141,6 +150,20 @@ mod tests {
         assert_eq!(r.model_for(Role::Architect), Some("Gemma-3-27B"));
         // every role assigned
         assert!(Role::ALL.iter().all(|&role| r.model_for(role).is_some()));
+    }
+
+    #[test]
+    fn default_pick_skips_embedding_and_image_models() {
+        // Real hipfire ids: embeddings + Krea diffusion models must be skipped so the
+        // default lands on the text model (regression for the Krea-2-Turbo.dit bug).
+        let available = vec![
+            "EmbeddingGemma-300M.oq4++".to_string(),
+            "Krea-2-Turbo.dit.oq4.25".to_string(),
+            "Krea-2-Turbo.source".to_string(),
+            "zaya1-8b-native.oq8++".to_string(),
+        ];
+        let r = RoleModels::resolve(&available, &RoleModels::default()).unwrap();
+        assert_eq!(r.model_for(Role::Coder), Some("zaya1-8b-native.oq8++"));
     }
 
     #[test]
