@@ -1,13 +1,16 @@
-//! The Leptos shell: header, a filesystem/repo explorer, the egui canvas, and the
-//! agent interface (prompt in, streamed output). CSR only — state lives in the
-//! daemon, reached over the `/agent` websocket.
+//! The Leptos shell: a filesystem/repo explorer, the xterm.js terminal + egui graph
+//! canvas (center), and the agent console (streamed output + prompt). CSR only —
+//! state lives in the daemon, reached over the `/agent` websocket.
 
 use corrode_core::{AgentCommand, Priority};
 use leptos::html;
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::model;
-use crate::{egui_panel, ws};
+use crate::{egui_panel, term, ws};
+
+const SESSION: &str = "web";
 
 /// Same-origin `/agent` websocket URL, `ws://` or `wss://` per the page scheme.
 fn agent_ws_url() -> String {
@@ -28,20 +31,45 @@ pub fn App() -> impl IntoView {
 
     let cmd_tx = ws::spawn_agent(agent_ws_url(), shared.clone(), log, entries);
 
-    // Hand the egui panels the canvas (once Leptos mounts it) plus the command
-    // sender, so terminal keystrokes flow back out as `TerminalInput`.
-    let canvas_ref = NodeRef::<html::Canvas>::new();
+    // xterm.js terminal: mount on the div once Leptos renders it. Keystrokes ->
+    // TerminalInput, geometry -> TerminalResize; pty output arrives via ws::write.
+    let term_ref = NodeRef::<html::Div>::new();
     {
-        let egui_tx = cmd_tx.clone();
+        let cmd_tx = cmd_tx.clone();
         Effect::new(move |_| {
-            if let Some(canvas) = canvas_ref.get() {
-                egui_panel::start(canvas, shared.clone(), egui_tx.clone());
+            if let Some(div) = term_ref.get() {
+                let el: web_sys::HtmlElement = div.unchecked_into();
+                let tx_data = cmd_tx.clone();
+                let tx_resize = cmd_tx.clone();
+                term::init(
+                    el,
+                    move |s: String| {
+                        let _ = tx_data.unbounded_send(AgentCommand::TerminalInput {
+                            session: SESSION.into(),
+                            data: s.into_bytes(),
+                        });
+                    },
+                    move |cols: u32, rows: u32| {
+                        let _ = tx_resize.unbounded_send(AgentCommand::TerminalResize {
+                            session: SESSION.into(),
+                            cols: cols as u16,
+                            rows: rows as u16,
+                        });
+                    },
+                );
             }
         });
     }
 
-    let prompt = RwSignal::new(String::new());
+    // egui/WebGL graph canvas.
+    let canvas_ref = NodeRef::<html::Canvas>::new();
+    Effect::new(move |_| {
+        if let Some(canvas) = canvas_ref.get() {
+            egui_panel::start(canvas, shared.clone());
+        }
+    });
 
+    let prompt = RwSignal::new(String::new());
     let send_prompt = {
         let cmd_tx = cmd_tx.clone();
         move |_| {
@@ -79,8 +107,9 @@ pub fn App() -> impl IntoView {
                 </ul>
             </section>
 
-            <section class="canvas-wrap">
-                <canvas node_ref=canvas_ref class="egui-canvas"></canvas>
+            <section class="center">
+                <div node_ref=term_ref class="terminal"></div>
+                <canvas node_ref=canvas_ref class="graph-canvas"></canvas>
             </section>
 
             <section class="agent">

@@ -69,14 +69,9 @@ fn apply_event(
     entries: RwSignal<Vec<(String, bool)>>,
 ) {
     match ev {
-        // Terminal bytes -> egui model; wake its render loop.
+        // Terminal bytes -> the xterm.js terminal.
         AgentEvent::TerminalOutput { data, .. } => {
-            let text = String::from_utf8_lossy(&data).into_owned();
-            let mut m = shared.borrow_mut();
-            m.terminal.push_str(&text);
-            if let Some(ctx) = &m.egui_ctx {
-                ctx.request_repaint();
-            }
+            crate::term::write(&data);
         }
         // Explorer listing -> both the DOM tree and the egui graph panel.
         AgentEvent::DirListing { entries: es, .. } => {

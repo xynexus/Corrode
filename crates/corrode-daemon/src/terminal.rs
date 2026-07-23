@@ -43,7 +43,12 @@ impl Terminals {
             return Ok(());
         }
         let pair = native_pty_system().openpty(size)?;
-        let child = pair.slave.spawn_command(CommandBuilder::new_default_prog())?;
+        // Advertise a terminal type xterm.js understands, so the shell emits escape
+        // sequences the client can render (and skips integration escapes meant for
+        // terminals it can't detect).
+        let mut cmd = CommandBuilder::new_default_prog();
+        cmd.env("TERM", "xterm-256color");
+        let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave); // so the master read hits EOF when the shell exits
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
