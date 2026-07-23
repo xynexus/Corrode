@@ -13,7 +13,7 @@ use corrode_core::AgentEvent;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
 
 struct Session {
@@ -21,10 +21,13 @@ struct Session {
     writer: Box<dyn Write + Send>,     // for input
 }
 
-/// The daemon's live terminal sessions, keyed by client-chosen session id.
+type SessionMap = Arc<Mutex<HashMap<String, Session>>>;
+
+/// The daemon's live terminal sessions, keyed by client-chosen session id. The map
+/// is shared with each session's reader thread so it can evict itself on exit.
 #[derive(Default)]
 pub struct Terminals {
-    sessions: Mutex<HashMap<String, Session>>,
+    sessions: SessionMap,
 }
 
 impl Terminals {
@@ -43,10 +46,13 @@ impl Terminals {
             return Ok(());
         }
         let pair = native_pty_system().openpty(size)?;
-        // Advertise a terminal type xterm.js understands, so the shell emits escape
-        // sequences the client can render (and skips integration escapes meant for
-        // terminals it can't detect).
-        let mut cmd = CommandBuilder::new_default_prog();
+        // Interactive, NON-login shell: sources ~/.bashrc but not /etc/profile.d,
+        // whose 80-systemd-osc-context.sh emits an OSC 3008 sequence xterm.js can't
+        // parse (it printed as noise and garbled input). Env is inherited from the
+        // daemon, so PATH/venv survive. TERM advertises a type xterm understands.
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.arg("-i");
         cmd.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave); // so the master read hits EOF when the shell exits
@@ -55,6 +61,7 @@ impl Terminals {
 
         let events = events.clone();
         let session_id = id.to_string(); // moved into the reader thread
+        let sessions = self.sessions.clone();
         std::thread::spawn(move || {
             let mut child = child; // owned here -> killed on thread exit
             let mut buf = [0u8; 4096];
@@ -73,6 +80,9 @@ impl Terminals {
                 }
             }
             let _ = child.kill();
+            // Evict the now-dead session so a reload/reconnect spawns a fresh pty
+            // (the disconnect happens well before the reconnect, so no id race).
+            sessions.lock().unwrap().remove(&session_id);
         });
 
         map.insert(id.to_string(), Session { master: pair.master, writer });
