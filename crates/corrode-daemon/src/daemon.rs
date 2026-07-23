@@ -14,6 +14,7 @@ use crate::swarm::{Swarm, Task};
 use crate::terminal::Terminals;
 use crate::vfs::Vfs;
 use corrode_core::{AgentCommand, AgentEvent, Priority};
+use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 pub struct Daemon {
@@ -68,7 +69,8 @@ impl Daemon {
                         return;
                     }
                 };
-                for (id, result) in self.swarm.run(tasks).await {
+                let mut results = self.swarm.run(tasks);
+                while let Some((id, result)) = results.next().await {
                     let ev = match result {
                         Ok(text) => AgentEvent::SubagentOutput { id: id as u64, text },
                         Err(e) => AgentEvent::Error { message: e.to_string() },
@@ -153,9 +155,8 @@ impl Daemon {
         let plan_text = self
             .swarm
             .run(vec![plan_task])
-            .await
-            .into_iter()
             .next()
+            .await
             .map(|(_, r)| r)
             .transpose()?
             .unwrap_or_default();
