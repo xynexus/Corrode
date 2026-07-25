@@ -8,6 +8,7 @@
 //! built), and the VFS.
 
 use crate::graph::GraphStore;
+use crate::plan_graph;
 use crate::planner;
 use crate::roles::{Role, RoleModels};
 use crate::skills::SkillContext;
@@ -66,8 +67,8 @@ impl Daemon {
     async fn handle(&self, cmd: AgentCommand, events: &mpsc::Sender<AgentEvent>) {
         match cmd {
             AgentCommand::Prompt { text, priority } => {
-                let tasks = match self.plan(&text, priority).await {
-                    Ok(tasks) => tasks,
+                let (subtasks, prefix) = match self.plan(&text, priority).await {
+                    Ok(planned) => planned,
                     Err(e) => {
                         let _ = events
                             .send(AgentEvent::Error {
@@ -77,15 +78,67 @@ impl Daemon {
                         return;
                     }
                 };
-                let mut results = self.swarm.run(tasks);
-                while let Some((id, result)) = results.next().await {
-                    let ev = match result {
-                        Ok(text) => AgentEvent::SubagentOutput { id: id as u64, text },
-                        Err(e) => AgentEvent::Error { message: e.to_string() },
-                    };
-                    if events.send(ev).await.is_err() {
-                        return; // consumer gone
+
+                // Seed the reactive plan graph with the decomposition. The scheduler
+                // fans ready tasks to the swarm and grows the graph as agents emit
+                // follow-up work (a test contract, a research spin-off) — dataflow,
+                // not a fixed fan-out. Concurrency is bounded by the swarm's inflight
+                // semaphore inside `execute`, not here.
+                let mut graph = plan_graph::PlanGraph::default();
+                for s in subtasks {
+                    graph.add(s.role, s.prompt, Vec::new());
+                }
+
+                plan_graph::run_reactive(&mut graph, |task| {
+                    let client = self.swarm.client();
+                    let model = self
+                        .roles
+                        .model_for(task.role)
+                        .unwrap_or_default()
+                        .to_string();
+                    let band = planner::band_for(task.role);
+                    let full = planner::subagent_prompt(&prefix, task.role, &task.prompt);
+                    let events = events.clone();
+                    let id = task.id;
+                    async move {
+                        let output = client.respond(&model, &full, band).await;
+                        let emitted = match &output {
+                            Ok(text) => {
+                                let _ = events
+                                    .send(AgentEvent::SubagentOutput {
+                                        id,
+                                        text: text.clone(),
+                                    })
+                                    .await;
+                                plan_graph::parse_emitted(text)
+                            }
+                            Err(e) => {
+                                let _ = events
+                                    .send(AgentEvent::Error {
+                                        message: e.to_string(),
+                                    })
+                                    .await;
+                                Vec::new()
+                            }
+                        };
+                        plan_graph::Outcome { output, emitted }
                     }
+                })
+                .await;
+
+                // Tasks left pending after the scheduler settled had a failed or
+                // unmet dependency (a failed emitter) — surface them rather than
+                // dropping them silently.
+                let stuck = graph.stuck();
+                if !stuck.is_empty() {
+                    let _ = events
+                        .send(AgentEvent::Error {
+                            message: format!(
+                                "{} task(s) could not be scheduled (a dependency failed)",
+                                stuck.len()
+                            ),
+                        })
+                        .await;
                 }
             }
             AgentCommand::DocQuery { question } => {
@@ -139,13 +192,20 @@ impl Daemon {
         }
     }
 
-    /// Decompose a prompt into role-tagged swarm tasks.
+    /// Decompose a prompt into role-tagged subtasks, with the shared context prefix.
     ///
     /// Phase 1: the orchestration model produces a plan (at the request's band).
-    /// Phase 2: [`planner::parse_plan`] + [`planner::to_tasks`] turn it into tasks,
-    /// each on its role's model and band. If the model returns nothing parseable,
-    /// degrade to a single coder task on the raw prompt.
-    async fn plan(&self, text: &str, priority: Priority) -> anyhow::Result<Vec<Task>> {
+    /// Phase 2: [`planner::parse_plan`] turns it into role-tagged [`PlannedSubtask`]s.
+    /// If the model returns nothing parseable, degrade to a single coder task on the
+    /// raw prompt. Returns the subtasks plus the prefix — the caller seeds a
+    /// [`plan_graph::PlanGraph`] with the subtasks and prepends the prefix to every
+    /// subagent prompt (KV reuse), and the reactive scheduler grows the graph as
+    /// agents emit follow-up work.
+    async fn plan(
+        &self,
+        text: &str,
+        priority: Priority,
+    ) -> anyhow::Result<(Vec<planner::PlannedSubtask>, String)> {
         // Built once and shared, byte-identical, by the planning call and every
         // subagent, so hipfire batches them prefix-shared and reuses KV.
         let prefix = self.context_prefix(text).await;
@@ -169,22 +229,17 @@ impl Daemon {
             .transpose()?
             .unwrap_or_default();
 
-        let plan = planner::parse_plan(&plan_text);
+        let mut plan = planner::parse_plan(&plan_text);
         if plan.is_empty() {
-            // ponytail: degrade to one coder task on the raw prompt (still behind
-            // the shared prefix) so a plan the model couldn't structure still gets
-            // attempted rather than dropped.
-            Ok(planner::to_tasks(
-                vec![planner::PlannedSubtask {
-                    role: Role::Coder,
-                    prompt: text.to_string(),
-                }],
-                &self.roles,
-                &prefix,
-            ))
-        } else {
-            Ok(planner::to_tasks(plan, &self.roles, &prefix))
+            // Degrade to one coder task on the raw prompt (still behind the shared
+            // prefix) so a plan the model couldn't structure still gets attempted
+            // rather than dropped.
+            plan = vec![planner::PlannedSubtask {
+                role: Role::Coder,
+                prompt: text.to_string(),
+            }];
         }
+        Ok((plan, prefix))
     }
 
     /// The shared context prefix prepended to every prompt in a Prompt turn.

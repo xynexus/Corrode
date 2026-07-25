@@ -14,6 +14,7 @@ mod daemon;
 mod fuse;
 mod graph;
 mod hipfire;
+mod plan_graph;
 mod planner;
 mod roles;
 mod server;
