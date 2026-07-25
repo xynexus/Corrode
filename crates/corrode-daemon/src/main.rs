@@ -21,6 +21,7 @@ mod server;
 mod skills;
 mod swarm;
 mod terminal;
+mod toolcall;
 mod vfs;
 
 use daemon::Daemon;
@@ -78,8 +79,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let graph = open_graph();
+    let tool_caller = open_tool_caller();
     let vfs = Box::new(PassthroughVfs::new(&repo_root));
-    let daemon = Daemon::new(Swarm::new(client, 32), roles, graph, vfs, skills);
+    let daemon = Daemon::new(Swarm::new(client, 32), roles, graph, vfs, skills, tool_caller);
 
     // Optional FUSE mount of the repo VFS (--features fuse, CORRODE_MOUNT=<dir>), so
     // git and subagent shells see the projection as a real tree. Runs alongside the
@@ -115,6 +117,36 @@ fn open_graph() -> Option<Box<dyn graph::GraphStore>> {
 
 #[cfg(not(feature = "helix"))]
 fn open_graph() -> Option<Box<dyn graph::GraphStore>> {
+    None
+}
+
+/// Load the Needle tool-call shim when built with `--features needle`. Reads
+/// `CORRODE_NEEDLE_ASSETS` (default `assets/needle`); absent assets or a load error
+/// degrade to `None` (the swarm falls back to model-emitted tool calls) rather than
+/// wedging startup.
+#[cfg(feature = "needle")]
+fn open_tool_caller() -> Option<std::sync::Arc<dyn toolcall::ToolCaller>> {
+    match toolcall::needle::NeedleToolCaller::load_from_env() {
+        Ok(Some(caller)) => {
+            eprintln!("Needle tool-caller: loaded");
+            Some(std::sync::Arc::new(caller))
+        }
+        Ok(None) => {
+            eprintln!(
+                "Needle tool-caller: assets not found (set CORRODE_NEEDLE_ASSETS); \
+                 falling back to model-emitted tool calls"
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("Needle tool-caller load failed: {e}; falling back");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "needle"))]
+fn open_tool_caller() -> Option<std::sync::Arc<dyn toolcall::ToolCaller>> {
     None
 }
 

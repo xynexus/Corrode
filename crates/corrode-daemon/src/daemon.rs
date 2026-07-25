@@ -14,9 +14,11 @@ use crate::roles::{Role, RoleModels};
 use crate::skills::SkillContext;
 use crate::swarm::{Swarm, Task};
 use crate::terminal::Terminals;
+use crate::toolcall::ToolCaller;
 use crate::vfs::Vfs;
 use corrode_core::{AgentCommand, AgentEvent, Priority};
 use futures_util::StreamExt;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// How many relevance-ranked skills to surface in the shared prefix per turn.
@@ -32,6 +34,10 @@ pub struct Daemon {
     terminals: Terminals,
     /// Agent Skills + AGENTS.md + the embedded index (fed into the shared prefix).
     skills: SkillContext,
+    /// Reliable tool-calling for small models (the Needle shim). `None` unless built
+    /// with `--features needle` and the assets were found.
+    #[allow(dead_code)] // wired into the tool-execution loop next; loadable + tested now.
+    tool_caller: Option<Arc<dyn ToolCaller>>,
 }
 
 impl Daemon {
@@ -41,6 +47,7 @@ impl Daemon {
         graph: Option<Box<dyn GraphStore>>,
         vfs: Box<dyn Vfs>,
         skills: SkillContext,
+        tool_caller: Option<Arc<dyn ToolCaller>>,
     ) -> Self {
         Self {
             swarm,
@@ -49,6 +56,7 @@ impl Daemon {
             vfs,
             terminals: Terminals::new(),
             skills,
+            tool_caller,
         }
     }
 
@@ -295,6 +303,7 @@ mod tests {
             None,
             Box::new(PassthroughVfs::new(std::env::temp_dir())),
             SkillContext::default(),
+            None,
         )
     }
 

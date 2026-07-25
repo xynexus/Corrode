@@ -26,7 +26,7 @@ written yet. Grep `ponytail:` for every deliberate seam and its upgrade trigger.
 
 ```
 crates/corrode-core     # shared wire types (Priority, AgentCommand/Event, node DTOs). Links nothing heavy; wasm-safe.
-crates/corrode-daemon   # the agent (AGPL-3.0 — see below). modules: daemon (command loop), planner, swarm, roles, hipfire, vfs, graph
+crates/corrode-daemon   # the agent (AGPL-3.0 — see below). modules: daemon (command loop), planner, plan_graph (reactive scheduler), swarm, roles, hipfire, skills, toolcall (Needle shim), vfs, graph
 crates/corrode-web      # web server stub (Apache-2.0)
 webui/                  # wasm front-end seam (out of the cargo workspace; its own trunk/wasm-pack build)
 third_party/helix-db    # git submodule: HelixDB pinned at v2.3.5 (AGPL-3.0), linked in-process behind the `helix` feature
@@ -41,6 +41,7 @@ cargo test                                   # unit tests
 cargo test -p corrode-daemon <name>          # single test
 cargo run -p corrode-daemon                  # serve the daemon ws at ws://127.0.0.1:7878/agent
 cargo build -p corrode-daemon --features helix   # HEAVY: compiles vendored HelixDB (mimalloc/LMDB/HelixQL). Enables the real in-process store.
+cargo build -p corrode-daemon --features needle  # compiles the Needle tool-call shim (CPU/candle). Enables reliable tool-calling for small models.
 cargo run  -p corrode-web                    # serve UI on http://127.0.0.1:8787, proxy /agent -> daemon
 ```
 
@@ -52,7 +53,9 @@ Env: `HIPFIRE_BASE_URL` (default `http://127.0.0.1:11435`), `HIPFIRE_API_KEY`,
 `CORRODE_MODEL` (offline fallback model for all roles), `CORRODE_ROLES` (path to a
 JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`),
 `CORRODE_GRAPH_DIR` (HelixDB path under `--features helix`),
-`CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
+`CORRODE_NEEDLE_ASSETS` (Needle asset dir under `--features needle`, default
+`assets/needle`; absent -> tool-caller disabled, swarm falls back to model-emitted
+calls), `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
 `CORRODE_WEB_ADDR` (web bind, default `127.0.0.1:8787`), `CORRODE_DAEMON_URL`
 (daemon ws the web proxies to), `CORRODE_MAX_TOKENS` (per-call output cap,
 default 1024). The hipfire background daemon must be up (`hipfire start`, not just
@@ -83,20 +86,48 @@ unreachable, all roles fall back to `CORRODE_MODEL`.
 
 ## Planner
 
-`planner.rs` is the two-phase swarm decomposition, driven by `Daemon::plan`:
-phase 1 asks the orchestration model for a JSON plan; phase 2 (`parse_plan` +
-`to_tasks`) turns it into role-tagged `Task`s, each on its role's model and a band
-derived from the role (`band_for`: orchestration→Realtime, architect/coder/review→
-Default, research→Opportunistic). Then the swarm fans them out. Empty/unparseable
-plan degrades to one coder task on the raw prompt.
+`planner.rs` is the two-phase decomposition, driven by `Daemon::plan`: phase 1 asks
+the orchestration model for a JSON plan; phase 2 (`parse_plan`) turns it into
+role-tagged `PlannedSubtask`s. Empty/unparseable plan degrades to one coder task on
+the raw prompt. `plan` returns those subtasks plus the shared prefix; the daemon
+seeds a `plan_graph::PlanGraph` with them and drives it via `run_reactive`.
 
-Every prompt in a turn — the orchestration call and each subagent — begins with a
-byte-identical **context prefix** (`Daemon::context_prefix`), so hipfire batches
-them prefix-shared and reuses KV when they land on the same model. The divergent
-role/task goes in the tail; nothing role-specific precedes the prefix. The
-`to_tasks` test guards this invariant. Remaining ponytail: the prefix is a shallow
-VFS root listing — the graph-backed VFS will supply richer, relevance-ranked
-context (hipfire embeddings/rerank picking nodes) without changing the sharing shape.
+`plan_graph.rs` is the **reactive scheduler** — the daemon's answer to "HelixDB has
+no triggers" (confirmed: none at any layer, so reactivity lives here, like Leptos
+builds it over state not in the DB). The graph is a dependency graph a *running*
+agent can grow: `run_reactive` launches every ready task, and on each completion
+marks it, folds in the tasks it emitted, and reschedules — until nothing is ready
+or in flight. A subagent emits follow-up work (a test contract, a research
+spin-off) by ending its reply with a fenced ` ```tasks ` JSON block, which
+`parse_emitted` folds back in (`after: true` depends on the emitter). Tasks left
+unschedulable after the run settles (`stuck`) surface as an Error. `band_for` maps
+role→band (orchestration→Realtime, architect/coder/review→Default,
+research→Opportunistic).
+
+Every prompt in a turn — the orchestration call and each subagent
+(`subagent_prompt`) — begins with a byte-identical **context prefix**
+(`Daemon::context_prefix`), so hipfire batches them prefix-shared and reuses KV when
+they land on the same model. The divergent role/task goes in the tail; nothing
+role-specific precedes the prefix. The `subagent_prompt` test guards this invariant.
+Remaining ponytail: the prefix is a shallow VFS root listing (plus AGENTS.md rules
+and ranked skills) — the graph-backed VFS will supply richer, relevance-ranked
+context without changing the sharing shape.
+
+## Tool-calling (Needle shim)
+
+`toolcall.rs` gives the swarm's small models reliable tool-calling. Small chat
+models botch tool-call JSON; **Needle** is a tiny CPU/candle encoder-decoder trained
+for one contract — `query + tools JSON -> JSON tool calls` — with grammar-guided
+decoding that constrains output to valid tool names, argument keys, and JSON
+structure. The daemon depends on the `ToolCaller` *trait* (always defined); the
+Needle backend is feature-gated (`--features needle`), mirroring `graph::GraphStore`
+— base build never compiles candle. `Daemon` holds `Option<Arc<dyn ToolCaller>>`,
+loaded from `CORRODE_NEEDLE_ASSETS` (absent -> `None`, degrade to model-emitted
+calls). The shim is a path dep on `../../../build/needle-toolcall-shim` (the user's
+own MIT crate, under active development — a live path dep, not a fork). ponytail: no
+tool-execution loop consumes calls yet; the caller is loaded + tested, wiring is
+next. When it lands, the reactive planner's ` ```tasks ` emission is the first
+candidate to route through Needle instead of trusting the model to format it.
 
 ## Licensing — read before touching the daemon
 
