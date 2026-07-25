@@ -307,6 +307,22 @@ impl JsonStateMachine {
             .is_some_and(|c| c == ':')
     }
 
+    /// True when a value string has just opened with no content yet: the buffer ends
+    /// with the value's opening `"` and only whitespace separates it from the preceding
+    /// `:`. Lets the guide reclaim an enum/literal value whose `:"` arrived as a single
+    /// token (e.g. the `":"` token), which would otherwise open a free string and skip
+    /// literal forcing entirely.
+    fn value_string_just_opened(&self) -> bool {
+        let s = self.buffer.trim_end();
+        let Some(before_quote) = s.strip_suffix('"') else {
+            return false;
+        };
+        match before_quote.rfind(':') {
+            Some(idx) => before_quote[idx + 1..].trim().is_empty(),
+            None => false,
+        }
+    }
+
     fn last_argument_key(&self) -> Option<String> {
         let s = self.buffer.as_str();
         let colon = s.rfind(':')?;
@@ -442,13 +458,8 @@ impl JsonGuide {
     fn start_literal_if_needed(&mut self) {
         if self.machine.state != JsonState::Free
             || !self.machine.in_arguments
-            || self.machine.in_string
             || self.machine.nesting_depth != self.machine.arguments_depth
         {
-            return;
-        }
-        let trimmed = self.machine.buffer.trim_end();
-        if !trimmed.ends_with(':') {
             return;
         }
         let key = (
@@ -458,9 +469,23 @@ impl JsonGuide {
         let Some(targets) = self.constraints.value_literals.get(&key).cloned() else {
             return;
         };
-        self.machine.state = JsonState::InLiteral;
-        self.machine.constrained.clear();
-        self.machine.literal_targets = targets;
+        let trimmed = self.machine.buffer.trim_end();
+        if !self.machine.in_string && trimmed.ends_with(':') {
+            // Colon and value arrived as separate tokens: enter the literal before the
+            // opening quote (constrained starts empty; the quote is the next token).
+            self.machine.state = JsonState::InLiteral;
+            self.machine.constrained.clear();
+            self.machine.literal_targets = targets;
+        } else if self.machine.in_string && self.machine.value_string_just_opened() {
+            // The colon and the value's opening quote arrived in ONE token (e.g. the
+            // `":"` token), so `in_string` was set before we could enter the literal.
+            // Reclaim it: the opening quote is already in the buffer, so seed
+            // `constrained` with it and force the rest to a valid literal.
+            self.machine.in_string = false;
+            self.machine.state = JsonState::InLiteral;
+            self.machine.constrained = "\"".to_string();
+            self.machine.literal_targets = targets;
+        }
     }
 
     fn structural_targets(&self) -> Option<Vec<String>> {
@@ -770,6 +795,56 @@ mod tests {
                 .get(&("pick".to_string(), "nothing".to_string()))
                 .unwrap(),
             &vec!["null".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn value_string_just_opened_detects_an_empty_open_value() {
+        let mut m = JsonStateMachine::default();
+        m.buffer = r#"{"role":""#.to_string(); // colon+quote just consumed, no content
+        assert!(m.value_string_just_opened());
+        m.buffer = r#"{"role" : ""#.to_string(); // whitespace between colon and quote
+        assert!(m.value_string_just_opened());
+        m.buffer = r#"{"role":"res"#.to_string(); // value already has content
+        assert!(!m.value_string_just_opened());
+        m.buffer = r#"{"role":"#.to_string(); // quote not yet emitted
+        assert!(!m.value_string_just_opened());
+    }
+
+    // Regression for the enum-forcing bug: the `":"` between a key and its value is a
+    // single tokenizer token, which used to set `in_string` and open a FREE value,
+    // skipping literal forcing (so `role` decoded as arbitrary text). The guide must
+    // reclaim it and force the enum. Asserts the guide lands in `InLiteral` with the
+    // enum targets after decoding up to the role value.
+    #[test]
+    fn enum_value_is_forced_past_the_merged_colon_quote_token() -> Result<()> {
+        let path = "assets/needle/needle.model";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping enum-forcing test; vendored tokenizer is missing");
+            return Ok(());
+        }
+        let tok = NeedleTokenizer::load(path)?;
+        let tools = r#"[{"name":"emit_task","parameters":{"properties":{"role":{"enum":["research","architect","coder","review"]},"task":{"type":"string"}}}}]"#;
+        let mut guide = JsonGuide::new(tools, &tok)?;
+        // Feed the decoder prefix up to and including the role value's opening quote.
+        let prefix = r#"[{"name":"emit_task","arguments":{"role":""#;
+        for id in tok.encode(prefix)? {
+            guide.update(id);
+        }
+        assert_eq!(
+            guide.machine.state,
+            JsonState::InLiteral,
+            "role value must be literal-forced, not a free string"
+        );
+        assert_eq!(
+            guide.machine.literal_targets,
+            vec![
+                r#""research""#.to_string(),
+                r#""architect""#.to_string(),
+                r#""coder""#.to_string(),
+                r#""review""#.to_string(),
+            ]
         );
         Ok(())
     }
