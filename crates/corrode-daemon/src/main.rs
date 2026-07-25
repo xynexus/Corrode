@@ -42,16 +42,20 @@ async fn main() -> anyhow::Result<()> {
     // Resolve role -> model from hipfire's live model list + optional CORRODE_ROLES
     // overrides. If hipfire is unreachable, fall back to CORRODE_MODEL for all roles.
     let overrides = RoleModels::overrides_from_env()?;
-    let roles = match client.list_models().await {
-        Ok(models) => {
-            eprintln!("hipfire models: {}", models.join(", "));
-            RoleModels::resolve(&models, &overrides)
-                .unwrap_or_else(|_| RoleModels::uniform(&fallback_model))
+    let models = match client.list_models().await {
+        Ok(m) => {
+            eprintln!("hipfire models: {}", m.join(", "));
+            m
         }
         Err(e) => {
             eprintln!("hipfire model list unavailable ({e}); using CORRODE_MODEL for all roles");
-            RoleModels::uniform(&fallback_model)
+            Vec::new()
         }
+    };
+    let roles = if models.is_empty() {
+        RoleModels::uniform(&fallback_model)
+    } else {
+        RoleModels::resolve(&models, &overrides).unwrap_or_else(|_| RoleModels::uniform(&fallback_model))
     };
     let summary: Vec<String> = roles
         .0
@@ -61,9 +65,16 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("role assignments: {}", summary.join("  "));
 
     // Discover Agent Skills (.agents/skills + .corrode/skills, project + ~/) and
-    // project AGENTS.md, for the swarm's shared context.
-    let skills = skills::SkillRegistry::discover(std::path::Path::new(&repo_root));
-    eprintln!("skills discovered: {}", skills.len());
+    // project AGENTS.md, then embed skill descriptions for relevance-ranked selection
+    // (if hipfire serves an embedding model). Falls back to the full manifest.
+    let embed_model = roles::default_embedding_model(&models).map(str::to_string);
+    let skills =
+        skills::SkillContext::build(std::path::Path::new(&repo_root), &client, embed_model).await;
+    eprintln!(
+        "skills discovered: {} (ranked retrieval: {})",
+        skills.count(),
+        skills.ranked()
+    );
 
     let graph = open_graph();
     let vfs = Box::new(PassthroughVfs::new(&repo_root));

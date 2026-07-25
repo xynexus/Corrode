@@ -48,6 +48,11 @@ impl Swarm {
         }
     }
 
+    /// The shared hipfire client (for embeddings / retrieval outside the fan-out).
+    pub fn client(&self) -> Arc<Client> {
+        Arc::clone(&self.client)
+    }
+
     /// Fan out every task concurrently, yielding each `(index, result)` **as it
     /// completes** — a stream, not a batch — so the caller streams partial output
     /// (the first subagent's answer doesn't wait on the slowest). hipfire's

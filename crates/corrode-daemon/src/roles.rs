@@ -114,6 +114,15 @@ const NON_CHAT_MARKERS: &[&str] = &[
     "krea", "flux", "sdxl", "sd3", "stable-diffusion", "-sd", "pixart", "kolors", "imagen",
 ];
 
+/// The embedding model to use for retrieval (skill/doc selection): the first served
+/// model that looks like an embedding model. `None` if hipfire serves none.
+pub fn default_embedding_model(available: &[String]) -> Option<&str> {
+    available
+        .iter()
+        .find(|id| id.to_lowercase().contains("embed"))
+        .map(String::as_str)
+}
+
 /// Default model for unassigned roles: the first served model that isn't an
 /// embedding or image/diffusion model. No size/capability ranking yet.
 fn default_pick(available: &[String]) -> Option<&str> {

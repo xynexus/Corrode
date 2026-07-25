@@ -10,13 +10,16 @@
 use crate::graph::GraphStore;
 use crate::planner;
 use crate::roles::{Role, RoleModels};
-use crate::skills::SkillRegistry;
+use crate::skills::SkillContext;
 use crate::swarm::{Swarm, Task};
 use crate::terminal::Terminals;
 use crate::vfs::Vfs;
 use corrode_core::{AgentCommand, AgentEvent, Priority};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
+
+/// How many relevance-ranked skills to surface in the shared prefix per turn.
+const TOP_K_SKILLS: usize = 8;
 
 pub struct Daemon {
     swarm: Swarm,
@@ -26,8 +29,8 @@ pub struct Daemon {
     vfs: Box<dyn Vfs>,
     /// Live pty-backed terminal sessions.
     terminals: Terminals,
-    /// Discovered Agent Skills + AGENTS.md rules (fed into the shared prefix).
-    skills: SkillRegistry,
+    /// Agent Skills + AGENTS.md + the embedded index (fed into the shared prefix).
+    skills: SkillContext,
 }
 
 impl Daemon {
@@ -36,7 +39,7 @@ impl Daemon {
         roles: RoleModels,
         graph: Option<Box<dyn GraphStore>>,
         vfs: Box<dyn Vfs>,
-        skills: SkillRegistry,
+        skills: SkillContext,
     ) -> Self {
         Self {
             swarm,
@@ -145,7 +148,7 @@ impl Daemon {
     async fn plan(&self, text: &str, priority: Priority) -> anyhow::Result<Vec<Task>> {
         // Built once and shared, byte-identical, by the planning call and every
         // subagent, so hipfire batches them prefix-shared and reuses KV.
-        let prefix = self.context_prefix().await;
+        let prefix = self.context_prefix(text).await;
 
         let orch_model = self
             .roles
@@ -190,20 +193,23 @@ impl Daemon {
     /// The graph-backed VFS will supply richer, relevance-ranked context here
     /// (hipfire embeddings/rerank picking which nodes) — but the KV-sharing shape
     /// is already right: identical bytes across the whole swarm, task in the tail.
-    async fn context_prefix(&self) -> String {
+    async fn context_prefix(&self, task: &str) -> String {
         let mut s = String::from(
             "You are a subagent in the Corrode coding-agent swarm working on a shared \
 repository.\n",
         );
-        // Project rules (AGENTS.md) + available skills — static per run, so they stay
-        // byte-identical across the swarm and share the KV prefill.
+        // Project rules (AGENTS.md) + skills relevant to this task. Byte-identical
+        // across the turn's subagents (same task), so they share the KV prefill.
         let rules = self.skills.agents_rules();
         if !rules.trim().is_empty() {
             s.push_str("\nProject instructions (AGENTS.md):\n");
             s.push_str(rules.trim_end());
             s.push('\n');
         }
-        let manifest = self.skills.manifest();
+        let manifest = self
+            .skills
+            .prefix_section(task, &self.swarm.client(), TOP_K_SKILLS)
+            .await;
         if !manifest.is_empty() {
             s.push('\n');
             s.push_str(&manifest);
@@ -233,7 +239,7 @@ mod tests {
             RoleModels::uniform("test-model"),
             None,
             Box::new(PassthroughVfs::new(std::env::temp_dir())),
-            SkillRegistry::default(),
+            SkillContext::default(),
         )
     }
 

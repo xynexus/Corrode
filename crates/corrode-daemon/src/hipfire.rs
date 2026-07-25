@@ -41,6 +41,24 @@ pub struct ResponsesReply {
     pub output_text: String,
 }
 
+#[derive(Serialize)]
+struct EmbeddingsRequest<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsReply {
+    #[serde(default)]
+    data: Vec<EmbeddingData>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingData {
+    #[serde(default)]
+    embedding: Vec<f32>,
+}
+
 #[derive(Deserialize)]
 struct ModelsReply {
     #[serde(default)]
@@ -101,5 +119,30 @@ impl Client {
         }
         let reply: ResponsesReply = rb.send().await?.error_for_status()?.json().await?;
         Ok(reply.output_text)
+    }
+
+    /// Embed `input` with an embedding model (`/v1/embeddings`) — code/doc/skill
+    /// retrieval is a hipfire call, not a local index. Powers skill selection and,
+    /// later, GraphRAG over HelixDB.
+    // ponytail: no loop caller yet — wired when skill/doc retrieval lands. The
+    // embedding model id (e.g. an EmbeddingGemma variant) is resolved like any role.
+    #[allow(dead_code)]
+    pub async fn embed(&self, model: &str, input: &str) -> anyhow::Result<Vec<f32>> {
+        let req = EmbeddingsRequest { model, input };
+        let mut rb = self
+            .http
+            .post(format!("{}/v1/embeddings", self.base_url))
+            .json(&req);
+        if let Some(key) = &self.api_key {
+            rb = rb.bearer_auth(key);
+        }
+        let reply: EmbeddingsReply = rb.send().await?.error_for_status()?.json().await?;
+        reply
+            .data
+            .into_iter()
+            .next()
+            .map(|d| d.embedding)
+            .filter(|e| !e.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("embeddings: empty response for model {model}"))
     }
 }
