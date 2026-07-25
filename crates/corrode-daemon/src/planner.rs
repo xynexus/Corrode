@@ -39,15 +39,17 @@ subtasks.\n\nUser request:\n{user_prompt}"
 
 /// Compose one subagent prompt: the shared prefix, then the divergent role+task
 /// tail. The prefix must be byte-identical across the whole swarm for KV reuse, so
-/// nothing role-specific goes before it. The tail also invites the agent to emit
-/// follow-up tasks (a test contract, a research spin-off) that the reactive planner
-/// ([`crate::plan_graph`]) schedules.
+/// nothing role-specific goes before it. The tail also invites the agent to propose a
+/// single follow-up (a test contract, a research spin-off) as a plain-English `NEXT:`
+/// line — easy for a small model to write, unlike a JSON tool call. The reactive
+/// planner ([`crate::plan_graph`]) classifies its role (via Needle) and schedules it;
+/// more follow-ups emerge as that task runs and proposes its own.
 pub fn subagent_prompt(context_prefix: &str, role: Role, task: &str) -> String {
     format!(
         "{context_prefix}\n\n[role: {}]\n{task}\n\n\
-(Optional) To spawn follow-up work, end your reply with a fenced ```tasks block — a \
-JSON array of {{\"role\": research|architect|coder|review, \"task\": <instruction>, \
-\"after\": true|false}} (after=true waits for you to finish first).",
+(Optional) If one clear follow-up is warranted, end your reply with a single line:\n\
+NEXT: <one plain-English instruction for the next task>\n\
+Write plain English, not JSON. Omit the line if no follow-up is needed.",
         role.as_str()
     )
 }

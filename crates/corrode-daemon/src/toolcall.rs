@@ -41,8 +41,6 @@ pub struct ToolCall {
 pub trait ToolCaller: Send + Sync {
     /// Decode the tool calls a request implies. `tools_json` is an OpenAI-style array
     /// `[{"name","description","parameters":{...}}]`. An empty result means "no call".
-    // ponytail: no caller in the base build yet — wired with the tool-execution loop.
-    #[allow(dead_code)]
     fn call(&self, query: &str, tools_json: &str) -> anyhow::Result<Vec<ToolCall>>;
 }
 

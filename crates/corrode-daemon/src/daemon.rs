@@ -35,8 +35,7 @@ pub struct Daemon {
     /// Agent Skills + AGENTS.md + the embedded index (fed into the shared prefix).
     skills: SkillContext,
     /// Reliable tool-calling for small models (the Needle shim). `None` unless built
-    /// with `--features needle` and the assets were found.
-    #[allow(dead_code)] // wired into the tool-execution loop next; loadable + tested now.
+    /// with `--features needle` and the assets were found; drives task emission.
     tool_caller: Option<Arc<dyn ToolCaller>>,
 }
 
@@ -107,6 +106,7 @@ impl Daemon {
                     let band = planner::band_for(task.role);
                     let full = planner::subagent_prompt(&prefix, task.role, &task.prompt);
                     let events = events.clone();
+                    let tool_caller = self.tool_caller.clone();
                     let id = task.id;
                     async move {
                         let output = client.respond(&model, &full, band).await;
@@ -118,7 +118,7 @@ impl Daemon {
                                         text: text.clone(),
                                     })
                                     .await;
-                                plan_graph::parse_emitted(text)
+                                emit_followups(tool_caller, text).await
                             }
                             Err(e) => {
                                 let _ = events
@@ -290,6 +290,57 @@ repository.\n",
     }
 }
 
+/// Extract the follow-up task a subagent proposed in its reply.
+///
+/// The agent writes a plain-English `NEXT:` line (see [`planner::subagent_prompt`]) —
+/// easy even for a small model, which can't hand-write a tool call. We then need the
+/// task's *role* (which band/model runs it). With a Needle tool-caller present, Needle
+/// classifies the instruction into one of the role tools ([`plan_graph::ROLE_TASK_TOOLS`]);
+/// tool selection is what it's trained for, so this is reliable — unlike trusting a
+/// small model to emit structured JSON. The task text stays verbatim from the `NEXT:`
+/// line (Needle's own `task` argument truncates). One instruction per reply → one task;
+/// the reactive graph chains the rest.
+///
+/// Without a caller (base build, or assets absent) or on a Needle error, the task still
+/// queues, defaulted to the Coder role. No `NEXT:` line → no emission. Needle inference
+/// is synchronous and CPU-bound, so it runs on a blocking thread.
+async fn emit_followups(
+    tool_caller: Option<Arc<dyn ToolCaller>>,
+    output: &str,
+) -> Vec<plan_graph::Emit> {
+    let Some(instruction) = plan_graph::parse_next_instruction(output) else {
+        return Vec::new(); // no follow-up proposed
+    };
+
+    let role = match tool_caller {
+        Some(caller) => {
+            let query = instruction.clone();
+            match tokio::task::spawn_blocking(move || {
+                caller.call(&query, plan_graph::ROLE_TASK_TOOLS)
+            })
+            .await
+            {
+                Ok(Ok(calls)) => plan_graph::role_from_tool_calls(&calls).unwrap_or(Role::Coder),
+                Ok(Err(e)) => {
+                    eprintln!("Needle role classification failed ({e}); defaulting to coder");
+                    Role::Coder
+                }
+                Err(e) => {
+                    eprintln!("Needle role classification thread panicked ({e}); defaulting to coder");
+                    Role::Coder
+                }
+            }
+        }
+        None => Role::Coder, // no classifier: queue it as a coder task
+    };
+
+    vec![plan_graph::Emit {
+        role,
+        prompt: instruction,
+        after_emitter: false,
+    }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +356,45 @@ mod tests {
             SkillContext::default(),
             None,
         )
+    }
+
+    // Real Needle emission, end-to-end through `emit_followups` (query wrapper +
+    // grammar-guided decode + mapping). Ignored by default (needs the weights):
+    //   cargo test -p corrode-daemon --features needle -- --ignored --nocapture
+    #[cfg(feature = "needle")]
+    #[tokio::test]
+    #[ignore = "requires Needle assets (CORRODE_NEEDLE_ASSETS or the vendored default)"]
+    async fn needle_classifies_the_next_line_role_and_keeps_the_text() {
+        use crate::toolcall::needle::NeedleToolCaller;
+        let caller: Arc<dyn ToolCaller> = Arc::new(
+            NeedleToolCaller::load_from_env()
+                .expect("load Needle")
+                .expect("Needle assets present"),
+        );
+        // Reply ends with a plain-English NEXT: line describing a review follow-up.
+        let reply = "Added the auth middleware in auth.rs.\n\
+            NEXT: review the token-expiry logic in the auth middleware for correctness";
+        let emits = emit_followups(Some(caller), reply).await;
+        let summary: Vec<_> = emits
+            .iter()
+            .map(|e| (e.role, e.prompt.as_str()))
+            .collect();
+        eprintln!("emitted: {summary:?}");
+        assert_eq!(emits.len(), 1, "one NEXT: line -> one task");
+        // Task text is verbatim from the NEXT: line (not Needle's truncated arg).
+        assert_eq!(
+            emits[0].prompt,
+            "review the token-expiry logic in the auth middleware for correctness"
+        );
+        // Needle classifies the role from the instruction (tool selection).
+        assert_eq!(emits[0].role, Role::Review);
+    }
+
+    // No NEXT: line -> no emission (and Needle isn't even called).
+    #[tokio::test]
+    async fn no_next_line_emits_nothing() {
+        let emits = emit_followups(None, "All done. The tests pass and nothing remains.").await;
+        assert!(emits.is_empty());
     }
 
     // The hipfire-free dispatch path: DocQuery without a graph store reports itself

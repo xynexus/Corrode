@@ -12,6 +12,7 @@
 //! emitted tasks out of agent output — is the integration step on top.
 
 use crate::roles::Role;
+use crate::toolcall::ToolCall;
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use std::future::Future;
@@ -150,37 +151,41 @@ where
     }
 }
 
-/// Parse follow-up tasks an agent emitted, from a fenced ```` ```tasks ```` block:
-/// a JSON array of `{"role","task","after"?}`. Absent/malformed -> none.
-pub fn parse_emitted(output: &str) -> Vec<Emit> {
-    let Some(block) = fenced(output, "tasks") else {
-        return Vec::new();
-    };
-    #[derive(serde::Deserialize)]
-    struct Raw {
-        role: String,
-        task: String,
-        #[serde(default)]
-        after: bool,
-    }
-    let raw: Vec<Raw> = serde_json::from_str(block.trim()).unwrap_or_default();
-    raw.into_iter()
-        .filter(|r| !r.task.trim().is_empty())
-        .map(|r| Emit {
-            role: Role::from_str(&r.role).unwrap_or(Role::Coder),
-            prompt: r.task,
-            after_emitter: r.after,
-        })
-        .collect()
+/// Extract the single follow-up instruction an agent proposed, from a `NEXT:` line
+/// (see [`crate::planner::subagent_prompt`]). Plain English — a small model can write
+/// this even though it can't hand-write a tool call. Returns the first such line's
+/// text, trimmed; `None` (no follow-up) if absent or empty.
+pub fn parse_next_instruction(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("NEXT:")?.trim();
+        (!rest.is_empty()).then(|| rest.to_string())
+    })
 }
 
-/// Contents between the first ```` ```<lang> ```` fence and the next ```` ``` ````.
-fn fenced<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
-    let open = format!("```{lang}");
-    let start = text.find(&open)? + open.len();
-    let rest = &text[start..];
-    let end = rest.find("```")?;
-    Some(&rest[..end])
+/// The tools handed to Needle to *classify* a follow-up instruction's role: one tool
+/// per role, in Needle's native flat schema (`parameters` = name -> spec). Role lives
+/// in the tool *name* — Needle is trained to pick one tool per turn, which it does
+/// reliably, unlike filling an enum argument. We take only the chosen tool (the role);
+/// the instruction text comes verbatim from the agent's `NEXT:` line, not from Needle's
+/// (often-truncated) `task` argument. Paired with [`role_from_tool_calls`].
+///
+/// ponytail: Needle will be finetuned on Corrode's actual tool set so the small coder
+/// models' tools are picked up reliably. Once that lands, its `task` argument becomes
+/// trustworthy too and the verbatim-text shortcut can drop — and this same schema
+/// shape extends to the real tool-execution tools (read_file, run_command, ...).
+pub const ROLE_TASK_TOOLS: &str = r#"[{"name":"research_task","description":"Investigate, read specs or docs, or survey prior art.","parameters":{"task":{"type":"string","description":"What to investigate.","required":true}}},{"name":"coding_task","description":"Write or modify code or tests.","parameters":{"task":{"type":"string","description":"What to build.","required":true}}},{"name":"architecture_task","description":"Make a design or structural decision.","parameters":{"task":{"type":"string","description":"What to design.","required":true}}},{"name":"review_task","description":"Check the correctness or quality of existing code.","parameters":{"task":{"type":"string","description":"What to review.","required":true}}}]"#;
+
+/// The role Needle picked, from the first call's tool name (see [`ROLE_TASK_TOOLS`]).
+/// Unknown/absent -> None (the caller defaults to Coder).
+pub fn role_from_tool_calls(calls: &[ToolCall]) -> Option<Role> {
+    let name = &calls.first()?.name;
+    match name.as_str() {
+        "research_task" => Some(Role::Research),
+        "coding_task" => Some(Role::Coder),
+        "architecture_task" => Some(Role::Architect),
+        "review_task" => Some(Role::Review),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -189,17 +194,41 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn parse_emitted_reads_a_tasks_block() {
-        let out = "Here's the code.\n\n```tasks\n\
-            [{\"role\":\"coder\",\"task\":\"write a test\",\"after\":true},\
-             {\"role\":\"research\",\"task\":\"check the RFC\"}]\n```\n";
-        let emits = parse_emitted(out);
-        assert_eq!(emits.len(), 2);
-        assert_eq!(emits[0].role, Role::Coder);
-        assert!(emits[0].after_emitter);
-        assert_eq!(emits[1].role, Role::Research);
-        assert!(!emits[1].after_emitter);
-        assert!(parse_emitted("no block here").is_empty());
+    fn parse_next_instruction_reads_the_next_line() {
+        let out = "I implemented add() in math.rs.\nNEXT: write unit tests for add() covering overflow\n";
+        assert_eq!(
+            parse_next_instruction(out).as_deref(),
+            Some("write unit tests for add() covering overflow")
+        );
+        // no line -> None; empty NEXT -> None
+        assert_eq!(parse_next_instruction("all done, nothing to do"), None);
+        assert_eq!(parse_next_instruction("NEXT:   "), None);
+    }
+
+    #[test]
+    fn role_from_tool_calls_maps_the_chosen_tool_name() {
+        let call = |n: &str| ToolCall {
+            name: n.into(),
+            arguments: serde_json::json!({"task":"x"}),
+        };
+        assert_eq!(
+            role_from_tool_calls(&[call("research_task")]),
+            Some(Role::Research)
+        );
+        assert_eq!(role_from_tool_calls(&[call("coding_task")]), Some(Role::Coder));
+        assert_eq!(
+            role_from_tool_calls(&[call("architecture_task")]),
+            Some(Role::Architect)
+        );
+        assert_eq!(role_from_tool_calls(&[call("review_task")]), Some(Role::Review));
+        // one call per turn: only the first is consulted
+        assert_eq!(
+            role_from_tool_calls(&[call("review_task"), call("coding_task")]),
+            Some(Role::Review)
+        );
+        // unknown / empty -> None (caller defaults to Coder)
+        assert_eq!(role_from_tool_calls(&[call("frobnicate")]), None);
+        assert_eq!(role_from_tool_calls(&[]), None);
     }
 
     // A coder task emits a test contract mid-run; a review task depends on the coder.

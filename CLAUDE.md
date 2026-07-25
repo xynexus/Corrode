@@ -117,21 +117,31 @@ context without changing the sharing shape.
 
 ## Tool-calling (Needle shim)
 
-`toolcall.rs` gives the swarm's small models reliable tool-calling. Small chat
-models botch tool-call JSON; **Needle** is a tiny CPU/candle encoder-decoder trained
-for one contract — `query + tools JSON -> JSON tool calls` — with grammar-guided
-decoding that constrains output to valid tool names, argument keys, and JSON
-structure. The daemon depends on the `ToolCaller` *trait* (always defined); the
-Needle backend is feature-gated (`--features needle`), mirroring `graph::GraphStore`
-— base build never compiles candle. `Daemon` holds `Option<Arc<dyn ToolCaller>>`,
-loaded from `CORRODE_NEEDLE_ASSETS` (default: the vendored crate's weights; absent ->
-`None`, degrade to model-emitted calls). The shim was merged in from a throwaway
-experiment and lives at `crates/needle-toolcall-shim` — a workspace-EXCLUDED crate
-(so the base build never compiles candle), pulled in only by `--features needle`. Its
-weights are committed under `assets/needle`. ponytail: no tool-execution loop consumes
-calls yet; the caller is loaded + tested, wiring is next. When it lands, the reactive
-planner's ` ```tasks ` emission is the first candidate to route through Needle instead
-of trusting the model to format it.
+`toolcall.rs` gives the swarm's small models reliable tool-calling. Small chat models
+botch tool-call JSON; **Needle** (a tiny CPU/candle encoder-decoder) takes a plain
+plain-English instruction plus a tool schema and picks ONE tool per turn, formatting
+the call for them. Its native tool schema is *flat* — `parameters` is a `name -> {type,
+description, required}` map, NOT the OpenAI `type:object/properties/required` nesting
+(feeding the nested form is out-of-distribution and degrades output). The daemon
+depends on the `ToolCaller` *trait* (always defined); the Needle backend is
+feature-gated (`--features needle`), mirroring `graph::GraphStore` — base build never
+compiles candle. `Daemon` holds `Option<Arc<dyn ToolCaller>>`, loaded from
+`CORRODE_NEEDLE_ASSETS` (default: the vendored crate's weights). The shim was merged in
+from a throwaway experiment and lives at `crates/needle-toolcall-shim` — a
+workspace-EXCLUDED crate, weights committed under `assets/needle`.
+
+**First use — reactive-planner task emission.** A subagent proposes a follow-up as a
+plain-English `NEXT:` line (easy for a small model; no JSON). `emit_followups` feeds
+that one line to Needle against `plan_graph::ROLE_TASK_TOOLS` (one tool per role —
+`research_task`/`coding_task`/`architecture_task`/`review_task`); Needle picks the tool,
+which gives the task's role (band/model). The task text stays verbatim from the `NEXT:`
+line (Needle's `task` arg truncates pre-finetune). One instruction → one task; the
+reactive graph chains the rest. No caller / Needle error -> the task still queues as
+Coder; no `NEXT:` line -> no emission. ponytail: Needle will be finetuned on Corrode's
+actual tools (incl. the real tool-execution set: read_file, run_command, ...) so the
+small coders' tools are picked up reliably; then its structured args become trustworthy
+too. Note: the guide's enum/literal token-forcing had a bug (the merged `":"` token
+bypassed it) — fixed in `needle-toolcall-shim/src/guide.rs`.
 
 ## Licensing — read before touching the daemon
 
