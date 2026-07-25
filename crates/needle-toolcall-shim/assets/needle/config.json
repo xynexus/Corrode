@@ -1,0 +1,20 @@
+{
+  "vocab_size": 8192,
+  "d_model": 512,
+  "num_heads": 8,
+  "num_kv_heads": 4,
+  "num_encoder_layers": 12,
+  "num_decoder_layers": 8,
+  "d_ff": 2048,
+  "max_seq_len": 1024,
+  "pad_token_id": 0,
+  "rope_theta": 10000.0,
+  "dtype": "bfloat16",
+  "activation": "swiglu",
+  "num_memory_slots": 64,
+  "n_mels": 80,
+  "dropout_rate": 0.1,
+  "contrastive_dim": 128,
+  "enable_speech": false,
+  "no_feedforward": true
+}

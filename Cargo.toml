@@ -5,10 +5,14 @@ members = [
     "crates/corrode-daemon",
     "crates/corrode-web",
 ]
-# Keep the vendored HelixDB workspace from being absorbed as members — it stays a
-# plain (optional, feature-gated) path dependency of corrode-daemon, not part of
-# our build/test graph unless `--features helix` is on.
-exclude = ["third_party"]
+# Keep heavy, feature-gated path dependencies out of the base build/test graph. Each
+# is a plain path dependency of corrode-daemon that only compiles under its feature:
+#   third_party/helix-db            -> `--features helix`  (vendored HelixDB, AGPL)
+#   crates/needle-toolcall-shim     -> `--features needle` (vendored Needle tool-call
+#                                       shim, a merged-in CPU/candle experiment)
+# Excluding them means `cargo build`/`cargo test` at the root never drags candle or
+# HelixDB in, while the daemon can still pull each in behind its feature flag.
+exclude = ["third_party", "crates/needle-toolcall-shim"]
 # webui/ is a wasm crate on its own build target (trunk/wasm-pack), kept OUT of the
 # native workspace so `cargo build` doesn't drag a wasm toolchain in. See webui/README.md.
 

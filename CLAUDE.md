@@ -28,6 +28,7 @@ written yet. Grep `ponytail:` for every deliberate seam and its upgrade trigger.
 crates/corrode-core     # shared wire types (Priority, AgentCommand/Event, node DTOs). Links nothing heavy; wasm-safe.
 crates/corrode-daemon   # the agent (AGPL-3.0 — see below). modules: daemon (command loop), planner, plan_graph (reactive scheduler), swarm, roles, hipfire, skills, toolcall (Needle shim), vfs, graph
 crates/corrode-web      # web server stub (Apache-2.0)
+crates/needle-toolcall-shim  # vendored Needle tool-call model (Apache-2.0, CPU/candle). Workspace-EXCLUDED; corrode-daemon links it behind `--features needle`. Weights committed under assets/needle.
 webui/                  # wasm front-end seam (out of the cargo workspace; its own trunk/wasm-pack build)
 third_party/helix-db    # git submodule: HelixDB pinned at v2.3.5 (AGPL-3.0), linked in-process behind the `helix` feature
 third_party/helix-skills# vendored HelixDB agent skills (MIT); Rust-relevant ones symlinked into .claude/skills/
@@ -53,9 +54,10 @@ Env: `HIPFIRE_BASE_URL` (default `http://127.0.0.1:11435`), `HIPFIRE_API_KEY`,
 `CORRODE_MODEL` (offline fallback model for all roles), `CORRODE_ROLES` (path to a
 JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`),
 `CORRODE_GRAPH_DIR` (HelixDB path under `--features helix`),
-`CORRODE_NEEDLE_ASSETS` (Needle asset dir under `--features needle`, default
-`assets/needle`; absent -> tool-caller disabled, swarm falls back to model-emitted
-calls), `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
+`CORRODE_NEEDLE_ASSETS` (Needle asset dir under `--features needle`; defaults to the
+vendored `crates/needle-toolcall-shim/assets/needle`, resolved at build time, so it
+works out of the box; absent -> tool-caller disabled, swarm falls back to
+model-emitted calls), `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
 `CORRODE_WEB_ADDR` (web bind, default `127.0.0.1:8787`), `CORRODE_DAEMON_URL`
 (daemon ws the web proxies to), `CORRODE_MAX_TOKENS` (per-call output cap,
 default 1024). The hipfire background daemon must be up (`hipfire start`, not just
@@ -122,12 +124,14 @@ decoding that constrains output to valid tool names, argument keys, and JSON
 structure. The daemon depends on the `ToolCaller` *trait* (always defined); the
 Needle backend is feature-gated (`--features needle`), mirroring `graph::GraphStore`
 — base build never compiles candle. `Daemon` holds `Option<Arc<dyn ToolCaller>>`,
-loaded from `CORRODE_NEEDLE_ASSETS` (absent -> `None`, degrade to model-emitted
-calls). The shim is a path dep on `../../../build/needle-toolcall-shim` (the user's
-own MIT crate, under active development — a live path dep, not a fork). ponytail: no
-tool-execution loop consumes calls yet; the caller is loaded + tested, wiring is
-next. When it lands, the reactive planner's ` ```tasks ` emission is the first
-candidate to route through Needle instead of trusting the model to format it.
+loaded from `CORRODE_NEEDLE_ASSETS` (default: the vendored crate's weights; absent ->
+`None`, degrade to model-emitted calls). The shim was merged in from a throwaway
+experiment and lives at `crates/needle-toolcall-shim` — a workspace-EXCLUDED crate
+(so the base build never compiles candle), pulled in only by `--features needle`. Its
+weights are committed under `assets/needle`. ponytail: no tool-execution loop consumes
+calls yet; the caller is loaded + tested, wiring is next. When it lands, the reactive
+planner's ` ```tasks ` emission is the first candidate to route through Needle instead
+of trusting the model to format it.
 
 ## Licensing — read before touching the daemon
 

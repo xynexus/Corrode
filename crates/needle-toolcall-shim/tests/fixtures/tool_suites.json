@@ -1,0 +1,1801 @@
+[
+  {
+    "suite": "opencode_builtin",
+    "source": "https://dev.opencode.ai/docs/tools/",
+    "notes": "OpenCode built-in tool names from the public tools documentation; schemas are compact OpenAI-style equivalents for shim stress tests.",
+    "tools": [
+      {
+        "name": "bash",
+        "description": "Execute shell commands in the project environment.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      },
+      {
+        "name": "edit",
+        "description": "Modify existing files using exact string replacements.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string"
+            },
+            "oldString": {
+              "type": "string"
+            },
+            "newString": {
+              "type": "string"
+            },
+            "replaceAll": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "filePath",
+            "oldString",
+            "newString"
+          ]
+        }
+      },
+      {
+        "name": "write",
+        "description": "Create or overwrite a file.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "filePath",
+            "content"
+          ]
+        }
+      },
+      {
+        "name": "read",
+        "description": "Read file contents, optionally with a range.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string"
+            },
+            "offset": {
+              "type": "integer"
+            },
+            "limit": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "filePath"
+          ]
+        }
+      },
+      {
+        "name": "grep",
+        "description": "Search file contents with a regular expression.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "include": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      },
+      {
+        "name": "glob",
+        "description": "Find files by glob pattern.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      },
+      {
+        "name": "lsp",
+        "description": "Query language-server code intelligence.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "string",
+              "enum": [
+                "goToDefinition",
+                "findReferences",
+                "hover",
+                "documentSymbol",
+                "workspaceSymbol",
+                "goToImplementation",
+                "prepareCallHierarchy",
+                "incomingCalls",
+                "outgoingCalls"
+              ]
+            },
+            "filePath": {
+              "type": "string"
+            },
+            "line": {
+              "type": "integer"
+            },
+            "character": {
+              "type": "integer"
+            },
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      },
+      {
+        "name": "apply_patch",
+        "description": "Apply a unified patch to project files.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "patchText": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "patchText"
+          ]
+        }
+      },
+      {
+        "name": "skill",
+        "description": "Load a local skill document.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      },
+      {
+        "name": "todowrite",
+        "description": "Create or update task-list items.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "todos": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "content": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "pending",
+                      "in_progress",
+                      "completed"
+                    ]
+                  }
+                },
+                "required": [
+                  "content",
+                  "status"
+                ]
+              }
+            }
+          },
+          "required": [
+            "todos"
+          ]
+        }
+      },
+      {
+        "name": "webfetch",
+        "description": "Fetch and read a web page.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "format": {
+              "type": "string",
+              "enum": [
+                "markdown",
+                "html",
+                "text"
+              ]
+            }
+          },
+          "required": [
+            "url"
+          ]
+        }
+      },
+      {
+        "name": "websearch",
+        "description": "Search the web for information.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "question",
+        "description": "Ask the user a question.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "header": {
+              "type": "string"
+            },
+            "question": {
+              "type": "string"
+            },
+            "options": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "question"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "suite": "smallcode_builtin",
+    "source": "https://www.kuro7983.com/repo/Doorman11991/smallcode",
+    "notes": "SmallCode public README tool table mirrored as compact test schemas; kept local so this repo has no SmallCode runtime dependency.",
+    "tools": [
+      {
+        "name": "bone_compile",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string"
+            },
+            "outDir": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "filePath"
+          ]
+        }
+      },
+      {
+        "name": "bone_check",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string"
+            },
+            "strict": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "filePath"
+          ]
+        }
+      },
+      {
+        "name": "list_projects",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "includeStats": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      {
+        "name": "graph_search",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "function",
+                "class",
+                "file",
+                "symbol"
+              ]
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "explain_symbol",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string"
+            },
+            "filePath": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "symbol"
+          ]
+        }
+      },
+      {
+        "name": "read_file",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "startLine": {
+              "type": "integer"
+            },
+            "endLine": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      },
+      {
+        "name": "write_file",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "overwrite": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ]
+        }
+      },
+      {
+        "name": "patch",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "search": {
+              "type": "string"
+            },
+            "replace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "search",
+            "replace"
+          ]
+        }
+      },
+      {
+        "name": "bash",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "cwd": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      },
+      {
+        "name": "search",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "caseSensitive": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      },
+      {
+        "name": "find_files",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "glob": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "glob"
+          ]
+        }
+      },
+      {
+        "name": "memory_load",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "memory_remember",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "note": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "note"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "suite": "hermes_function_calling",
+    "source": "https://huggingface.co/datasets/minpeter/hermes-function-calling-v1-jsonl",
+    "notes": "Hermes-style API/domain functions covering nested schemas, enums, arrays, nulls, and booleans.",
+    "tools": [
+      {
+        "name": "get_stock_fundamentals",
+        "description": "Get fundamental data for a stock symbol.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string"
+            },
+            "includeFinancials": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "symbol"
+          ]
+        }
+      },
+      {
+        "name": "search_flights",
+        "description": "Find flights between two cities.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "origin": {
+              "type": "string"
+            },
+            "destination": {
+              "type": "string"
+            },
+            "departDate": {
+              "type": "string"
+            },
+            "cabin": {
+              "type": "string",
+              "enum": [
+                "economy",
+                "premium_economy",
+                "business",
+                "first"
+              ]
+            },
+            "nonstop": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "origin",
+            "destination",
+            "departDate"
+          ]
+        }
+      },
+      {
+        "name": "book_flight",
+        "description": "Book a selected flight.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "flightId": {
+              "type": "string"
+            },
+            "passengerName": {
+              "type": "string"
+            },
+            "seatPreference": {
+              "type": "string",
+              "enum": [
+                "aisle",
+                "window",
+                "middle"
+              ]
+            }
+          },
+          "required": [
+            "flightId",
+            "passengerName"
+          ]
+        }
+      },
+      {
+        "name": "get_weather",
+        "description": "Get weather for a location.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            }
+          },
+          "required": [
+            "location"
+          ]
+        }
+      },
+      {
+        "name": "send_email",
+        "description": "Send an email message.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "to": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "subject": {
+              "type": "string"
+            },
+            "body": {
+              "type": "string"
+            },
+            "cc": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "to",
+            "subject",
+            "body"
+          ]
+        }
+      },
+      {
+        "name": "create_calendar_event",
+        "description": "Create a calendar event.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "startTime": {
+              "type": "string"
+            },
+            "endTime": {
+              "type": "string"
+            },
+            "attendees": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "visibility": {
+              "type": "string",
+              "enum": [
+                "default",
+                "public",
+                "private"
+              ]
+            }
+          },
+          "required": [
+            "title",
+            "startTime",
+            "endTime"
+          ]
+        }
+      },
+      {
+        "name": "lookup_order",
+        "description": "Look up an order by id or email.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "orderId": {
+              "type": "string"
+            },
+            "email": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "refund_order",
+        "description": "Refund an order.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "orderId": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string",
+              "enum": [
+                "duplicate",
+                "fraudulent",
+                "requested_by_customer"
+              ]
+            },
+            "notifyCustomer": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "orderId",
+            "reason"
+          ]
+        }
+      },
+      {
+        "name": "search_hotels",
+        "description": "Search hotel availability.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "checkIn": {
+              "type": "string"
+            },
+            "checkOut": {
+              "type": "string"
+            },
+            "rooms": {
+              "type": "integer"
+            },
+            "amenities": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "wifi",
+                  "parking",
+                  "pool",
+                  "gym",
+                  "spa"
+                ]
+              }
+            }
+          },
+          "required": [
+            "city",
+            "checkIn",
+            "checkOut"
+          ]
+        }
+      },
+      {
+        "name": "reserve_hotel",
+        "description": "Reserve a selected hotel room.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "hotelId": {
+              "type": "string"
+            },
+            "roomType": {
+              "type": "string",
+              "enum": [
+                "standard",
+                "suite",
+                "deluxe"
+              ]
+            },
+            "guestName": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "hotelId",
+            "guestName"
+          ]
+        }
+      },
+      {
+        "name": "track_package",
+        "description": "Track a shipment.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "trackingNumber": {
+              "type": "string"
+            },
+            "carrier": {
+              "type": "string",
+              "enum": [
+                "ups",
+                "fedex",
+                "usps",
+                "dhl"
+              ]
+            }
+          },
+          "required": [
+            "trackingNumber"
+          ]
+        }
+      },
+      {
+        "name": "convert_currency",
+        "description": "Convert an amount between currencies.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "amount": {
+              "type": "number"
+            },
+            "fromCurrency": {
+              "type": "string"
+            },
+            "toCurrency": {
+              "type": "string"
+            },
+            "date": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "amount",
+            "fromCurrency",
+            "toCurrency"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "suite": "hermes_current_session",
+    "source": "current_tool_export.md temporary local export, imported then removed",
+    "notes": "Exact Hermes current-session tool surface imported from the user-provided export. Covers browser, cron, delegation, filesystem, shell, memory, messaging, skills, web, media, and multi-tool wrapper schemas.",
+    "tools": [
+      {
+        "name": "browser_back",
+        "description": "Navigate back to the previous browser history page.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      },
+      {
+        "name": "browser_click",
+        "description": "Click an element identified by a ref ID from a browser snapshot.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string",
+              "description": "Element reference, e.g. @e5"
+            }
+          },
+          "required": [
+            "ref"
+          ]
+        }
+      },
+      {
+        "name": "browser_console",
+        "description": "Get browser console output and JavaScript errors, or evaluate JavaScript in the page context.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "clear": {
+              "type": "boolean",
+              "default": false
+            },
+            "expression": {
+              "type": "string",
+              "description": "JavaScript expression to evaluate in page context"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "browser_get_images",
+        "description": "List all images on the current page with URLs and alt text.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      },
+      {
+        "name": "browser_navigate",
+        "description": "Navigate to a URL in the browser. Initializes browser session and returns a compact accessibility snapshot. Prefer `web_search`/`web_extract` for simple information retrieval or plain-text endpoints.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "url"
+          ]
+        }
+      },
+      {
+        "name": "browser_press",
+        "description": "Press a keyboard key in the browser.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "key": {
+              "type": "string",
+              "examples": [
+                "Enter",
+                "Tab",
+                "Escape",
+                "ArrowDown"
+              ]
+            }
+          },
+          "required": [
+            "key"
+          ]
+        }
+      },
+      {
+        "name": "browser_scroll",
+        "description": "Scroll the browser page.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "direction": {
+              "type": "string",
+              "enum": [
+                "up",
+                "down"
+              ]
+            }
+          },
+          "required": [
+            "direction"
+          ]
+        }
+      },
+      {
+        "name": "browser_snapshot",
+        "description": "Get a text accessibility-tree snapshot of the current browser page. Use `full=true` for complete page content.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "full": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "browser_type",
+        "description": "Type text into an input field identified by ref ID. Clears the field first.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ref",
+            "text"
+          ]
+        }
+      },
+      {
+        "name": "browser_vision",
+        "description": "Take a screenshot of the current browser page and analyze it visually. Useful for CAPTCHAs, visual verification, and layouts not captured by text snapshots.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string"
+            },
+            "annotate": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "question"
+          ]
+        }
+      },
+      {
+        "name": "clarify",
+        "description": "Ask the user a clarification or decision question. Supports open-ended or up to four multiple-choice options. Do not use for simple yes/no confirmation of dangerous commands; terminal handles that.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string"
+            },
+            "choices": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 4
+            }
+          },
+          "required": [
+            "question"
+          ]
+        }
+      },
+      {
+        "name": "cronjob",
+        "description": "Create/list/update/pause/resume/remove/run scheduled cron jobs.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "create",
+                "list",
+                "update",
+                "pause",
+                "resume",
+                "remove",
+                "run"
+              ]
+            },
+            "job_id": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "schedule": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "repeat": {
+              "type": "integer"
+            },
+            "deliver": {
+              "type": "string"
+            },
+            "skills": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "model": {
+              "type": "object",
+              "properties": {
+                "provider": {
+                  "type": "string"
+                },
+                "model": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model"
+              ]
+            },
+            "script": {
+              "type": "string"
+            },
+            "no_agent": {
+              "type": "boolean",
+              "default": false
+            },
+            "context_from": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "enabled_toolsets": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "workdir": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      },
+      {
+        "name": "delegate_task",
+        "description": "Spawn one or more isolated subagents synchronously. Use for reasoning-heavy subtasks, parallel independent workstreams, or context-heavy investigation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "goal": {
+              "type": "string"
+            },
+            "context": {
+              "type": "string"
+            },
+            "toolsets": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "tasks": {
+              "type": "array",
+              "maxItems": 3,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "goal": {
+                    "type": "string"
+                  },
+                  "context": {
+                    "type": "string"
+                  },
+                  "toolsets": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "acp_command": {
+                    "type": "string"
+                  },
+                  "acp_args": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "leaf",
+                      "orchestrator"
+                    ]
+                  }
+                },
+                "required": [
+                  "goal"
+                ]
+              }
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "leaf",
+                "orchestrator"
+              ]
+            },
+            "acp_command": {
+              "type": "string"
+            },
+            "acp_args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "execute_code",
+        "description": "Run a Python script that can call Hermes tools programmatically. Use for 3+ tool calls with processing logic, loops, retries, or output reduction.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code"
+          ]
+        }
+      },
+      {
+        "name": "image_generate",
+        "description": "Generate an image from a prompt. Backend/model are user-configured and not agent-selected.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string"
+            },
+            "aspect_ratio": {
+              "type": "string",
+              "enum": [
+                "landscape",
+                "square",
+                "portrait"
+              ],
+              "default": "landscape"
+            }
+          },
+          "required": [
+            "prompt"
+          ]
+        }
+      },
+      {
+        "name": "memory",
+        "description": "Manage persistent memory. Save compact durable facts about user preferences, stable environment facts, and reusable lessons. Do not save temporary task progress, PR numbers, issue numbers, commit SHAs, or stale artifacts.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "add",
+                "replace",
+                "remove"
+              ]
+            },
+            "target": {
+              "type": "string",
+              "enum": [
+                "memory",
+                "user"
+              ]
+            },
+            "content": {
+              "type": "string"
+            },
+            "old_text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "target"
+          ]
+        }
+      },
+      {
+        "name": "patch",
+        "description": "Targeted file edits. Prefer over `sed`/`awk`. Supports replace mode and V4A multi-file patch mode. Auto-runs syntax checks after editing.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "replace",
+                "patch"
+              ],
+              "default": "replace"
+            },
+            "path": {
+              "type": "string"
+            },
+            "old_string": {
+              "type": "string"
+            },
+            "new_string": {
+              "type": "string"
+            },
+            "replace_all": {
+              "type": "boolean",
+              "default": false
+            },
+            "patch": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        }
+      },
+      {
+        "name": "process",
+        "description": "Manage background processes started with `terminal(background=true)`.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "list",
+                "poll",
+                "log",
+                "wait",
+                "kill",
+                "write",
+                "submit",
+                "close"
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "data": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "offset": {
+              "type": "integer"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      },
+      {
+        "name": "read_file",
+        "description": "Read a text file with line numbers and pagination. Prefer over `cat/head/tail`. Cannot read images or binary files.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "offset": {
+              "type": "integer",
+              "default": 1,
+              "minimum": 1
+            },
+            "limit": {
+              "type": "integer",
+              "default": 500,
+              "maximum": 2000
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      },
+      {
+        "name": "search_files",
+        "description": "Search file contents or find files by glob. Prefer over `grep/rg/find/ls`.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string",
+              "enum": [
+                "content",
+                "files"
+              ],
+              "default": "content"
+            },
+            "path": {
+              "type": "string",
+              "default": "."
+            },
+            "file_glob": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer",
+              "default": 50
+            },
+            "offset": {
+              "type": "integer",
+              "default": 0
+            },
+            "output_mode": {
+              "type": "string",
+              "enum": [
+                "content",
+                "files_only",
+                "count"
+              ],
+              "default": "content"
+            },
+            "context": {
+              "type": "integer",
+              "default": 0
+            }
+          },
+          "required": [
+            "pattern"
+          ]
+        }
+      },
+      {
+        "name": "send_message",
+        "description": "Send a message to a connected platform, or list available targets. If sending to a specific channel/person, call `send_message(action=\"list\")` first. If user names only a platform, send directly to home channel.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "send",
+                "list"
+              ],
+              "default": "send"
+            },
+            "target": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "session_search",
+        "description": "Search long-term memory of past conversations or browse recent sessions. Use proactively when user references prior work.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "role_filter": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer",
+              "default": 3,
+              "maximum": 5
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "skill_manage",
+        "description": "Create, patch, edit, delete, or manage files in skills. Confirm with user before creating/deleting skills. Patch skills immediately when loaded skill instructions are stale/wrong.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "create",
+                "patch",
+                "edit",
+                "delete",
+                "write_file",
+                "remove_file"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "old_string": {
+              "type": "string"
+            },
+            "new_string": {
+              "type": "string"
+            },
+            "replace_all": {
+              "type": "boolean"
+            },
+            "category": {
+              "type": "string"
+            },
+            "file_path": {
+              "type": "string"
+            },
+            "file_content": {
+              "type": "string"
+            },
+            "absorbed_into": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "name"
+          ]
+        }
+      },
+      {
+        "name": "skill_view",
+        "description": "Load a skill's full content or linked files. Must be used when a relevant skill exists.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "file_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      },
+      {
+        "name": "skills_list",
+        "description": "List available skills, optionally by category.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "category": {
+              "type": "string"
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "terminal",
+        "description": "Execute shell commands on Linux. Filesystem usually persists.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "background": {
+              "type": "boolean",
+              "default": false
+            },
+            "timeout": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "workdir": {
+              "type": "string"
+            },
+            "pty": {
+              "type": "boolean",
+              "default": false
+            },
+            "notify_on_complete": {
+              "type": "boolean",
+              "default": false
+            },
+            "watch_patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      },
+      {
+        "name": "text_to_speech",
+        "description": "Convert text to speech audio. Provider/voice are user-configured. In CLI mode saves under `~/voice-memos/` unless output path is provided.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "output_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ]
+        }
+      },
+      {
+        "name": "todo",
+        "description": "Manage current-session task list. Use for complex tasks with 3+ steps or multiple tasks. Only one item should be `in_progress` at a time.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "todos": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "pending",
+                      "in_progress",
+                      "completed",
+                      "cancelled"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "content",
+                  "status"
+                ]
+              }
+            },
+            "merge": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": []
+        }
+      },
+      {
+        "name": "vision_analyze",
+        "description": "Load and analyze an image from URL, local path, or data URL. Use whenever user references an image.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "image_url": {
+              "type": "string"
+            },
+            "question": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "image_url",
+            "question"
+          ]
+        }
+      },
+      {
+        "name": "web_extract",
+        "description": "Extract content from web pages/PDF URLs as markdown. Prefer over browser for non-interactive retrieval. Max 5 URLs.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "urls": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 5
+            }
+          },
+          "required": [
+            "urls"
+          ]
+        }
+      },
+      {
+        "name": "web_search",
+        "description": "Search the web for current information. Supports backend-dependent search operators.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer",
+              "default": 5,
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "write_file",
+        "description": "Write content to a file, replacing any existing content. Prefer over shell heredocs. Creates parent directories. Auto-runs syntax checks on supported file types.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ]
+        }
+      },
+      {
+        "name": "multi_tool_use.parallel",
+        "description": "Run multiple developer tools simultaneously, only if they can operate in parallel. Only tools defined in developer messages may be called. Do not use for dependent calls.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "tool_uses": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "recipient_name": {
+                    "type": "string",
+                    "description": "Format: <tool_name>.<function_name>"
+                  },
+                  "parameters": {
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "recipient_name",
+                  "parameters"
+                ]
+              }
+            }
+          },
+          "required": [
+            "tool_uses"
+          ]
+        }
+      }
+    ]
+  }
+]

@@ -72,8 +72,11 @@ pub mod needle {
     use std::path::Path;
     use std::sync::Mutex;
 
-    /// Fallback asset dir when `CORRODE_NEEDLE_ASSETS` is unset.
-    const DEFAULT_ASSETS: &str = "assets/needle";
+    /// Fallback asset dir when `CORRODE_NEEDLE_ASSETS` is unset: the vendored crate's
+    /// committed weights, resolved at build time relative to this crate so the default
+    /// works regardless of the daemon's runtime CWD.
+    const DEFAULT_ASSETS: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../needle-toolcall-shim/assets/needle");
     /// Generation cap — tool-call JSON is short; this is a runaway backstop.
     const MAX_GEN_LEN: usize = 512;
 

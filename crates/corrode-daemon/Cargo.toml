@@ -52,14 +52,12 @@ optional = true
 
 # Needle tool-call shim: a tiny CPU/candle encoder-decoder that turns `query + tools
 # JSON` into structurally-valid tool calls, so the swarm's small models don't have to
-# format calls themselves. A path dependency on the sibling repo (the user's own,
-# under active development — a live path dep keeps its improvements flowing in rather
-# than forking). Optional so the base workspace builds without the candle compile;
-# enable with `--features needle` and set `CORRODE_NEEDLE_ASSETS`.
-# ponytail: absolute-ish sibling path (like helix-db's submodule) — not clone-portable
-# off this host. Move to a submodule/vendored copy once the shim has a remote.
+# format calls themselves. Vendored in-repo at crates/needle-toolcall-shim (a merged-in
+# experiment — see the workspace `exclude`), so it's not part of the base build/test
+# graph. Optional; enable with `--features needle` and set `CORRODE_NEEDLE_ASSETS`
+# (defaults to the vendored crate's assets/ dir).
 [dependencies.needle-toolcall-shim]
-path = "../../../build/needle-toolcall-shim"
+path = "../needle-toolcall-shim"
 optional = true
 
 [features]

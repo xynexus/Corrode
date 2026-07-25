@@ -1,0 +1,23 @@
+[
+  {
+    "name": "weather_single_tool",
+    "query": "What's the weather in San Francisco?",
+    "tools": "[{\"name\":\"get_weather\",\"parameters\":{\"location\":\"string\"}}]",
+    "unconstrained": "[{\"name\":\"get_weather\",\"arguments\":{\"location\":\"San Francisco\"}}]",
+    "constrained": "[{\"name\":\"get_weather\",\"arguments\":{\"location\":\"San Francisco\"}}]"
+  },
+  {
+    "name": "shell_command_choice",
+    "query": "List the files in the current directory.",
+    "tools": "[{\"name\":\"run_shell\",\"parameters\":{\"command\":\"string\"}},{\"name\":\"get_weather\",\"parameters\":{\"location\":\"string\"}}]",
+    "unconstrained": "[]",
+    "constrained": "[]"
+  },
+  {
+    "name": "camel_case_restore",
+    "query": "What's the weather in Perth?",
+    "tools": "[{\"name\":\"getWeather\",\"parameters\":{\"location\":\"string\"}}]",
+    "unconstrained": "[{\"name\":\"getWeather\",\"arguments\":{\"location\":\"Perth\"}}]",
+    "constrained": "[{\"name\":\"getWeather\",\"arguments\":{\"location\":\"Perth\"}}]"
+  }
+]

@@ -1,0 +1,6 @@
+/target/
+/needle/
+/needle-weights/
+__pycache__/
+*.pyc
+*.swp
