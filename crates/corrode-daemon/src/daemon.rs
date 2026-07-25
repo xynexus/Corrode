@@ -10,6 +10,7 @@
 use crate::graph::GraphStore;
 use crate::planner;
 use crate::roles::{Role, RoleModels};
+use crate::skills::SkillRegistry;
 use crate::swarm::{Swarm, Task};
 use crate::terminal::Terminals;
 use crate::vfs::Vfs;
@@ -25,6 +26,8 @@ pub struct Daemon {
     vfs: Box<dyn Vfs>,
     /// Live pty-backed terminal sessions.
     terminals: Terminals,
+    /// Discovered Agent Skills + AGENTS.md rules (fed into the shared prefix).
+    skills: SkillRegistry,
 }
 
 impl Daemon {
@@ -33,6 +36,7 @@ impl Daemon {
         roles: RoleModels,
         graph: Option<Box<dyn GraphStore>>,
         vfs: Box<dyn Vfs>,
+        skills: SkillRegistry,
     ) -> Self {
         Self {
             swarm,
@@ -40,6 +44,7 @@ impl Daemon {
             graph,
             vfs,
             terminals: Terminals::new(),
+            skills,
         }
     }
 
@@ -188,8 +193,22 @@ impl Daemon {
     async fn context_prefix(&self) -> String {
         let mut s = String::from(
             "You are a subagent in the Corrode coding-agent swarm working on a shared \
-repository. Repository root:\n",
+repository.\n",
         );
+        // Project rules (AGENTS.md) + available skills — static per run, so they stay
+        // byte-identical across the swarm and share the KV prefill.
+        let rules = self.skills.agents_rules();
+        if !rules.trim().is_empty() {
+            s.push_str("\nProject instructions (AGENTS.md):\n");
+            s.push_str(rules.trim_end());
+            s.push('\n');
+        }
+        let manifest = self.skills.manifest();
+        if !manifest.is_empty() {
+            s.push('\n');
+            s.push_str(&manifest);
+        }
+        s.push_str("\nRepository root:\n");
         match self.vfs.list("").await {
             Ok(entries) => {
                 for e in entries {
@@ -214,6 +233,7 @@ mod tests {
             RoleModels::uniform("test-model"),
             None,
             Box::new(PassthroughVfs::new(std::env::temp_dir())),
+            SkillRegistry::default(),
         )
     }
 

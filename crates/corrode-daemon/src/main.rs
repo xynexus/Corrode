@@ -17,6 +17,7 @@ mod hipfire;
 mod planner;
 mod roles;
 mod server;
+mod skills;
 mod swarm;
 mod terminal;
 mod vfs;
@@ -59,9 +60,14 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     eprintln!("role assignments: {}", summary.join("  "));
 
+    // Discover Agent Skills (.agents/skills + .corrode/skills, project + ~/) and
+    // project AGENTS.md, for the swarm's shared context.
+    let skills = skills::SkillRegistry::discover(std::path::Path::new(&repo_root));
+    eprintln!("skills discovered: {}", skills.len());
+
     let graph = open_graph();
     let vfs = Box::new(PassthroughVfs::new(&repo_root));
-    let daemon = Daemon::new(Swarm::new(client, 32), roles, graph, vfs);
+    let daemon = Daemon::new(Swarm::new(client, 32), roles, graph, vfs, skills);
 
     // Optional FUSE mount of the repo VFS (--features fuse, CORRODE_MOUNT=<dir>), so
     // git and subagent shells see the projection as a real tree. Runs alongside the
