@@ -1,3 +1,9 @@
 [submodule "third_party/helix-db"]
 	path = third_party/helix-db
 	url = https://github.com/HelixDB/helix-db
+[submodule "third_party/agentskills"]
+	path = third_party/agentskills
+	url = https://github.com/agentskills/agentskills
+[submodule "third_party/agents.md"]
+	path = third_party/agents.md
+	url = https://github.com/agentsmd/agents.md
