@@ -11,18 +11,78 @@
 //! `write_file` / `run_command` need sandboxing + the daemon's action-approval gate
 //! before they join the set.
 
+use crate::dialect::{Param, Tool};
 use crate::toolcall::ToolCall;
 use crate::vfs::Vfs;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-/// Needle-native (flat) schema for the toolset: `parameters` is a
-/// `name -> {type, description, required}` map (NOT OpenAI `type:object/properties`,
-/// which is out-of-distribution for Needle). One tool per turn; role/args come back as
-/// a single call. `write_file`/`run_command`/`run_skill_script` are *mutating* —
-/// [`is_mutating`] gates them behind human approval before [`ToolBox::execute`] runs.
-pub const TOOL_SCHEMAS: &str = r#"[{"name":"read_file","description":"Read the contents of a file in the repository.","parameters":{"path":{"type":"string","description":"Repository-relative file path.","required":true}}},{"name":"list_dir","description":"List the entries of a directory in the repository.","parameters":{"path":{"type":"string","description":"Repository-relative directory path.","required":true}}},{"name":"write_file","description":"Create or overwrite a file with the given contents.","parameters":{"path":{"type":"string","description":"Repository-relative file path.","required":true},"contents":{"type":"string","description":"The full new contents of the file.","required":true}}},{"name":"run_command","description":"Run a shell command in the repository and return its output.","parameters":{"command":{"type":"string","description":"The shell command line to run.","required":true}}},{"name":"run_skill_script","description":"Run a script bundled with an installed skill.","parameters":{"target":{"type":"string","description":"The skill and script as skill/script (e.g. impeccable/hook.mjs), or just the script name.","required":true}}}]"#;
+/// The tool-execution toolset, as canonical (model-agnostic) [`Tool`] data. A model's
+/// [`crate::dialect::ToolDialect`] renders these into the schema it expects and maps its
+/// call names back to these canonical names. `write_file`/`run_command`/`run_skill_script`
+/// are *mutating* — [`is_mutating`] gates them behind human approval before
+/// [`ToolBox::execute`] runs.
+pub const EXEC_TOOLS: &[Tool] = &[
+    Tool {
+        name: "read_file",
+        description: "Read the contents of a file in the repository.",
+        params: &[Param {
+            name: "path",
+            ty: "string",
+            description: "Repository-relative file path.",
+            required: true,
+        }],
+    },
+    Tool {
+        name: "list_dir",
+        description: "List the entries of a directory in the repository.",
+        params: &[Param {
+            name: "path",
+            ty: "string",
+            description: "Repository-relative directory path.",
+            required: true,
+        }],
+    },
+    Tool {
+        name: "write_file",
+        description: "Create or overwrite a file with the given contents.",
+        params: &[
+            Param {
+                name: "path",
+                ty: "string",
+                description: "Repository-relative file path.",
+                required: true,
+            },
+            Param {
+                name: "contents",
+                ty: "string",
+                description: "The full new contents of the file.",
+                required: true,
+            },
+        ],
+    },
+    Tool {
+        name: "run_command",
+        description: "Run a shell command in the repository and return its output.",
+        params: &[Param {
+            name: "command",
+            ty: "string",
+            description: "The shell command line to run.",
+            required: true,
+        }],
+    },
+    Tool {
+        name: "run_skill_script",
+        description: "Run a script bundled with an installed skill.",
+        params: &[Param {
+            name: "target",
+            ty: "string",
+            description: "The skill and script as skill/script (e.g. impeccable/hook.mjs), or just the script name.",
+            required: true,
+        }],
+    },
+];
 
 /// Cap on how many bytes of a file a `read_file` observation carries back into the
 /// model's context — enough to be useful without blowing the window.

@@ -35,29 +35,18 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
-/// Turns a natural-language request plus an OpenAI-style tool schema into concrete,
-/// structurally-valid tool calls. The daemon depends on the trait, not the model, so
-/// the base build stays free of candle and the backend can be swapped.
+/// Generates a model's raw tool-call reply for a request + a (dialect-rendered) tool
+/// schema. The daemon depends on the trait, not the model, so the base build stays free
+/// of candle and the backend can be swapped. Rendering the schema and *parsing* the
+/// reply are the [`crate::dialect::ToolDialect`]'s job, keyed by [`ToolCaller::model_id`]
+/// — so different tool-call models can use different names/formats.
 pub trait ToolCaller: Send + Sync {
-    /// Decode the tool calls a request implies. `tools_json` is an OpenAI-style array
-    /// `[{"name","description","parameters":{...}}]`. An empty result means "no call".
-    fn call(&self, query: &str, tools_json: &str) -> anyhow::Result<Vec<ToolCall>>;
-}
+    /// The model's raw reply for `query` given `tools_json` (already in the model's
+    /// dialect). The caller parses it with the matching dialect.
+    fn generate(&self, query: &str, tools_json: &str) -> anyhow::Result<String>;
 
-/// Parse Needle's compact output — a JSON array of `{"name","arguments"}` — into
-/// calls. Tolerant of a leading `<tool_call>` marker and surrounding whitespace (the
-/// shim strips the marker itself, but be defensive) and of an empty reply.
-#[allow(dead_code)] // used by tests and the `needle` backend; dead in the base build.
-pub fn parse_tool_calls(output: &str) -> anyhow::Result<Vec<ToolCall>> {
-    let trimmed = output
-        .trim()
-        .trim_start_matches("<tool_call>")
-        .trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-    serde_json::from_str(trimmed)
-        .map_err(|e| anyhow::anyhow!("parsing Needle tool calls from {trimmed:?}: {e}"))
+    /// Identifier used to resolve this caller's tool dialect (schema/names/parse).
+    fn model_id(&self) -> &str;
 }
 
 /// The Needle backend. Only compiled with `--features needle`, which pulls in the
@@ -83,6 +72,9 @@ pub mod needle {
     /// and the `Mutex` makes the caller `Sync` regardless of the tokenizer's internals.
     pub struct NeedleToolCaller {
         inner: Mutex<Inner>,
+        /// Dialect key (see `CORRODE_NEEDLE_MODEL_ID`, default `needle`). Lets different
+        /// Needle finetunes resolve to different tool dialects.
+        model_id: String,
     }
 
     struct Inner {
@@ -98,6 +90,8 @@ pub mod needle {
             let model = NeedleModel::load(&assets)?;
             Ok(Self {
                 inner: Mutex::new(Inner { model, tokenizer }),
+                model_id: std::env::var("CORRODE_NEEDLE_MODEL_ID")
+                    .unwrap_or_else(|_| "needle".to_string()),
             })
         }
 
@@ -116,22 +110,25 @@ pub mod needle {
     }
 
     impl ToolCaller for NeedleToolCaller {
-        fn call(&self, query: &str, tools_json: &str) -> anyhow::Result<Vec<ToolCall>> {
+        fn generate(&self, query: &str, tools_json: &str) -> anyhow::Result<String> {
             let inner = self
                 .inner
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Needle tool-caller mutex poisoned"))?;
             // Guided + normalized: constrain to valid JSON/tool structure and accept
-            // loosely-cased tool names (the shim maps them back).
-            let output = inner.model.generate(
+            // loosely-cased tool names (the shim maps them back). The dialect parses.
+            inner.model.generate(
                 &inner.tokenizer,
                 query,
                 tools_json,
                 MAX_GEN_LEN,
                 /* guided */ true,
                 /* normalize */ true,
-            )?;
-            parse_tool_calls(&output)
+            )
+        }
+
+        fn model_id(&self) -> &str {
+            &self.model_id
         }
     }
 
@@ -149,41 +146,17 @@ pub mod needle {
             let caller = NeedleToolCaller::load_from_env()
                 .expect("load Needle")
                 .expect("CORRODE_NEEDLE_ASSETS must point at the asset dir");
-            let tools = r#"[{"name":"get_weather","description":"Look up current weather",
-                "parameters":{"type":"object","properties":{"location":{"type":"string"}},
-                "required":["location"]}}]"#;
-            let calls = caller
-                .call("What's the weather in San Francisco?", tools)
+            // Needle-flat schema; the dialect parses the raw reply.
+            let tools = r#"[{"name":"get_weather","description":"Look up current weather","parameters":{"location":{"type":"string","description":"City","required":true}}}]"#;
+            let raw = caller
+                .generate("What's the weather in San Francisco?", tools)
                 .expect("inference");
-            eprintln!("decoded: {calls:?}");
+            eprintln!("raw: {raw}");
+            let calls = crate::dialect::ToolDialect::default().parse(&raw).unwrap();
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].name, "get_weather");
             assert!(calls[0].arguments.get("location").is_some());
+            assert_eq!(caller.model_id(), "needle");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_needle_output_with_marker_and_arguments() {
-        let out = "<tool_call>[{\"name\":\"get_weather\",\"arguments\":{\"location\":\"SF\"}}]";
-        let calls = parse_tool_calls(out).unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "get_weather");
-        assert_eq!(calls[0].arguments["location"], "SF");
-    }
-
-    #[test]
-    fn empty_output_is_no_calls() {
-        assert!(parse_tool_calls("   ").unwrap().is_empty());
-        assert!(parse_tool_calls("<tool_call>").unwrap().is_empty());
-    }
-
-    #[test]
-    fn malformed_output_is_an_error_not_a_panic() {
-        assert!(parse_tool_calls("[{not json").is_err());
     }
 }

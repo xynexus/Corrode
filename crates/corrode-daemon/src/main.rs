@@ -11,6 +11,7 @@
 
 mod approval;
 mod daemon;
+mod dialect;
 #[cfg(feature = "fuse")]
 mod fuse;
 mod graph;
@@ -83,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
     let graph = open_graph();
     let tool_caller = open_tool_caller();
     let vfs = std::sync::Arc::new(PassthroughVfs::new(&repo_root));
+    let dialects = std::sync::Arc::new(dialect::Dialects::load());
     let daemon = Daemon::new(
         Swarm::new(client, 32),
         roles,
@@ -91,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         skills,
         tool_caller,
         std::path::PathBuf::from(&repo_root),
+        dialects,
     );
 
     // Optional FUSE mount of the repo VFS (--features fuse, CORRODE_MOUNT=<dir>), so

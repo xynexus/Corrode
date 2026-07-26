@@ -62,7 +62,10 @@ model-emitted calls), `CORRODE_SMALL_MODELS` (comma-separated substrings that
 force-classify a model as "small" -> uses the Needle tool loop) and
 `CORRODE_SMALL_MODEL_MAX_B` (billions-param cutoff below which a model counts as small,
 default 32), `CORRODE_SKILL_ACTIVATE_MIN` (cosine bar to inject a skill's full body,
-default 0.35), `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
+default 0.35), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -> tool-profile` file
+— per-model tool names/schema/parse; absent -> the built-in Needle default),
+`CORRODE_NEEDLE_MODEL_ID` (dialect key for the Needle caller, default `needle`),
+`CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
 `CORRODE_WEB_ADDR` (web bind, default `127.0.0.1:8787`), `CORRODE_DAEMON_URL`
 (daemon ws the web proxies to), `CORRODE_MAX_TOKENS` (per-call output cap,
 default 1024). The hipfire background daemon must be up (`hipfire start`, not just
@@ -144,6 +147,20 @@ skill (`SkillContext::script_dirs` → name→dir map) and runs its bundled `scr
 behind the approval gate (it executes code). We read only the vendor-neutral `.agents`
 + Corrode's `.corrode` dirs, never agent-specific ones (`.claude`/`.codex`/`.opencode`),
 to stay on the standard.
+
+## Tool dialects (`dialect.rs`)
+
+Tools are canonical, model-agnostic data: `EXEC_TOOLS` (`tools.rs`) and `ROLE_TOOLS`
+(`plan_graph.rs`) are `&[Tool]`, not hardcoded JSON. A **`ToolDialect`** renders that
+into the schema a given tool-call model expects (`SchemaFormat`: `needle-flat` /
+`openai-nested`), maps canonical tool names ↔ the names the model exposes, and parses
+the model's reply (`ParseFormat`: `json-array`). `ToolCaller` now yields the *raw* reply
+(`generate`) + a `model_id`; the daemon resolves the dialect for that id, renders, calls,
+parses. Dialects are matched by a glob JSON file (`CORRODE_TOOL_DIALECTS`,
+`{ "model-glob": {schema,parse,names}, "default": {…} }`); absent -> the built-in
+default = Needle-flat / json-array / no renames (today's behavior). This is how
+different tool-call models (Needle finetunes, others) get different names/formats
+without touching the call sites.
 
 ## Tool-calling (Needle shim)
 

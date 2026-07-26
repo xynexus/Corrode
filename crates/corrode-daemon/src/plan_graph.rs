@@ -11,6 +11,7 @@
 //! This is the engine. The live wiring — executor = the hipfire swarm, and parsing
 //! emitted tasks out of agent output — is the integration step on top.
 
+use crate::dialect::{Param, Tool};
 use crate::roles::Role;
 use crate::toolcall::ToolCall;
 use futures_util::stream::FuturesUnordered;
@@ -296,18 +297,54 @@ pub fn parse_next_instruction(output: &str) -> Option<String> {
     })
 }
 
-/// The tools handed to Needle to *classify* a follow-up instruction's role: one tool
-/// per role, in Needle's native flat schema (`parameters` = name -> spec). Role lives
-/// in the tool *name* — Needle is trained to pick one tool per turn, which it does
-/// reliably, unlike filling an enum argument. We take only the chosen tool (the role);
-/// the instruction text comes verbatim from the agent's `NEXT:` line, not from Needle's
-/// (often-truncated) `task` argument. Paired with [`role_from_tool_calls`].
-///
-/// ponytail: Needle will be finetuned on Corrode's actual tool set so the small coder
-/// models' tools are picked up reliably. Once that lands, its `task` argument becomes
-/// trustworthy too and the verbatim-text shortcut can drop — and this same schema
-/// shape extends to the real tool-execution tools (read_file, run_command, ...).
-pub const ROLE_TASK_TOOLS: &str = r#"[{"name":"research_task","description":"Investigate, read specs or docs, or survey prior art.","parameters":{"task":{"type":"string","description":"What to investigate.","required":true}}},{"name":"coding_task","description":"Write or modify code or tests.","parameters":{"task":{"type":"string","description":"What to build.","required":true}}},{"name":"architecture_task","description":"Make a design or structural decision.","parameters":{"task":{"type":"string","description":"What to design.","required":true}}},{"name":"review_task","description":"Check the correctness or quality of existing code.","parameters":{"task":{"type":"string","description":"What to review.","required":true}}}]"#;
+/// The tools that *classify* a follow-up instruction's role: one tool per role, as
+/// canonical [`Tool`] data (a model's [`crate::dialect::ToolDialect`] renders them). Role
+/// lives in the tool *name* — the tool-caller is trained to pick one tool per turn,
+/// which it does reliably, unlike filling an enum argument. We take only the chosen tool
+/// (the role); the instruction text comes verbatim from the agent's `NEXT:` line, not
+/// from the model's (often-truncated) `task` argument. Paired with [`role_from_tool_calls`].
+pub const ROLE_TOOLS: &[Tool] = &[
+    Tool {
+        name: "research_task",
+        description: "Investigate, read specs or docs, or survey prior art.",
+        params: &[Param {
+            name: "task",
+            ty: "string",
+            description: "What to investigate.",
+            required: true,
+        }],
+    },
+    Tool {
+        name: "coding_task",
+        description: "Write or modify code or tests.",
+        params: &[Param {
+            name: "task",
+            ty: "string",
+            description: "What to build.",
+            required: true,
+        }],
+    },
+    Tool {
+        name: "architecture_task",
+        description: "Make a design or structural decision.",
+        params: &[Param {
+            name: "task",
+            ty: "string",
+            description: "What to design.",
+            required: true,
+        }],
+    },
+    Tool {
+        name: "review_task",
+        description: "Check the correctness or quality of existing code.",
+        params: &[Param {
+            name: "task",
+            ty: "string",
+            description: "What to review.",
+            required: true,
+        }],
+    },
+];
 
 /// The role Needle picked, from the first call's tool name (see [`ROLE_TASK_TOOLS`]).
 /// Unknown/absent -> None (the caller defaults to Coder).

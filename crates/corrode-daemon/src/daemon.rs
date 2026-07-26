@@ -8,6 +8,7 @@
 //! built), and the VFS.
 
 use crate::approval::ApprovalGate;
+use crate::dialect::Dialects;
 use crate::graph::GraphStore;
 use crate::hipfire::Client;
 use crate::plan_graph;
@@ -52,6 +53,8 @@ pub struct Daemon {
     /// Skill name -> skill dir, for `run_skill_script` in the tool loop. Derived from
     /// `skills` at construction; `Arc` so the tool-loop future owns a clone.
     skill_scripts: Arc<std::collections::HashMap<String, PathBuf>>,
+    /// Per-model tool dialects (schema/names/parse), matched to the tool-call model.
+    dialects: Arc<Dialects>,
 }
 
 impl Daemon {
@@ -63,6 +66,7 @@ impl Daemon {
         skills: SkillContext,
         tool_caller: Option<Arc<dyn ToolCaller>>,
         repo_root: PathBuf,
+        dialects: Arc<Dialects>,
     ) -> Self {
         let skill_scripts = Arc::new(skills.script_dirs());
         Self {
@@ -77,6 +81,7 @@ impl Daemon {
             repo_root,
             next_plan_id: std::sync::atomic::AtomicU64::new(0),
             skill_scripts,
+            dialects,
         }
     }
 
@@ -148,6 +153,7 @@ impl Daemon {
                     let approvals = Arc::clone(&self.approvals);
                     let root = self.repo_root.clone();
                     let skill_scripts = Arc::clone(&self.skill_scripts);
+                    let dialects = Arc::clone(&self.dialects);
                     let id = task.id;
                     let role = task.role;
                     let prompt = task.prompt.clone();
@@ -168,6 +174,7 @@ impl Daemon {
                                 caller,
                                 ToolBox::new(vfs, root, skill_scripts),
                                 &approvals,
+                                &dialects,
                                 &prefix,
                                 role,
                                 &prompt,
@@ -191,7 +198,7 @@ impl Daemon {
                         };
 
                         let emitted = match &output {
-                            Ok(text) => emit_followups(tool_caller, text).await,
+                            Ok(text) => emit_followups(tool_caller, &dialects, text).await,
                             Err(e) => {
                                 let _ = events
                                     .send(AgentEvent::Error {
@@ -413,7 +420,6 @@ const MAX_TOOL_STEPS: usize = 6;
 /// Needle errors come back as observations (the model can recover), not hard failures;
 /// only a model-generation error aborts the loop.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn run_tool_loop(
     client: &Client,
     model: &str,
@@ -421,6 +427,7 @@ async fn run_tool_loop(
     caller: Arc<dyn ToolCaller>,
     toolbox: ToolBox,
     approvals: &ApprovalGate,
+    dialects: &Dialects,
     prefix: &str,
     role: Role,
     task: &str,
@@ -428,6 +435,10 @@ async fn run_tool_loop(
     id: u64,
     written: &mut Vec<String>,
 ) -> anyhow::Result<String> {
+    // Render the exec toolset in the tool-call model's dialect once; parse each reply
+    // with the same dialect (which maps its tool names back to canonical).
+    let dialect = dialects.resolve(caller.model_id());
+    let schema = dialect.render(crate::tools::EXEC_TOOLS);
     let mut scratchpad = String::new();
     let mut last = String::new();
     for _ in 0..MAX_TOOL_STEPS {
@@ -445,15 +456,14 @@ async fn run_tool_loop(
             return Ok(text); // no TOOL: line -> this turn is the final answer
         };
 
-        // Needle turns the plain-English intent into a structured call (spawn_blocking:
-        // Needle inference is synchronous and CPU-bound).
+        // The tool-caller turns the plain-English intent into a structured call
+        // (spawn_blocking: Needle inference is synchronous and CPU-bound); the dialect
+        // parses the raw reply.
         let query = intent.clone();
-        let needle = caller.clone();
-        let observation = match tokio::task::spawn_blocking(move || {
-            needle.call(&query, crate::tools::TOOL_SCHEMAS)
-        })
-        .await
-        {
+        let toolcaller = caller.clone();
+        let schema = schema.clone();
+        let raw = tokio::task::spawn_blocking(move || toolcaller.generate(&query, &schema)).await;
+        let observation = match raw.map(|r| r.and_then(|raw| dialect.parse(&raw))) {
             Ok(Ok(calls)) => match calls.first() {
                 // Mutating calls (write_file / run_command) need a human's go-ahead;
                 // read-only calls run straight through.
@@ -500,6 +510,7 @@ async fn run_tool_loop(
 /// is synchronous and CPU-bound, so it runs on a blocking thread.
 async fn emit_followups(
     tool_caller: Option<Arc<dyn ToolCaller>>,
+    dialects: &Dialects,
     output: &str,
 ) -> Vec<plan_graph::Emit> {
     let Some(instruction) = plan_graph::parse_next_instruction(output) else {
@@ -508,19 +519,20 @@ async fn emit_followups(
 
     let role = match tool_caller {
         Some(caller) => {
+            // Render the role tools in the caller's dialect, classify, parse back.
+            let dialect = dialects.resolve(caller.model_id());
+            let schema = dialect.render(plan_graph::ROLE_TOOLS);
             let query = instruction.clone();
-            match tokio::task::spawn_blocking(move || {
-                caller.call(&query, plan_graph::ROLE_TASK_TOOLS)
-            })
-            .await
-            {
+            let raw =
+                tokio::task::spawn_blocking(move || caller.generate(&query, &schema)).await;
+            match raw.map(|r| r.and_then(|raw| dialect.parse(&raw))) {
                 Ok(Ok(calls)) => plan_graph::role_from_tool_calls(&calls).unwrap_or(Role::Coder),
                 Ok(Err(e)) => {
-                    eprintln!("Needle role classification failed ({e}); defaulting to coder");
+                    eprintln!("role classification failed ({e}); defaulting to coder");
                     Role::Coder
                 }
                 Err(e) => {
-                    eprintln!("Needle role classification thread panicked ({e}); defaulting to coder");
+                    eprintln!("role classification thread panicked ({e}); defaulting to coder");
                     Role::Coder
                 }
             }
@@ -550,6 +562,7 @@ mod tests {
             SkillContext::default(),
             None,
             std::env::temp_dir(),
+            Arc::new(Dialects::default()),
         )
     }
 
@@ -569,7 +582,7 @@ mod tests {
         // Reply ends with a plain-English NEXT: line describing a review follow-up.
         let reply = "Added the auth middleware in auth.rs.\n\
             NEXT: review the token-expiry logic in the auth middleware for correctness";
-        let emits = emit_followups(Some(caller), reply).await;
+        let emits = emit_followups(Some(caller), &Dialects::default(), reply).await;
         let summary: Vec<_> = emits
             .iter()
             .map(|e| (e.role, e.prompt.as_str()))
@@ -588,7 +601,12 @@ mod tests {
     // No NEXT: line -> no emission (and Needle isn't even called).
     #[tokio::test]
     async fn no_next_line_emits_nothing() {
-        let emits = emit_followups(None, "All done. The tests pass and nothing remains.").await;
+        let emits = emit_followups(
+            None,
+            &Dialects::default(),
+            "All done. The tests pass and nothing remains.",
+        )
+        .await;
         assert!(emits.is_empty());
     }
 
@@ -599,7 +617,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Needle assets (CORRODE_NEEDLE_ASSETS or the vendored default)"]
     async fn needle_builds_a_tool_call_that_the_toolbox_executes() {
-        use crate::tools::{ToolBox, TOOL_SCHEMAS};
+        use crate::dialect::ToolDialect;
+        use crate::tools::{ToolBox, EXEC_TOOLS};
         let dir = std::env::temp_dir().join(format!("corrode-toolloop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("greeting.txt"), b"hello from the tool loop").unwrap();
@@ -612,9 +631,11 @@ mod tests {
         let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
             .expect("load Needle")
             .expect("Needle assets present");
-        let calls = caller
-            .call("read the file greeting.txt", TOOL_SCHEMAS)
-            .expect("tool-call construction");
+        let dialect = ToolDialect::default();
+        let raw = caller
+            .generate("read the file greeting.txt", &dialect.render(EXEC_TOOLS))
+            .expect("generation");
+        let calls = dialect.parse(&raw).expect("parse");
         eprintln!("calls: {calls:?}");
         let call = calls.first().expect("a tool call");
         assert_eq!(call.name, "read_file");
@@ -633,7 +654,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Needle assets (CORRODE_NEEDLE_ASSETS or the vendored default)"]
     async fn needle_runs_a_skill_script_end_to_end() {
-        use crate::tools::{ToolBox, TOOL_SCHEMAS};
+        use crate::dialect::ToolDialect;
+        use crate::tools::{ToolBox, EXEC_TOOLS};
         let dir = std::env::temp_dir().join(format!("corrode-skille2e-{}", std::process::id()));
         let skill_dir = dir.join("skills/greeter");
         std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
@@ -649,9 +671,14 @@ mod tests {
         let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
             .expect("load Needle")
             .expect("Needle assets present");
-        let calls = caller
-            .call("run the hello.sh script from the greeter skill", TOOL_SCHEMAS)
-            .expect("tool-call construction");
+        let dialect = ToolDialect::default();
+        let raw = caller
+            .generate(
+                "run the hello.sh script from the greeter skill",
+                &dialect.render(EXEC_TOOLS),
+            )
+            .expect("generation");
+        let calls = dialect.parse(&raw).expect("parse");
         eprintln!("calls: {calls:?}");
         let call = calls.first().expect("a tool call");
         assert_eq!(call.name, "run_skill_script");
