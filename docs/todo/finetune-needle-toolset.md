@@ -56,8 +56,10 @@ tool selection ≥ ~95% on held-out phrasings, and no truncation of paths/conten
       `…render(ROLE_TOOLS)` so the *training* schema is byte-identical to what the daemon
       sends at runtime. Prevents train/serve schema skew.
 - [ ] **Generate a dataset** in Needle's JSONL format (`{query, tools, answers}` per
-      line; `tools`/`answers` are JSON-encoded strings). Cover, per the README's
-      **≥120 examples per tool** (100 train / 10 val / 10 test):
+      line; `tools`/`answers` are JSON-encoded strings), using **`fixtures/demo-repo`**
+      (the `xynexus/corrode-demo` submodule) as the realistic repo so queries reference
+      real paths/files/skills. Cover, per the README's **≥120 examples per tool** (100
+      train / 10 val / 10 test):
   - [ ] The **plain-English phrasings the tool loop actually produces** — `TOOL:` lines
         (imperatives like "read the file X", "write <contents> to <path>", "run <cmd>")
         and `NEXT:` lines for role classification.

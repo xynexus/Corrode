@@ -30,6 +30,7 @@ crates/corrode-daemon   # the agent (AGPL-3.0 — see below). modules: daemon (c
 crates/corrode-web      # web server stub (Apache-2.0)
 crates/needle-toolcall-shim  # vendored Needle tool-call model (Apache-2.0, CPU/candle). Workspace-EXCLUDED; corrode-daemon links it behind `--features needle`. Weights committed under assets/needle.
 third_party/needle      # git submodule: upstream Needle (Cactus) — training/finetuning code, kept for finetuning Needle on Corrode's real tool set.
+fixtures/demo-repo      # git submodule (xynexus/corrode-demo): a tiny real Rust project — deterministic target for e2e/tool/skill/provenance testing (CORRODE_REPO) + Needle-finetune query source.
 webui/                  # wasm front-end seam (out of the cargo workspace; its own trunk/wasm-pack build)
 third_party/helix-db    # git submodule: HelixDB pinned at v2.3.5 (AGPL-3.0), linked in-process behind the `helix` feature
 third_party/helix-skills# vendored HelixDB agent skills (MIT); Rust-relevant ones symlinked into .claude/skills/

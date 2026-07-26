@@ -10,3 +10,6 @@
 [submodule "third_party/needle"]
 	path = third_party/needle
 	url = https://github.com/cactus-compute/needle
+[submodule "fixtures/demo-repo"]
+	path = fixtures/demo-repo
+	url = https://github.com/xynexus/corrode-demo
