@@ -16,7 +16,7 @@
 //! through the tool loop) is still ahead.
 
 use crate::hipfire::Client;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A discovered skill (name + description + its directory). The full `SKILL.md`
@@ -221,6 +221,16 @@ impl SkillContext {
 
     pub fn count(&self) -> usize {
         self.registry.len()
+    }
+
+    /// Map of skill name -> its directory, so the tool loop can resolve and run a
+    /// skill's bundled `scripts/` (progressive-disclosure stage 3, execution).
+    pub fn script_dirs(&self) -> HashMap<String, PathBuf> {
+        self.registry
+            .skills
+            .iter()
+            .map(|s| (s.name.clone(), s.dir.clone()))
+            .collect()
     }
 
     pub fn ranked(&self) -> bool {

@@ -49,6 +49,9 @@ pub struct Daemon {
     repo_root: PathBuf,
     /// Monotonic id source for plan (provenance root) nodes, one per Prompt turn.
     next_plan_id: std::sync::atomic::AtomicU64,
+    /// Skill name -> skill dir, for `run_skill_script` in the tool loop. Derived from
+    /// `skills` at construction; `Arc` so the tool-loop future owns a clone.
+    skill_scripts: Arc<std::collections::HashMap<String, PathBuf>>,
 }
 
 impl Daemon {
@@ -61,6 +64,7 @@ impl Daemon {
         tool_caller: Option<Arc<dyn ToolCaller>>,
         repo_root: PathBuf,
     ) -> Self {
+        let skill_scripts = Arc::new(skills.script_dirs());
         Self {
             swarm,
             roles,
@@ -72,6 +76,7 @@ impl Daemon {
             approvals: Arc::new(ApprovalGate::default()),
             repo_root,
             next_plan_id: std::sync::atomic::AtomicU64::new(0),
+            skill_scripts,
         }
     }
 
@@ -142,6 +147,7 @@ impl Daemon {
                     let vfs = Arc::clone(&self.vfs);
                     let approvals = Arc::clone(&self.approvals);
                     let root = self.repo_root.clone();
+                    let skill_scripts = Arc::clone(&self.skill_scripts);
                     let id = task.id;
                     let role = task.role;
                     let prompt = task.prompt.clone();
@@ -160,7 +166,7 @@ impl Daemon {
                                 &model,
                                 band,
                                 caller,
-                                ToolBox::new(vfs, root),
+                                ToolBox::new(vfs, root, skill_scripts),
                                 &approvals,
                                 &prefix,
                                 role,
@@ -597,7 +603,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("corrode-toolloop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("greeting.txt"), b"hello from the tool loop").unwrap();
-        let toolbox = ToolBox::new(Arc::new(PassthroughVfs::new(&dir)));
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(std::collections::HashMap::new()),
+        );
 
         let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
             .expect("load Needle")
@@ -614,6 +624,42 @@ mod tests {
             observation.contains("hello from the tool loop"),
             "got: {observation}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Stage 3 end-to-end: a plain-English "run the skill script" -> Needle builds a
+    // run_skill_script call -> the ToolBox resolves the skill and runs its script.
+    #[cfg(feature = "needle")]
+    #[tokio::test]
+    #[ignore = "requires Needle assets (CORRODE_NEEDLE_ASSETS or the vendored default)"]
+    async fn needle_runs_a_skill_script_end_to_end() {
+        use crate::tools::{ToolBox, TOOL_SCHEMAS};
+        let dir = std::env::temp_dir().join(format!("corrode-skille2e-{}", std::process::id()));
+        let skill_dir = dir.join("skills/greeter");
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::write(
+            skill_dir.join("scripts/hello.sh"),
+            "#!/bin/sh\necho skill script ran\n",
+        )
+        .unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert("greeter".to_string(), skill_dir);
+        let toolbox = ToolBox::new(Arc::new(PassthroughVfs::new(&dir)), dir.clone(), Arc::new(map));
+
+        let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
+            .expect("load Needle")
+            .expect("Needle assets present");
+        let calls = caller
+            .call("run the hello.sh script from the greeter skill", TOOL_SCHEMAS)
+            .expect("tool-call construction");
+        eprintln!("calls: {calls:?}");
+        let call = calls.first().expect("a tool call");
+        assert_eq!(call.name, "run_skill_script");
+
+        // The call is mutating (executes code) -> would gate on approval in the loop.
+        assert!(crate::tools::is_mutating(call));
+        let observation = toolbox.execute(call).await;
+        assert!(observation.contains("skill script ran"), "got: {observation}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

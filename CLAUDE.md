@@ -138,9 +138,12 @@ name+descriptions into the shared prefix (stage 1, discovery) AND injects the si
 most-relevant skill's full `SKILL.md` body when its similarity clears
 `CORRODE_SKILL_ACTIVATE_MIN` (default 0.35; body capped at 8KB) — stage 2, activation.
 The activated body rides the shared prefix, so all the turn's subagents get the same
-skill (KV-reuse preserved). Stage 3 (running a skill's `scripts/` via the tool loop)
-is still ahead. We read only the vendor-neutral `.agents` + Corrode's `.corrode` dirs,
-never agent-specific ones (`.claude`/`.codex`/`.opencode`), to stay on the standard.
+skill (KV-reuse preserved). Stage 3 (execution) is the `run_skill_script` tool: a small
+model asks in plain English, Needle builds the call, and the tool loop resolves the
+skill (`SkillContext::script_dirs` → name→dir map) and runs its bundled `scripts/`
+behind the approval gate (it executes code). We read only the vendor-neutral `.agents`
++ Corrode's `.corrode` dirs, never agent-specific ones (`.claude`/`.codex`/`.opencode`),
+to stay on the standard.
 
 ## Tool-calling (Needle shim)
 
@@ -182,8 +185,9 @@ path unchanged. Path args come through Needle cleanly (paths tokenize well); too
 loop's `'static` future owns a clone.
 
 Tools: `read_file`, `list_dir` (read-only) run straight through; `write_file`,
-`run_command` are **mutating** (`tools::is_mutating`) and pass through a human
-**approval gate** first (`approval.rs`). The loop emits `AgentEvent::ApprovalRequest`
+`run_command`, and `run_skill_script` (run a skill's bundled `scripts/`, resolved by a
+`skill/script` or bare-script `target`) are **mutating/executing** (`tools::is_mutating`)
+and pass through a human **approval gate** first (`approval.rs`). The loop emits `AgentEvent::ApprovalRequest`
 and blocks that one call until an `AgentCommand::ApprovalResponse` arrives; it fails
 CLOSED (denied) if the client is gone. For the response to be received while a Prompt
 handler waits, `Daemon::run` now dispatches `Prompt` handling on a spawned task (other
