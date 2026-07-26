@@ -61,7 +61,8 @@ works out of the box; absent -> tool-caller disabled, swarm falls back to
 model-emitted calls), `CORRODE_SMALL_MODELS` (comma-separated substrings that
 force-classify a model as "small" -> uses the Needle tool loop) and
 `CORRODE_SMALL_MODEL_MAX_B` (billions-param cutoff below which a model counts as small,
-default 32), `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
+default 32), `CORRODE_SKILL_ACTIVATE_MIN` (cosine bar to inject a skill's full body,
+default 0.35), `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
 `CORRODE_WEB_ADDR` (web bind, default `127.0.0.1:8787`), `CORRODE_DAEMON_URL`
 (daemon ws the web proxies to), `CORRODE_MAX_TOKENS` (per-call output cap,
 default 1024). The hipfire background daemon must be up (`hipfire start`, not just
@@ -127,8 +128,19 @@ Every prompt in a turn — the orchestration call and each subagent
 they land on the same model. The divergent role/task goes in the tail; nothing
 role-specific precedes the prefix. The `subagent_prompt` test guards this invariant.
 Remaining ponytail: the prefix is a shallow VFS root listing (plus AGENTS.md rules
-and ranked skills) — the graph-backed VFS will supply richer, relevance-ranked
-context without changing the sharing shape.
+and skills) — the graph-backed VFS will supply richer, relevance-ranked context
+without changing the sharing shape.
+
+**Skills (`skills.rs`) — progressive disclosure.** `SkillContext` discovers Agent
+Skills (`.agents/skills` + `.corrode/skills`, project + `~/`) and `AGENTS.md`, embeds
+their descriptions, and cosine-ranks them per task. `prefix_section` folds the top-`k`
+name+descriptions into the shared prefix (stage 1, discovery) AND injects the single
+most-relevant skill's full `SKILL.md` body when its similarity clears
+`CORRODE_SKILL_ACTIVATE_MIN` (default 0.35; body capped at 8KB) — stage 2, activation.
+The activated body rides the shared prefix, so all the turn's subagents get the same
+skill (KV-reuse preserved). Stage 3 (running a skill's `scripts/` via the tool loop)
+is still ahead. We read only the vendor-neutral `.agents` + Corrode's `.corrode` dirs,
+never agent-specific ones (`.claude`/`.codex`/`.opencode`), to stay on the standard.
 
 ## Tool-calling (Needle shim)
 

@@ -9,9 +9,11 @@
 //! non-standard extensions and would drift Corrode off the standard. Corrode-custom
 //! shadows standard; project shadows global (first-seen wins).
 //!
-//! This is progressive-disclosure stage 1 (discovery: name+description). The manifest
-//! rides the swarm's shared `context_prefix`; `body()` loads a full SKILL.md on
-//! activation; execution runs the skill's `scripts/` through the pty/VFS.
+//! Progressive disclosure: stage 1 (discovery) surfaces name+description manifests on
+//! the swarm's shared `context_prefix`; stage 2 (activation) injects the single
+//! most-relevant skill's full `SKILL.md` body when it clears the relevance bar (see
+//! [`SkillContext::prefix_section`]). Stage 3 (execution — running a skill's `scripts/`
+//! through the tool loop) is still ahead.
 
 use crate::hipfire::Client;
 use std::collections::HashSet;
@@ -108,9 +110,8 @@ impl SkillRegistry {
             .unwrap_or_default()
     }
 
-    /// Stage 2 (activation): the full `SKILL.md` body for `name`.
-    // ponytail: no loop caller yet — wired when the planner routes a task to a skill.
-    #[allow(dead_code)]
+    /// Stage 2 (activation): the full `SKILL.md` body for `name`. Injected into the
+    /// context prefix by [`SkillContext::prefix_section`] when a task activates the skill.
     pub fn body(&self, name: &str) -> anyhow::Result<String> {
         let sk = self
             .skills
@@ -168,23 +169,29 @@ impl SkillIndex {
         self.entries.is_empty()
     }
 
-    /// A manifest of the top-`k` skills by cosine similarity to `query` — the same
-    /// shape as `SkillRegistry::manifest`, but relevance-ranked and trimmed.
-    pub fn top_k_manifest(&self, query: &[f32], k: usize) -> String {
-        let mut scored: Vec<(f32, &IndexedSkill)> = self
+    /// Skills ranked by cosine similarity to `query`, most-relevant first (with scores,
+    /// so the caller can both list the top-k and decide whether the top skill is
+    /// relevant enough to *activate*).
+    pub fn rank(&self, query: &[f32]) -> Vec<Ranked<'_>> {
+        let mut scored: Vec<Ranked> = self
             .entries
             .iter()
-            .map(|e| (cosine(query, &e.embedding), e))
+            .map(|e| Ranked {
+                score: cosine(query, &e.embedding),
+                name: &e.name,
+                description: &e.description,
+            })
             .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let mut s = String::from(
-            "Relevant skills for this task (load a skill's full instructions by name):\n",
-        );
-        for (_, e) in scored.into_iter().take(k) {
-            s.push_str(&SkillRegistry::line(&e.name, &e.description));
-        }
-        s
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored
     }
+}
+
+/// One skill scored against a query (a borrow into the index).
+pub struct Ranked<'a> {
+    pub score: f32,
+    pub name: &'a str,
+    pub description: &'a str,
 }
 
 /// Everything the daemon needs for skills: the discovered registry, the embedded
@@ -224,19 +231,72 @@ impl SkillContext {
         self.registry.agents_rules()
     }
 
-    /// The skills section for the shared `context_prefix`: the relevance-ranked
-    /// top-`k` when the task can be embedded, else the full manifest (so skills are
-    /// still surfaced when retrieval is unavailable).
+    /// The skills section for the shared `context_prefix`. With retrieval available:
+    /// the relevance-ranked top-`k` descriptions (discovery) **plus** the full
+    /// instructions of the single most-relevant skill when it clears the activation bar
+    /// (progressive-disclosure activation). Without retrieval: the full manifest, so
+    /// skills are still surfaced.
     pub async fn prefix_section(&self, task: &str, client: &Client, k: usize) -> String {
         if !self.index.is_empty() {
             if let Some(model) = &self.embed_model {
                 if let Ok(q) = client.embed(model, task).await {
-                    return self.index.top_k_manifest(&q, k);
+                    return self.render(&q, k);
                 }
             }
         }
         self.registry.manifest()
     }
+
+    /// Render the skills section for a task's query embedding: top-`k` ranked
+    /// descriptions, then the top skill's `SKILL.md` body if it's relevant enough to
+    /// activate. Split from `prefix_section` (which does the embedding) so it's a pure,
+    /// testable function of the index + registry.
+    fn render(&self, query: &[f32], k: usize) -> String {
+        let ranked = self.index.rank(query);
+        let mut s = String::from(
+            "Relevant skills for this task (load a skill's full instructions by name):\n",
+        );
+        for r in ranked.iter().take(k) {
+            s.push_str(&SkillRegistry::line(r.name, r.description));
+        }
+        // Activation: inject the single most-relevant skill's instructions, but only
+        // when it clears the bar — otherwise every prompt would carry the least-
+        // irrelevant skill's whole body. The body rides the shared prefix, so all the
+        // turn's subagents get the same activated skill (KV-reuse preserved).
+        if let Some(top) = ranked.first() {
+            if top.score >= activate_min() {
+                if let Ok(body) = self.registry.body(top.name) {
+                    s.push_str(&activated_section(top.name, &body));
+                }
+            }
+        }
+        s
+    }
+}
+
+/// Cosine bar the top skill must clear to be *activated* (full body injected), not just
+/// listed. Conservative default; override with `CORRODE_SKILL_ACTIVATE_MIN`.
+const DEFAULT_ACTIVATE_MIN: f32 = 0.35;
+/// Cap on an injected `SKILL.md` body, so a large skill can't blow the shared prefix.
+const MAX_BODY_BYTES: usize = 8192;
+
+fn activate_min() -> f32 {
+    std::env::var("CORRODE_SKILL_ACTIVATE_MIN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_ACTIVATE_MIN)
+}
+
+/// The activated-skill block: the skill's `SKILL.md` instructions, truncated at a char
+/// boundary to `MAX_BODY_BYTES`.
+fn activated_section(name: &str, body: &str) -> String {
+    let mut end = body.len().min(MAX_BODY_BYTES);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let shown = &body[..end];
+    let ellipsis = if end < body.len() { "\n… (truncated)" } else { "" };
+    format!("\n--- Activated skill: {name} (follow these instructions) ---\n{shown}{ellipsis}\n")
 }
 
 /// Cosine similarity; 0 for mismatched/degenerate vectors.
@@ -349,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn top_k_manifest_ranks_by_cosine_similarity() {
+    fn rank_orders_by_cosine_similarity() {
         let mk = |name: &str, emb: Vec<f32>| IndexedSkill {
             name: name.to_string(),
             description: format!("desc of {name}"),
@@ -362,12 +422,61 @@ mod tests {
                 mk("test-skill", vec![0.0, 0.0, 1.0]),
             ],
         };
-        // query closest to db-skill, then ui-skill
-        let out = index.top_k_manifest(&[0.9, 0.4, 0.0], 2);
-        assert!(out.contains("db-skill"));
-        assert!(out.contains("ui-skill"));
-        assert!(!out.contains("test-skill"), "trimmed to top-2");
-        // db-skill should rank above ui-skill (appears first)
-        assert!(out.find("db-skill").unwrap() < out.find("ui-skill").unwrap());
+        // query closest to db-skill, then ui-skill, with test-skill last.
+        let ranked = index.rank(&[0.9, 0.4, 0.0]);
+        let order: Vec<&str> = ranked.iter().map(|r| r.name).collect();
+        assert_eq!(order, vec!["db-skill", "ui-skill", "test-skill"]);
+        assert!(ranked[0].score > ranked[1].score);
+    }
+
+    #[test]
+    fn activation_injects_top_skill_body_only_when_relevant() {
+        let root =
+            std::env::temp_dir().join(format!("corrode-skill-activate-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let p = root.join(".agents/skills/db-skill/SKILL.md");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            "---\nname: db-skill\ndescription: Database helper.\n---\nDB INSTRUCTIONS: use the pool.",
+        )
+        .unwrap();
+
+        let empty_home = root.join("home");
+        let registry = SkillRegistry::discover_in(&root, Some(&empty_home));
+        let index = SkillIndex {
+            entries: vec![
+                IndexedSkill {
+                    name: "db-skill".into(),
+                    description: "Database helper.".into(),
+                    embedding: vec![1.0, 0.0, 0.0],
+                },
+                IndexedSkill {
+                    name: "ui-skill".into(),
+                    description: "UI helper.".into(),
+                    embedding: vec![0.0, 1.0, 0.0],
+                },
+            ],
+        };
+        let ctx = SkillContext {
+            registry,
+            index,
+            embed_model: Some("m".into()),
+        };
+
+        // Query aligned with db-skill: listed AND activated (full body injected).
+        let out = ctx.render(&[1.0, 0.05, 0.0], 5);
+        assert!(out.contains("db-skill:"), "listed in manifest");
+        assert!(out.contains("Activated skill: db-skill"), "activated");
+        assert!(out.contains("DB INSTRUCTIONS"), "body injected");
+
+        // Query orthogonal to every skill: nothing clears the bar -> no body injected.
+        let out2 = ctx.render(&[0.0, 0.0, 1.0], 5);
+        assert!(
+            !out2.contains("DB INSTRUCTIONS"),
+            "below the activation bar -> description only"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
