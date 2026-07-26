@@ -22,6 +22,7 @@ mod skills;
 mod swarm;
 mod terminal;
 mod toolcall;
+mod tools;
 mod vfs;
 
 use daemon::Daemon;
@@ -80,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
 
     let graph = open_graph();
     let tool_caller = open_tool_caller();
-    let vfs = Box::new(PassthroughVfs::new(&repo_root));
+    let vfs = std::sync::Arc::new(PassthroughVfs::new(&repo_root));
     let daemon = Daemon::new(Swarm::new(client, 32), roles, graph, vfs, skills, tool_caller);
 
     // Optional FUSE mount of the repo VFS (--features fuse, CORRODE_MOUNT=<dir>), so

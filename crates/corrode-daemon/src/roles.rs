@@ -123,6 +123,69 @@ pub fn default_embedding_model(available: &[String]) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// Default cutoff (in billions of params) below which a model is treated as "small"
+/// enough to need Needle-mediated tool-calling. Overridable via `CORRODE_SMALL_MODEL_MAX_B`.
+const DEFAULT_SMALL_MODEL_MAX_B: f64 = 32.0;
+
+/// Whether a model is "small" — i.e. can't be trusted to construct tool-call JSON on
+/// its own, so the tool-execution loop routes its calls through Needle.
+///
+/// `CORRODE_SMALL_MODELS` (comma-separated substrings) force-classifies matches as
+/// small and wins. Otherwise a name heuristic: any millions-scale marker (`270m`) is
+/// small; a billions marker (`8b`, `27B`) is small when `<=` the cutoff
+/// (`CORRODE_SMALL_MODEL_MAX_B`, default 32). A model with no size marker is treated as
+/// large (conservative — the Needle path only engages for models we can see are small).
+pub fn is_small_model(id: &str) -> bool {
+    let lower = id.to_lowercase();
+    if let Ok(list) = std::env::var("CORRODE_SMALL_MODELS") {
+        if list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .any(|s| lower.contains(&s.to_lowercase()))
+        {
+            return true;
+        }
+    }
+    let (billions, millions) = param_markers(&lower);
+    if millions {
+        return true;
+    }
+    let cutoff = std::env::var("CORRODE_SMALL_MODEL_MAX_B")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_SMALL_MODEL_MAX_B);
+    billions.is_some_and(|b| b <= cutoff)
+}
+
+/// Scan a (lowercased) model id for param-size markers. Returns the largest
+/// billions-scale value found (a number directly followed by `b`), and whether any
+/// millions-scale marker (`<n>m`) is present. Numbers not adjacent to `b`/`m` (version
+/// tags like `qwen3.5`) are ignored.
+fn param_markers(lower: &str) -> (Option<f64>, bool) {
+    let bytes = lower.as_bytes();
+    let mut max_b: Option<f64> = None;
+    let mut has_m = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            let num: f64 = lower[start..i].parse().unwrap_or(0.0);
+            match bytes.get(i) {
+                Some(b'b') => max_b = Some(max_b.map_or(num, |m| m.max(num))),
+                Some(b'm') => has_m = true,
+                _ => {}
+            }
+        } else {
+            i += 1;
+        }
+    }
+    (max_b, has_m)
+}
+
 /// Default model for unassigned roles: the first served model that isn't an
 /// embedding or image/diffusion model. No size/capability ranking yet.
 fn default_pick(available: &[String]) -> Option<&str> {
@@ -178,5 +241,19 @@ mod tests {
     #[test]
     fn resolve_errors_on_empty_model_list() {
         assert!(RoleModels::resolve(&[], &RoleModels::default()).is_err());
+    }
+
+    #[test]
+    fn is_small_model_reads_param_markers() {
+        // billions under the default 32B cutoff -> small; version tags ignored.
+        assert!(is_small_model("zaya1-8b-native.oq8++"));
+        assert!(is_small_model("Gemma-3-27B"));
+        assert!(is_small_model("qwen3.5-9b")); // the "3.5" tag is not a param marker
+        // millions-scale -> always small.
+        assert!(is_small_model("FunctionGemma-270m"));
+        // large models are not small.
+        assert!(!is_small_model("Qwen3.5-397B"));
+        // no size marker -> treated as large (conservative).
+        assert!(!is_small_model("some-mystery-model"));
     }
 }

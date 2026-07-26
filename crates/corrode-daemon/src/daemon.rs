@@ -8,13 +8,15 @@
 //! built), and the VFS.
 
 use crate::graph::GraphStore;
+use crate::hipfire::Client;
 use crate::plan_graph;
 use crate::planner;
-use crate::roles::{Role, RoleModels};
+use crate::roles::{self, Role, RoleModels};
 use crate::skills::SkillContext;
 use crate::swarm::{Swarm, Task};
 use crate::terminal::Terminals;
 use crate::toolcall::ToolCaller;
+use crate::tools::ToolBox;
 use crate::vfs::Vfs;
 use corrode_core::{AgentCommand, AgentEvent, Priority};
 use futures_util::StreamExt;
@@ -29,7 +31,8 @@ pub struct Daemon {
     roles: RoleModels,
     /// Embedded HelixDB. `None` unless built with `--features helix` and opened.
     graph: Option<Box<dyn GraphStore>>,
-    vfs: Box<dyn Vfs>,
+    /// Repo VFS. `Arc` so the tool-execution loop's `'static` future can own a clone.
+    vfs: Arc<dyn Vfs>,
     /// Live pty-backed terminal sessions.
     terminals: Terminals,
     /// Agent Skills + AGENTS.md + the embedded index (fed into the shared prefix).
@@ -44,7 +47,7 @@ impl Daemon {
         swarm: Swarm,
         roles: RoleModels,
         graph: Option<Box<dyn GraphStore>>,
-        vfs: Box<dyn Vfs>,
+        vfs: Arc<dyn Vfs>,
         skills: SkillContext,
         tool_caller: Option<Arc<dyn ToolCaller>>,
     ) -> Self {
@@ -104,22 +107,49 @@ impl Daemon {
                         .unwrap_or_default()
                         .to_string();
                     let band = planner::band_for(task.role);
-                    let full = planner::subagent_prompt(&prefix, task.role, &task.prompt);
+                    let prefix = prefix.clone();
                     let events = events.clone();
                     let tool_caller = self.tool_caller.clone();
+                    let vfs = Arc::clone(&self.vfs);
                     let id = task.id;
+                    let role = task.role;
+                    let prompt = task.prompt.clone();
                     async move {
-                        let output = client.respond(&model, &full, band).await;
-                        let emitted = match &output {
-                            Ok(text) => {
+                        // Small models can't construct tool-call JSON, so they run the
+                        // Needle-mediated tool-execution loop. Larger models (or a build
+                        // without a Needle caller) do a single-shot response as before.
+                        let output = if let (true, Some(caller)) =
+                            (roles::is_small_model(&model), tool_caller.clone())
+                        {
+                            run_tool_loop(
+                                &client,
+                                &model,
+                                band,
+                                caller,
+                                ToolBox::new(vfs),
+                                &prefix,
+                                role,
+                                &prompt,
+                                &events,
+                                id,
+                            )
+                            .await
+                        } else {
+                            let full = planner::subagent_prompt(&prefix, role, &prompt);
+                            let out = client.respond(&model, &full, band).await;
+                            if let Ok(text) = &out {
                                 let _ = events
                                     .send(AgentEvent::SubagentOutput {
                                         id,
                                         text: text.clone(),
                                     })
                                     .await;
-                                emit_followups(tool_caller, text).await
                             }
+                            out
+                        };
+
+                        let emitted = match &output {
+                            Ok(text) => emit_followups(tool_caller, text).await,
                             Err(e) => {
                                 let _ = events
                                     .send(AgentEvent::Error {
@@ -290,6 +320,71 @@ repository.\n",
     }
 }
 
+/// Max tool calls a small model may make before it must answer — a bound on GPU spend
+/// and runaway loops.
+const MAX_TOOL_STEPS: usize = 6;
+
+/// The Needle-mediated tool-execution loop for a small model.
+///
+/// Each turn the model responds (streamed as `SubagentOutput`). If it wrote a `TOOL:`
+/// line, Needle structures that plain-English intent into a call — the small model
+/// never writes JSON — `toolbox` executes it against the repo, and the observation is
+/// appended to the scratchpad for the next turn. The loop ends when a turn has no
+/// `TOOL:` line (that text is the final answer) or the step budget is spent. Tool and
+/// Needle errors come back as observations (the model can recover), not hard failures;
+/// only a model-generation error aborts the loop.
+#[allow(clippy::too_many_arguments)]
+async fn run_tool_loop(
+    client: &Client,
+    model: &str,
+    band: Priority,
+    caller: Arc<dyn ToolCaller>,
+    toolbox: ToolBox,
+    prefix: &str,
+    role: Role,
+    task: &str,
+    events: &mpsc::Sender<AgentEvent>,
+    id: u64,
+) -> anyhow::Result<String> {
+    let mut scratchpad = String::new();
+    let mut last = String::new();
+    for _ in 0..MAX_TOOL_STEPS {
+        let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
+        let text = client.respond(model, &prompt, band).await?;
+        let _ = events
+            .send(AgentEvent::SubagentOutput {
+                id,
+                text: text.clone(),
+            })
+            .await;
+        last = text.clone();
+
+        let Some(intent) = crate::tools::parse_tool_intent(&text) else {
+            return Ok(text); // no TOOL: line -> this turn is the final answer
+        };
+
+        // Needle turns the plain-English intent into a structured call (spawn_blocking:
+        // Needle inference is synchronous and CPU-bound).
+        let query = intent.clone();
+        let caller = caller.clone();
+        let observation = match tokio::task::spawn_blocking(move || {
+            caller.call(&query, crate::tools::TOOL_SCHEMAS)
+        })
+        .await
+        {
+            Ok(Ok(calls)) => match calls.first() {
+                Some(c) => toolbox.execute(c).await,
+                None => "error: no tool call produced".to_string(),
+            },
+            Ok(Err(e)) => format!("error: tool-call construction failed: {e}"),
+            Err(e) => format!("error: tool-call thread panicked: {e}"),
+        };
+        scratchpad.push_str(&format!("\nTOOL: {intent}\nRESULT: {observation}\n"));
+    }
+    // Step budget spent: hand back the last turn as the answer.
+    Ok(last)
+}
+
 /// Extract the follow-up task a subagent proposed in its reply.
 ///
 /// The agent writes a plain-English `NEXT:` line (see [`planner::subagent_prompt`]) —
@@ -352,7 +447,7 @@ mod tests {
             Swarm::new(Client::new("http://127.0.0.1:1", None), 1),
             RoleModels::uniform("test-model"),
             None,
-            Box::new(PassthroughVfs::new(std::env::temp_dir())),
+            Arc::new(PassthroughVfs::new(std::env::temp_dir())),
             SkillContext::default(),
             None,
         )
@@ -395,6 +490,37 @@ mod tests {
     async fn no_next_line_emits_nothing() {
         let emits = emit_followups(None, "All done. The tests pass and nothing remains.").await;
         assert!(emits.is_empty());
+    }
+
+    // The tool-execution path a small model takes: a plain-English intent -> Needle
+    // builds the call -> the ToolBox runs it against the repo. (The full loop also
+    // needs hipfire for the model turns; this covers the Needle+tool half.)
+    #[cfg(feature = "needle")]
+    #[tokio::test]
+    #[ignore = "requires Needle assets (CORRODE_NEEDLE_ASSETS or the vendored default)"]
+    async fn needle_builds_a_tool_call_that_the_toolbox_executes() {
+        use crate::tools::{ToolBox, TOOL_SCHEMAS};
+        let dir = std::env::temp_dir().join(format!("corrode-toolloop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("greeting.txt"), b"hello from the tool loop").unwrap();
+        let toolbox = ToolBox::new(Arc::new(PassthroughVfs::new(&dir)));
+
+        let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
+            .expect("load Needle")
+            .expect("Needle assets present");
+        let calls = caller
+            .call("read the file greeting.txt", TOOL_SCHEMAS)
+            .expect("tool-call construction");
+        eprintln!("calls: {calls:?}");
+        let call = calls.first().expect("a tool call");
+        assert_eq!(call.name, "read_file");
+
+        let observation = toolbox.execute(call).await;
+        assert!(
+            observation.contains("hello from the tool loop"),
+            "got: {observation}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // The hipfire-free dispatch path: DocQuery without a graph store reports itself

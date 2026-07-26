@@ -54,6 +54,25 @@ Write plain English, not JSON. Omit the line if no follow-up is needed.",
     )
 }
 
+/// Compose a tool-loop turn for a small model: the shared prefix, the role+task, the
+/// scratchpad of tool calls/results so far, then instructions. The model acts by writing
+/// a plain-English `TOOL:` line (Needle structures it — the small model never writes a
+/// tool call); it finishes with a turn that has no `TOOL:` line. The shared prefix stays
+/// byte-identical across turns and across the swarm, so hipfire reuses the KV prefill;
+/// only the scratchpad tail grows.
+pub fn tool_loop_prompt(context_prefix: &str, role: Role, task: &str, scratchpad: &str) -> String {
+    format!(
+        "{context_prefix}\n\n[role: {}]\n{task}\n{scratchpad}\n\
+You can use tools. To use one, write a line:\n\
+TOOL: <one plain-English request> (e.g. TOOL: read the file crates/corrode-core/src/lib.rs)\n\
+Write plain English, not JSON — the tool call is constructed for you. You will get the \
+result and can continue. When you have enough to answer, reply with your final answer and \
+NO TOOL: line. Optionally end with:\n\
+NEXT: <one plain-English follow-up task>",
+        role.as_str()
+    )
+}
+
 #[derive(Deserialize)]
 struct RawSubtask {
     role: String,

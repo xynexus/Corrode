@@ -26,7 +26,7 @@ written yet. Grep `ponytail:` for every deliberate seam and its upgrade trigger.
 
 ```
 crates/corrode-core     # shared wire types (Priority, AgentCommand/Event, node DTOs). Links nothing heavy; wasm-safe.
-crates/corrode-daemon   # the agent (AGPL-3.0 — see below). modules: daemon (command loop), planner, plan_graph (reactive scheduler), swarm, roles, hipfire, skills, toolcall (Needle shim), vfs, graph
+crates/corrode-daemon   # the agent (AGPL-3.0 — see below). modules: daemon (command loop), planner, plan_graph (reactive scheduler), swarm, roles, hipfire, skills, toolcall (Needle shim), tools (tool-exec loop), vfs, graph
 crates/corrode-web      # web server stub (Apache-2.0)
 crates/needle-toolcall-shim  # vendored Needle tool-call model (Apache-2.0, CPU/candle). Workspace-EXCLUDED; corrode-daemon links it behind `--features needle`. Weights committed under assets/needle.
 third_party/needle      # git submodule: upstream Needle (Cactus) — training/finetuning code, kept for finetuning Needle on Corrode's real tool set.
@@ -58,7 +58,10 @@ JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`),
 `CORRODE_NEEDLE_ASSETS` (Needle asset dir under `--features needle`; defaults to the
 vendored `crates/needle-toolcall-shim/assets/needle`, resolved at build time, so it
 works out of the box; absent -> tool-caller disabled, swarm falls back to
-model-emitted calls), `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
+model-emitted calls), `CORRODE_SMALL_MODELS` (comma-separated substrings that
+force-classify a model as "small" -> uses the Needle tool loop) and
+`CORRODE_SMALL_MODEL_MAX_B` (billions-param cutoff below which a model counts as small,
+default 32), `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
 `CORRODE_WEB_ADDR` (web bind, default `127.0.0.1:8787`), `CORRODE_DAEMON_URL`
 (daemon ws the web proxies to), `CORRODE_MAX_TOKENS` (per-call output cap,
 default 1024). The hipfire background daemon must be up (`hipfire start`, not just
@@ -143,6 +146,18 @@ actual tools (incl. the real tool-execution set: read_file, run_command, ...) so
 small coders' tools are picked up reliably; then its structured args become trustworthy
 too. Note: the guide's enum/literal token-forcing had a bug (the merged `":"` token
 bypassed it) — fixed in `needle-toolcall-shim/src/guide.rs`.
+
+**Second use — the tool-execution loop (`tools.rs`), small models only.** When a
+subagent's role model is *small* (`roles::is_small_model` — a param-size heuristic; see
+`CORRODE_SMALL_MODELS` / `CORRODE_SMALL_MODEL_MAX_B`) and a Needle caller is present,
+`run_tool_loop` runs it: each turn the model writes a plain-English `TOOL:` line, Needle
+builds the call against `tools::TOOL_SCHEMAS`, `ToolBox` executes it and feeds the
+observation back; the loop ends on a turn with no `TOOL:` line (the final answer) or
+after `MAX_TOOL_STEPS`. Larger models (or a build without Needle) take the single-shot
+path unchanged. The toolset is READ-ONLY for now (`read_file`, `list_dir` over the VFS);
+`write_file`/`run_command` wait on sandboxing + an action-approval gate. Path args come
+through Needle cleanly (paths tokenize well); tool *selection* sharpens with the planned
+finetune. `Daemon`'s `vfs` is `Arc<dyn Vfs>` so the loop's `'static` future owns a clone.
 
 ## Licensing — read before touching the daemon
 
