@@ -119,6 +119,9 @@ pub enum AgentCommand {
     DocQuery { question: String },
     /// Explorer: list the VFS entries under a directory path.
     ListDir { path: String },
+    /// A human's decision on a pending `ApprovalRequest` (mutating tool call). The
+    /// `id` echoes the request; `approved=false` (or a dropped channel) denies it.
+    ApprovalResponse { id: u64, approved: bool },
 }
 
 /// daemon -> webui/web-server. Streamed events (websocket in practice).
@@ -132,6 +135,10 @@ pub enum AgentEvent {
     DocAnswer { text: String, grounded_on: Vec<String> },
     /// Explorer: entries under a listed directory.
     DirListing { path: String, entries: Vec<FileNodeView> },
+    /// A subagent wants to run a mutating tool (write a file, run a command) and needs
+    /// a human's go-ahead. Reply with `AgentCommand::ApprovalResponse` carrying this
+    /// `id`. `action` is a human-readable description of exactly what will happen.
+    ApprovalRequest { id: u64, action: String },
     Error { message: String },
 }
 

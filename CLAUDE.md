@@ -79,8 +79,10 @@ same loop serves both. Frames are the serde-JSON encoding of the enums (external
 tagged, e.g. `{"Prompt":{"text":"...","priority":0}}`). The `Daemon` owns the
 host-side state handlers reach via `&self`: the `Swarm`, the `RoleModels`
 assignments, an `Option<Box<dyn GraphStore>>` (HelixDB; `None` without
-`--features helix`), and a `Box<dyn Vfs>`. Dispatch: `Prompt`→swarm, `ListDir`→vfs
-(real), `DocQuery`→graph (real when helix built), `TerminalInput`→echo (pty later).
+`--features helix`), an `Arc<dyn Vfs>`, and the `ApprovalGate`. Dispatch: `Prompt`→swarm
+(spawned concurrently — it can be long-lived and block on approval, so the loop keeps
+receiving), `ListDir`→vfs (real), `DocQuery`→graph (real when helix built),
+`TerminalInput`→pty, `ApprovalResponse`→resolves a pending mutating-tool approval.
 
 ## Roles
 
@@ -154,10 +156,17 @@ subagent's role model is *small* (`roles::is_small_model` — a param-size heuri
 builds the call against `tools::TOOL_SCHEMAS`, `ToolBox` executes it and feeds the
 observation back; the loop ends on a turn with no `TOOL:` line (the final answer) or
 after `MAX_TOOL_STEPS`. Larger models (or a build without Needle) take the single-shot
-path unchanged. The toolset is READ-ONLY for now (`read_file`, `list_dir` over the VFS);
-`write_file`/`run_command` wait on sandboxing + an action-approval gate. Path args come
-through Needle cleanly (paths tokenize well); tool *selection* sharpens with the planned
-finetune. `Daemon`'s `vfs` is `Arc<dyn Vfs>` so the loop's `'static` future owns a clone.
+path unchanged. Path args come through Needle cleanly (paths tokenize well); tool
+*selection* sharpens with the planned finetune. `Daemon`'s `vfs` is `Arc<dyn Vfs>` so the
+loop's `'static` future owns a clone.
+
+Tools: `read_file`, `list_dir` (read-only) run straight through; `write_file`,
+`run_command` are **mutating** (`tools::is_mutating`) and pass through a human
+**approval gate** first (`approval.rs`). The loop emits `AgentEvent::ApprovalRequest`
+and blocks that one call until an `AgentCommand::ApprovalResponse` arrives; it fails
+CLOSED (denied) if the client is gone. For the response to be received while a Prompt
+handler waits, `Daemon::run` now dispatches `Prompt` handling on a spawned task (other
+commands stay inline/ordered). `run_command`'s cwd is the daemon's `repo_root`.
 
 ## Licensing — read before touching the daemon
 

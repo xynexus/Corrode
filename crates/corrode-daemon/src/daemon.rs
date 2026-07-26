@@ -7,6 +7,7 @@
 //! swarm, the role->model assignments, the embedded graph store (HelixDB, when
 //! built), and the VFS.
 
+use crate::approval::ApprovalGate;
 use crate::graph::GraphStore;
 use crate::hipfire::Client;
 use crate::plan_graph;
@@ -20,6 +21,7 @@ use crate::tools::ToolBox;
 use crate::vfs::Vfs;
 use corrode_core::{AgentCommand, AgentEvent, Priority};
 use futures_util::StreamExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -40,6 +42,11 @@ pub struct Daemon {
     /// Reliable tool-calling for small models (the Needle shim). `None` unless built
     /// with `--features needle` and the assets were found; drives task emission.
     tool_caller: Option<Arc<dyn ToolCaller>>,
+    /// Human-in-the-loop gate for mutating tool calls (write_file / run_command).
+    /// Shared with the command loop, which resolves `ApprovalResponse`s.
+    approvals: Arc<ApprovalGate>,
+    /// Repo root — the working directory for `run_command` in the tool loop.
+    repo_root: PathBuf,
 }
 
 impl Daemon {
@@ -50,6 +57,7 @@ impl Daemon {
         vfs: Arc<dyn Vfs>,
         skills: SkillContext,
         tool_caller: Option<Arc<dyn ToolCaller>>,
+        repo_root: PathBuf,
     ) -> Self {
         Self {
             swarm,
@@ -59,18 +67,31 @@ impl Daemon {
             terminals: Terminals::new(),
             skills,
             tool_caller,
+            approvals: Arc::new(ApprovalGate::default()),
+            repo_root,
         }
     }
 
     /// Run until the command channel closes. Dropping the sender ends the loop,
     /// which drops `events` and unblocks the consumer.
+    ///
+    /// `Prompt` handling is dispatched concurrently (it can be long-lived and may block
+    /// on a human approval), so the loop keeps receiving — crucially, the
+    /// `ApprovalResponse` that unblocks a waiting tool call. Other commands (terminal
+    /// I/O, approvals) are handled inline to preserve their ordering.
     pub async fn run(
-        &self,
+        self: Arc<Self>,
         mut commands: mpsc::Receiver<AgentCommand>,
         events: mpsc::Sender<AgentEvent>,
     ) {
         while let Some(cmd) = commands.recv().await {
-            self.handle(cmd, &events).await;
+            if matches!(cmd, AgentCommand::Prompt { .. }) {
+                let this = Arc::clone(&self);
+                let events = events.clone();
+                tokio::spawn(async move { this.handle(cmd, &events).await });
+            } else {
+                self.handle(cmd, &events).await;
+            }
         }
     }
 
@@ -111,6 +132,8 @@ impl Daemon {
                     let events = events.clone();
                     let tool_caller = self.tool_caller.clone();
                     let vfs = Arc::clone(&self.vfs);
+                    let approvals = Arc::clone(&self.approvals);
+                    let root = self.repo_root.clone();
                     let id = task.id;
                     let role = task.role;
                     let prompt = task.prompt.clone();
@@ -126,7 +149,8 @@ impl Daemon {
                                 &model,
                                 band,
                                 caller,
-                                ToolBox::new(vfs),
+                                ToolBox::new(vfs, root),
+                                &approvals,
                                 &prefix,
                                 role,
                                 &prompt,
@@ -226,6 +250,11 @@ impl Daemon {
                         })
                         .await;
                 }
+            }
+            AgentCommand::ApprovalResponse { id, approved } => {
+                // Unblock the tool call waiting on this decision (no-op if it already
+                // gave up). Handled inline so it lands while a Prompt handler waits.
+                self.approvals.resolve(id, approved);
             }
         }
     }
@@ -334,12 +363,14 @@ const MAX_TOOL_STEPS: usize = 6;
 /// Needle errors come back as observations (the model can recover), not hard failures;
 /// only a model-generation error aborts the loop.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn run_tool_loop(
     client: &Client,
     model: &str,
     band: Priority,
     caller: Arc<dyn ToolCaller>,
     toolbox: ToolBox,
+    approvals: &ApprovalGate,
     prefix: &str,
     role: Role,
     task: &str,
@@ -366,13 +397,22 @@ async fn run_tool_loop(
         // Needle turns the plain-English intent into a structured call (spawn_blocking:
         // Needle inference is synchronous and CPU-bound).
         let query = intent.clone();
-        let caller = caller.clone();
+        let needle = caller.clone();
         let observation = match tokio::task::spawn_blocking(move || {
-            caller.call(&query, crate::tools::TOOL_SCHEMAS)
+            needle.call(&query, crate::tools::TOOL_SCHEMAS)
         })
         .await
         {
             Ok(Ok(calls)) => match calls.first() {
+                // Mutating calls (write_file / run_command) need a human's go-ahead;
+                // read-only calls run straight through.
+                Some(c) if crate::tools::is_mutating(c) => {
+                    if approvals.request(events, crate::tools::describe(c)).await {
+                        toolbox.execute(c).await
+                    } else {
+                        format!("denied: {} was not approved", crate::tools::describe(c))
+                    }
+                }
                 Some(c) => toolbox.execute(c).await,
                 None => "error: no tool call produced".to_string(),
             },
@@ -450,6 +490,7 @@ mod tests {
             Arc::new(PassthroughVfs::new(std::env::temp_dir())),
             SkillContext::default(),
             None,
+            std::env::temp_dir(),
         )
     }
 
@@ -539,7 +580,7 @@ mod tests {
         .unwrap();
         drop(ctx);
 
-        daemon.run(crx, etx).await;
+        Arc::new(daemon).run(crx, etx).await;
 
         assert!(matches!(
             erx.recv().await.unwrap(),

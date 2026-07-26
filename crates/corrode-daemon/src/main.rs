@@ -9,6 +9,7 @@
 //! the daemon's WebSocket interface (`corrode-web` and the wasm webui drive it from
 //! there).
 
+mod approval;
 mod daemon;
 #[cfg(feature = "fuse")]
 mod fuse;
@@ -82,7 +83,15 @@ async fn main() -> anyhow::Result<()> {
     let graph = open_graph();
     let tool_caller = open_tool_caller();
     let vfs = std::sync::Arc::new(PassthroughVfs::new(&repo_root));
-    let daemon = Daemon::new(Swarm::new(client, 32), roles, graph, vfs, skills, tool_caller);
+    let daemon = Daemon::new(
+        Swarm::new(client, 32),
+        roles,
+        graph,
+        vfs,
+        skills,
+        tool_caller,
+        std::path::PathBuf::from(&repo_root),
+    );
 
     // Optional FUSE mount of the repo VFS (--features fuse, CORRODE_MOUNT=<dir>), so
     // git and subagent shells see the projection as a real tree. Runs alongside the
