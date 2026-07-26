@@ -47,6 +47,8 @@ pub struct Daemon {
     approvals: Arc<ApprovalGate>,
     /// Repo root — the working directory for `run_command` in the tool loop.
     repo_root: PathBuf,
+    /// Monotonic id source for plan (provenance root) nodes, one per Prompt turn.
+    next_plan_id: std::sync::atomic::AtomicU64,
 }
 
 impl Daemon {
@@ -69,6 +71,7 @@ impl Daemon {
             tool_caller,
             approvals: Arc::new(ApprovalGate::default()),
             repo_root,
+            next_plan_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -110,12 +113,17 @@ impl Daemon {
                     }
                 };
 
-                // Seed the reactive plan graph with the decomposition. The scheduler
-                // fans ready tasks to the swarm and grows the graph as agents emit
-                // follow-up work (a test contract, a research spin-off) — dataflow,
-                // not a fixed fan-out. Concurrency is bounded by the swarm's inflight
-                // semaphore inside `execute`, not here.
-                let mut graph = plan_graph::PlanGraph::default();
+                // Seed the reactive plan graph with the decomposition, rooted at a plan
+                // node. The scheduler fans ready tasks to the swarm and grows the graph
+                // as agents emit follow-up work (a test contract, a research spin-off) —
+                // dataflow, not a fixed fan-out. Concurrency is bounded by the swarm's
+                // inflight semaphore inside `execute`, not here.
+                let plan_id = format!(
+                    "plan-{}",
+                    self.next_plan_id
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
+                let mut graph = plan_graph::PlanGraph::new(&plan_id);
                 for s in subtasks {
                     graph.add(s.role, s.prompt, Vec::new());
                 }
@@ -141,6 +149,9 @@ impl Daemon {
                         // Small models can't construct tool-call JSON, so they run the
                         // Needle-mediated tool-execution loop. Larger models (or a build
                         // without a Needle caller) do a single-shot response as before.
+                        // `artifacts` collects the files a tool-loop task wrote (its code
+                        // nodes in provenance).
+                        let mut artifacts = Vec::new();
                         let output = if let (true, Some(caller)) =
                             (roles::is_small_model(&model), tool_caller.clone())
                         {
@@ -156,6 +167,7 @@ impl Daemon {
                                 &prompt,
                                 &events,
                                 id,
+                                &mut artifacts,
                             )
                             .await
                         } else {
@@ -183,7 +195,11 @@ impl Daemon {
                                 Vec::new()
                             }
                         };
-                        plan_graph::Outcome { output, emitted }
+                        plan_graph::Outcome {
+                            output,
+                            emitted,
+                            artifacts,
+                        }
                     }
                 })
                 .await;
@@ -202,6 +218,10 @@ impl Daemon {
                         })
                         .await;
                 }
+
+                // Persist the plan's provenance (plan <- task/contract <- code) to the
+                // graph store, so the code<->task<->plan lineage is queryable.
+                self.persist_provenance(&graph);
             }
             AgentCommand::DocQuery { question } => {
                 let ev = match &self.graph {
@@ -309,6 +329,30 @@ impl Daemon {
         Ok((plan, prefix))
     }
 
+    /// Persist a plan's provenance subgraph to the graph store, if one is open.
+    /// Best-effort: without `--features helix` there's no store (a no-op), and the
+    /// HelixDB write path is still stubbed — so on the first write error we log once and
+    /// stop rather than spamming. The in-memory provenance is already correct; this is
+    /// the durability seam.
+    fn persist_provenance(&self, graph: &plan_graph::PlanGraph) {
+        let Some(store) = &self.graph else {
+            return;
+        };
+        let prov = graph.provenance();
+        for node in &prov.nodes {
+            if let Err(e) = store.upsert_node(&node.id, node.kind.as_str(), &node.label) {
+                eprintln!("provenance persistence unavailable ({e}); skipping");
+                return;
+            }
+        }
+        for edge in &prov.edges {
+            if let Err(e) = store.add_edge(&edge.from, &edge.rel, &edge.to) {
+                eprintln!("provenance edge persistence unavailable ({e}); skipping");
+                return;
+            }
+        }
+    }
+
     /// The shared context prefix prepended to every prompt in a Prompt turn.
     ///
     /// ponytail: a shallow repo digest (VFS root listing) plus a fixed preamble.
@@ -376,6 +420,7 @@ async fn run_tool_loop(
     task: &str,
     events: &mpsc::Sender<AgentEvent>,
     id: u64,
+    written: &mut Vec<String>,
 ) -> anyhow::Result<String> {
     let mut scratchpad = String::new();
     let mut last = String::new();
@@ -408,7 +453,15 @@ async fn run_tool_loop(
                 // read-only calls run straight through.
                 Some(c) if crate::tools::is_mutating(c) => {
                     if approvals.request(events, crate::tools::describe(c)).await {
-                        toolbox.execute(c).await
+                        let obs = toolbox.execute(c).await;
+                        // A successful write authors a code node — record its path so
+                        // provenance can link it to this task.
+                        if c.name == "write_file" && obs.starts_with("wrote") {
+                            if let Some(path) = c.arguments.get("path").and_then(|p| p.as_str()) {
+                                written.push(path.to_string());
+                            }
+                        }
+                        obs
                     } else {
                         format!("denied: {} was not approved", crate::tools::describe(c))
                     }

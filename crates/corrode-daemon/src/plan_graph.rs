@@ -45,24 +45,96 @@ pub struct Emit {
     pub after_emitter: bool,
 }
 
-/// What executing one task yields: its output, and any tasks it emitted.
+/// What executing one task yields: its output, any tasks it emitted, and the repo paths
+/// it produced (code nodes it authored via `write_file`).
 pub struct Outcome {
     pub output: anyhow::Result<String>,
     pub emitted: Vec<Emit>,
+    pub artifacts: Vec<String>,
+}
+
+/// A node in the provenance subgraph a plan produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvNode {
+    pub id: String,
+    pub kind: NodeKind,
+    pub label: String,
+}
+
+/// The kind of a provenance node. `Task` is a planned subtask; `Contract` is a task an
+/// agent emitted mid-run (a test/research spin-off); `Code` is a produced file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    Plan,
+    Task,
+    Contract,
+    Code,
+}
+
+impl NodeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NodeKind::Plan => "plan",
+            NodeKind::Task => "task",
+            NodeKind::Contract => "contract",
+            NodeKind::Code => "code",
+        }
+    }
+}
+
+/// A directed, labelled provenance edge (`from -rel-> to`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvEdge {
+    pub from: String,
+    pub rel: String,
+    pub to: String,
+}
+
+impl ProvEdge {
+    fn new(from: &str, rel: &str, to: &str) -> Self {
+        Self {
+            from: from.to_string(),
+            rel: rel.to_string(),
+            to: to.to_string(),
+        }
+    }
+}
+
+/// The plan's provenance subgraph: `nodes` (Plan + Task/Contract + Code) and the `edges`
+/// connecting them (`part_of`, `emitted_from`, `produced_by`).
+pub struct Provenance {
+    pub nodes: Vec<ProvNode>,
+    pub edges: Vec<ProvEdge>,
 }
 
 struct Node {
     task: PlanTask,
     status: Status,
+    /// The task that emitted this one, if any — a task with an emitter is a *contract*
+    /// (a test/research spin-off), and this is its provenance back to its emitter.
+    emitted_by: Option<TaskId>,
+    /// Repo paths this task produced (via `write_file`) — the code nodes it authored.
+    artifacts: Vec<String>,
 }
 
 #[derive(Default)]
 pub struct PlanGraph {
+    /// Stable id of the plan this graph *is* — the root every task hangs off in the
+    /// provenance graph. Empty for graphs built without one (tests).
+    plan_id: String,
     nodes: Vec<Node>,
     next_id: TaskId,
 }
 
 impl PlanGraph {
+    /// A graph rooted at a named plan (its provenance root node).
+    pub fn new(plan_id: impl Into<String>) -> Self {
+        Self {
+            plan_id: plan_id.into(),
+            ..Self::default()
+        }
+    }
+
     /// Add a task; returns its id (usable as a dependency for later tasks).
     pub fn add(&mut self, role: Role, prompt: impl Into<String>, deps: Vec<TaskId>) -> TaskId {
         let id = self.next_id;
@@ -75,8 +147,68 @@ impl PlanGraph {
                 deps,
             },
             status: Status::Pending,
+            emitted_by: None,
+            artifacts: Vec::new(),
         });
         id
+    }
+
+    /// Record that `id` was emitted by `emitter` — makes `id` a contract in provenance.
+    fn set_emitted_by(&mut self, id: TaskId, emitter: TaskId) {
+        if let Some(n) = self.nodes.iter_mut().find(|n| n.task.id == id) {
+            n.emitted_by = Some(emitter);
+        }
+    }
+
+    /// Record the code artifacts (repo paths) a task produced.
+    fn set_artifacts(&mut self, id: TaskId, artifacts: Vec<String>) {
+        if let Some(n) = self.nodes.iter_mut().find(|n| n.task.id == id) {
+            n.artifacts = artifacts;
+        }
+    }
+
+    fn node_ref(&self, id: TaskId) -> String {
+        format!("{}:task:{}", self.plan_id, id)
+    }
+
+    /// The provenance subgraph this plan produced: a Plan root, a Task/Contract node per
+    /// task (`part_of` the plan, and `emitted_from` its emitter for contracts), and a
+    /// Code node per produced file (`produced_by` its task). This is what a graph store
+    /// persists so the code<->task<->plan lineage is queryable.
+    pub fn provenance(&self) -> Provenance {
+        let plan = self.plan_id.clone();
+        let mut nodes = vec![ProvNode {
+            id: plan.clone(),
+            kind: NodeKind::Plan,
+            label: plan.clone(),
+        }];
+        let mut edges = Vec::new();
+        for n in &self.nodes {
+            let task_ref = self.node_ref(n.task.id);
+            nodes.push(ProvNode {
+                id: task_ref.clone(),
+                kind: if n.emitted_by.is_some() {
+                    NodeKind::Contract
+                } else {
+                    NodeKind::Task
+                },
+                label: n.task.prompt.clone(),
+            });
+            edges.push(ProvEdge::new(&task_ref, "part_of", &plan));
+            if let Some(emitter) = n.emitted_by {
+                edges.push(ProvEdge::new(&task_ref, "emitted_from", &self.node_ref(emitter)));
+            }
+            for path in &n.artifacts {
+                let code_ref = format!("{plan}:code:{path}");
+                nodes.push(ProvNode {
+                    id: code_ref.clone(),
+                    kind: NodeKind::Code,
+                    label: path.clone(),
+                });
+                edges.push(ProvEdge::new(&code_ref, "produced_by", &task_ref));
+            }
+        }
+        Provenance { nodes, edges }
     }
 
     fn status(&self, id: TaskId) -> Option<&Status> {
@@ -144,9 +276,11 @@ where
                 Status::Failed
             },
         );
+        graph.set_artifacts(id, outcome.artifacts); // code nodes this task produced
         for emit in outcome.emitted {
             let deps = if emit.after_emitter { vec![id] } else { vec![] };
-            graph.add(emit.role, emit.prompt, deps);
+            let emitted_id = graph.add(emit.role, emit.prompt, deps);
+            graph.set_emitted_by(emitted_id, id); // the emitted task is a contract of `id`
         }
     }
 }
@@ -258,6 +392,7 @@ mod tests {
                 Outcome {
                     output: Ok(format!("done: {}", task.prompt)),
                     emitted,
+                    artifacts: Vec::new(),
                 }
             }
         })
@@ -269,5 +404,57 @@ mod tests {
         assert!(pos("test add").is_some(), "emitted test task ran");
         assert!(pos("write add") < pos("test add"), "emitted test runs after its emitter");
         assert!(g.stuck().is_empty(), "everything scheduled");
+    }
+
+    // The provenance graph a plan produces: a coder task emits a contract and writes a
+    // file; assert code -produced_by-> task, contract -emitted_from-> task, and every
+    // task/contract -part_of-> the plan node.
+    #[tokio::test]
+    async fn provenance_links_code_to_task_and_contract_to_plan() {
+        let mut g = PlanGraph::new("plan-7");
+        g.add(Role::Coder, "write add()", vec![]);
+
+        run_reactive(&mut g, |task: PlanTask| async move {
+            let emits = if task.prompt.contains("write add") {
+                vec![Emit {
+                    role: Role::Coder,
+                    prompt: "test add()".into(),
+                    after_emitter: true,
+                }]
+            } else {
+                vec![]
+            };
+            let artifacts = if task.prompt.contains("write add") {
+                vec!["src/math.rs".to_string()]
+            } else {
+                vec![]
+            };
+            Outcome {
+                output: Ok("done".into()),
+                emitted: emits,
+                artifacts,
+            }
+        })
+        .await;
+
+        let prov = g.provenance();
+        let has_node = |id: &str, kind: NodeKind| {
+            prov.nodes.iter().any(|n| n.id == id && n.kind == kind)
+        };
+        let has_edge = |from: &str, rel: &str, to: &str| {
+            prov.edges
+                .iter()
+                .any(|e| e.from == from && e.rel == rel && e.to == to)
+        };
+
+        assert!(has_node("plan-7", NodeKind::Plan));
+        assert!(has_node("plan-7:task:0", NodeKind::Task)); // original subtask
+        assert!(has_node("plan-7:task:1", NodeKind::Contract)); // emitted test
+        assert!(has_node("plan-7:code:src/math.rs", NodeKind::Code));
+
+        assert!(has_edge("plan-7:task:0", "part_of", "plan-7"));
+        assert!(has_edge("plan-7:task:1", "part_of", "plan-7"));
+        assert!(has_edge("plan-7:task:1", "emitted_from", "plan-7:task:0"));
+        assert!(has_edge("plan-7:code:src/math.rs", "produced_by", "plan-7:task:0"));
     }
 }

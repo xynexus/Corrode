@@ -27,6 +27,13 @@ pub trait GraphStore: Send + Sync {
     /// GraphRAG: vector-search docs, then walk the graph for grounding. Returns the
     /// node ids the answer is grounded on.
     fn doc_search(&self, question: &str, k: usize) -> anyhow::Result<Vec<String>>;
+
+    /// Create-or-update a provenance node (plan / task / contract / code) by id.
+    fn upsert_node(&self, id: &str, kind: &str, label: &str) -> anyhow::Result<()>;
+
+    /// Add a directed, labelled provenance edge (`from -rel-> to`), e.g. a code node
+    /// `produced_by` its task, a task `part_of` its plan.
+    fn add_edge(&self, from: &str, rel: &str, to: &str) -> anyhow::Result<()>;
 }
 
 /// In-process HelixDB. Only compiled with `--features helix`.
@@ -61,6 +68,18 @@ pub mod embedded {
         fn doc_search(&self, _question: &str, _k: usize) -> anyhow::Result<Vec<String>> {
             // ponytail: wire vector_core HNSW search + graph grounding here.
             anyhow::bail!("doc_search: not implemented yet")
+        }
+
+        fn upsert_node(&self, _id: &str, _kind: &str, _label: &str) -> anyhow::Result<()> {
+            // ponytail: the provenance schema + write (add_n / set_property upsert via
+            // traversal_core) lands here; until then the daemon records provenance
+            // best-effort and logs that persistence is unavailable.
+            anyhow::bail!("upsert_node: not implemented yet")
+        }
+
+        fn add_edge(&self, _from: &str, _rel: &str, _to: &str) -> anyhow::Result<()> {
+            // ponytail: add_e between provenance nodes once upsert_node lands.
+            anyhow::bail!("add_edge: not implemented yet")
         }
     }
 

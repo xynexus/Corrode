@@ -112,6 +112,15 @@ unschedulable after the run settles (`stuck`) surface as an Error. `band_for` ma
 role→band (orchestration→Realtime, architect/coder/review→Default,
 research→Opportunistic).
 
+**Provenance.** A `PlanGraph` is rooted at a `plan` node (one per Prompt turn). Every
+task is `part_of` the plan; an emitted task is a *contract* and also links
+`emitted_from` its emitter; a file a task writes becomes a `code` node `produced_by`
+that task (paths collected from `write_file` calls in the tool loop). `graph.provenance()`
+exports this as nodes+edges, and `Daemon::persist_provenance` writes it to the graph
+store via the `GraphStore::upsert_node` / `add_edge` seam so the code↔task↔plan lineage
+is queryable. ponytail: the HelixDB write path is still stubbed (bails) — the in-memory
+provenance is correct and tested; persistence logs "unavailable" until those writes land.
+
 Every prompt in a turn — the orchestration call and each subagent
 (`subagent_prompt`) — begins with a byte-identical **context prefix**
 (`Daemon::context_prefix`), so hipfire batches them prefix-shared and reuses KV when
