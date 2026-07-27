@@ -566,6 +566,38 @@ mod tests {
         )
     }
 
+    /// The `fixtures/demo-repo` submodule (`xynexus/corrode-demo`) — the deterministic
+    /// repo the e2e tests run against: real files (`src/lib.rs`), real rules
+    /// (`AGENTS.md`), a real skill (`.agents/skills/run-tests`). `None` when it isn't
+    /// checked out (`git submodule update --init fixtures/demo-repo`), so the tests skip
+    /// rather than fail on a missing fixture.
+    fn demo_repo() -> Option<std::path::PathBuf> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo-repo");
+        dir.join("src/lib.rs").exists().then_some(dir)
+    }
+
+    /// The fixture is wired up, through the same `SkillContext` the daemon builds:
+    /// discovery finds the bundled `run-tests` skill, it reaches the shared prefix, its
+    /// scripts are resolvable, and `AGENTS.md` is read. Runs on the base build (no
+    /// embedding model -> no hipfire call), so a moved path or an uninitialized submodule
+    /// fails here rather than inside an ignored test.
+    #[tokio::test]
+    async fn demo_repo_fixture_is_discoverable() {
+        let Some(repo) = demo_repo() else {
+            eprintln!("skipped: fixtures/demo-repo not checked out");
+            return;
+        };
+        let client = Client::new("http://127.0.0.1:1", None);
+        let skills = SkillContext::build(&repo, &client, None).await;
+        let section = skills
+            .prefix_section("run the tests", &client, TOP_K_SKILLS)
+            .await;
+        assert!(section.contains("run-tests"), "got: {section}");
+        assert!(skills.script_dirs().contains_key("run-tests"));
+        let rules = skills.agents_rules();
+        assert!(rules.contains("cargo test"), "got: {rules}");
+    }
+
     // Real Needle emission, end-to-end through `emit_followups` (query wrapper +
     // grammar-guided decode + mapping). Ignored by default (needs the weights):
     //   cargo test -p corrode-daemon --features needle -- --ignored --nocapture
@@ -579,9 +611,10 @@ mod tests {
                 .expect("load Needle")
                 .expect("Needle assets present"),
         );
-        // Reply ends with a plain-English NEXT: line describing a review follow-up.
-        let reply = "Added the auth middleware in auth.rs.\n\
-            NEXT: review the token-expiry logic in the auth middleware for correctness";
+        // A subagent's reply against the fixture repo, ending with a plain-English NEXT:
+        // line describing a review follow-up (mathkit's standing is_prime task).
+        let reply = "Rewrote is_prime in src/lib.rs to trial-divide up to sqrt(n).\n\
+            NEXT: review the new is_prime implementation in src/lib.rs for correctness";
         let emits = emit_followups(Some(caller), &Dialects::default(), reply).await;
         let summary: Vec<_> = emits
             .iter()
@@ -592,7 +625,7 @@ mod tests {
         // Task text is verbatim from the NEXT: line (not Needle's truncated arg).
         assert_eq!(
             emits[0].prompt,
-            "review the token-expiry logic in the auth middleware for correctness"
+            "review the new is_prime implementation in src/lib.rs for correctness"
         );
         // Needle classifies the role from the instruction (tool selection).
         assert_eq!(emits[0].role, Role::Review);
@@ -619,12 +652,13 @@ mod tests {
     async fn needle_builds_a_tool_call_that_the_toolbox_executes() {
         use crate::dialect::ToolDialect;
         use crate::tools::{ToolBox, EXEC_TOOLS};
-        let dir = std::env::temp_dir().join(format!("corrode-toolloop-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("greeting.txt"), b"hello from the tool loop").unwrap();
+        let Some(repo) = demo_repo() else {
+            eprintln!("skipped: fixtures/demo-repo not checked out");
+            return;
+        };
         let toolbox = ToolBox::new(
-            Arc::new(PassthroughVfs::new(&dir)),
-            dir.clone(),
+            Arc::new(PassthroughVfs::new(&repo)),
+            repo.clone(),
             Arc::new(std::collections::HashMap::new()),
         );
 
@@ -633,40 +667,40 @@ mod tests {
             .expect("Needle assets present");
         let dialect = ToolDialect::default();
         let raw = caller
-            .generate("read the file greeting.txt", &dialect.render(EXEC_TOOLS))
+            .generate("read the file src/lib.rs", &dialect.render(EXEC_TOOLS))
             .expect("generation");
         let calls = dialect.parse(&raw).expect("parse");
         eprintln!("calls: {calls:?}");
         let call = calls.first().expect("a tool call");
         assert_eq!(call.name, "read_file");
 
+        // mathkit's source, straight out of the fixture repo.
         let observation = toolbox.execute(call).await;
-        assert!(
-            observation.contains("hello from the tool loop"),
-            "got: {observation}"
-        );
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(observation.contains("pub fn is_prime"), "got: {observation}");
     }
 
-    // Stage 3 end-to-end: a plain-English "run the skill script" -> Needle builds a
-    // run_skill_script call -> the ToolBox resolves the skill and runs its script.
+    // Stage 3 end-to-end against the fixture repo: discovery finds its bundled
+    // `run-tests` skill -> a plain-English ask -> Needle builds a run_skill_script call
+    // -> the ToolBox resolves the skill and runs `scripts/test.sh` (a real `cargo test`
+    // over mathkit, so the first run compiles the fixture).
     #[cfg(feature = "needle")]
     #[tokio::test]
     #[ignore = "requires Needle assets (CORRODE_NEEDLE_ASSETS or the vendored default)"]
     async fn needle_runs_a_skill_script_end_to_end() {
         use crate::dialect::ToolDialect;
         use crate::tools::{ToolBox, EXEC_TOOLS};
-        let dir = std::env::temp_dir().join(format!("corrode-skille2e-{}", std::process::id()));
-        let skill_dir = dir.join("skills/greeter");
-        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
-        std::fs::write(
-            skill_dir.join("scripts/hello.sh"),
-            "#!/bin/sh\necho skill script ran\n",
-        )
-        .unwrap();
-        let mut map = std::collections::HashMap::new();
-        map.insert("greeter".to_string(), skill_dir);
-        let toolbox = ToolBox::new(Arc::new(PassthroughVfs::new(&dir)), dir.clone(), Arc::new(map));
+        let Some(repo) = demo_repo() else {
+            eprintln!("skipped: fixtures/demo-repo not checked out");
+            return;
+        };
+        let client = Client::new("http://127.0.0.1:1", None);
+        let skills = SkillContext::build(&repo, &client, None).await.script_dirs();
+        assert!(skills.contains_key("run-tests"), "got: {skills:?}");
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&repo)),
+            repo.clone(),
+            Arc::new(skills),
+        );
 
         let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
             .expect("load Needle")
@@ -674,7 +708,7 @@ mod tests {
         let dialect = ToolDialect::default();
         let raw = caller
             .generate(
-                "run the hello.sh script from the greeter skill",
+                "run the test.sh script from the run-tests skill",
                 &dialect.render(EXEC_TOOLS),
             )
             .expect("generation");
@@ -686,8 +720,8 @@ mod tests {
         // The call is mutating (executes code) -> would gate on approval in the loop.
         assert!(crate::tools::is_mutating(call));
         let observation = toolbox.execute(call).await;
-        assert!(observation.contains("skill script ran"), "got: {observation}");
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(observation.starts_with("exit 0:"), "got: {observation}");
+        assert!(observation.contains("test result: ok"), "got: {observation}");
     }
 
     // The hipfire-free dispatch path: DocQuery without a graph store reports itself
