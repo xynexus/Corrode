@@ -44,6 +44,15 @@ pub enum SchemaFormat {
 pub enum ParseFormat {
     /// A JSON array of `{"name","arguments"}` (optionally prefixed with `<tool_call>`).
     JsonArray,
+    /// MiniCPM5's native XML: `<function name="f"><param name="p">v</param></function>`,
+    /// with `<![CDATA[…]]>` around values containing `<`, `&` or newlines.
+    ///
+    /// This is what the model emits *by itself* once its chat template renders the
+    /// `<tools>` block — no Needle in the loop. CDATA is why it matters: multi-param
+    /// calls carrying file contents are structurally safe here, which is precisely the
+    /// case `docs/todo/finetune-needle-toolset.md` calls the finetune's primary target
+    /// (the base weights emit bare keys like `{"skill":"…","script"}` for it).
+    MiniCpmXml,
 }
 
 /// A model's tool dialect: how to render tool schemas, how to parse its calls, and the
@@ -134,6 +143,7 @@ impl ToolDialect {
         let calls: Vec<ToolCall> = match self.parse {
             ParseFormat::JsonArray => serde_json::from_str(trimmed)
                 .map_err(|e| anyhow::anyhow!("parsing tool calls from {trimmed:?}: {e}"))?,
+            ParseFormat::MiniCpmXml => parse_minicpm_xml(raw),
         };
         Ok(calls
             .into_iter()
@@ -232,6 +242,7 @@ impl ProfileConfig {
         };
         let parse = match self.parse.as_str() {
             "json-array" => ParseFormat::JsonArray,
+            "minicpm-xml" => ParseFormat::MiniCpmXml,
             other => anyhow::bail!("unknown parse format `{other}`"),
         };
         Ok(ToolDialect::new(schema, parse, self.names))
@@ -302,5 +313,171 @@ mod tests {
         assert_eq!(d.resolve("needle-base").schema, SchemaFormat::OpenAiNested);
         // no match -> default
         assert_eq!(d.resolve("zaya1-8b").schema, SchemaFormat::NeedleFlat);
+    }
+}
+
+/// Parse MiniCPM5's native XML tool calls out of a reply.
+///
+/// The model reasons in prose and then emits one or more `<function>` blocks, so this
+/// scans rather than expecting the whole reply to be a call. A malformed or absent
+/// block yields no calls (the reply was a final answer, not a tool step) — never an
+/// error, matching how the tool loop treats a turn with no call.
+///
+/// ponytail: string scan, not an XML parser. The grammar in hipfire constrains this
+/// shape at the token level, and values arrive either plain or CDATA-wrapped; a real
+/// parser buys nothing until the dialect grows attributes or nesting.
+fn parse_minicpm_xml(raw: &str) -> Vec<ToolCall> {
+    const FN_OPEN: &str = "<function name=\"";
+    const PARAM_OPEN: &str = "<param name=\"";
+    let mut calls = Vec::new();
+    let mut rest = raw;
+    while let Some(at) = rest.find(FN_OPEN) {
+        let after = &rest[at + FN_OPEN.len()..];
+        let Some(name_end) = after.find("\">") else {
+            break;
+        };
+        let name = after[..name_end].trim().to_string();
+        let body_start = &after[name_end + 2..];
+        // A call ends at its close tag; without one, take the rest (truncated output).
+        let (body, tail) = match body_start.find("</function>") {
+            Some(end) => (&body_start[..end], &body_start[end + "</function>".len()..]),
+            None => (body_start, ""),
+        };
+
+        let mut args = serde_json::Map::new();
+        let mut param_rest = body;
+        while let Some(p_at) = param_rest.find(PARAM_OPEN) {
+            let p_after = &param_rest[p_at + PARAM_OPEN.len()..];
+            let Some(p_name_end) = p_after.find("\">") else {
+                break;
+            };
+            let p_name = p_after[..p_name_end].trim().to_string();
+            let value_start = &p_after[p_name_end + 2..];
+            let (value, next) = match value_start.find("</param>") {
+                Some(end) => (
+                    &value_start[..end],
+                    &value_start[end + "</param>".len()..],
+                ),
+                None => (value_start, ""),
+            };
+            args.insert(p_name, serde_json::Value::String(unwrap_cdata(value)));
+            param_rest = next;
+        }
+
+        if !name.is_empty() {
+            calls.push(ToolCall {
+                name,
+                arguments: serde_json::Value::Object(args),
+            });
+        }
+        rest = tail;
+    }
+    calls
+}
+
+/// Strip a `<![CDATA[…]]>` wrapper. Values only need it when they contain `<`, `&` or
+/// newlines, so both forms turn up in the same reply and the content is verbatim either
+/// way — no entity decoding, which is the point of CDATA for source code.
+fn unwrap_cdata(value: &str) -> String {
+    let trimmed = value.trim();
+    match trimmed
+        .strip_prefix("<![CDATA[")
+        .and_then(|inner| inner.strip_suffix("]]>"))
+    {
+        Some(inner) => inner.to_string(),
+        // Only trim when there was no CDATA: inside CDATA, whitespace is content.
+        None => trimmed.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod minicpm_xml_tests {
+    use super::*;
+
+    fn dialect() -> ToolDialect {
+        ToolDialect::new(
+            SchemaFormat::OpenAiNested,
+            ParseFormat::MiniCpmXml,
+            HashMap::new(),
+        )
+    }
+
+    // The shape MiniCPM5 actually emitted on the live daemon once its template rendered
+    // the <tools> block. Single-param, no CDATA.
+    #[test]
+    fn parses_a_native_single_param_call() {
+        let calls = dialect()
+            .parse(r#"<function name="read_file"><param name="path">src/lib.rs</param></function>"#)
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/lib.rs");
+    }
+
+    // The case the Needle finetune exists to fix: multi-param with a file body. In JSON
+    // the base weights emit a bare key and it won't parse; in CDATA it is just content.
+    #[test]
+    fn parses_multi_param_with_cdata_verbatim() {
+        let raw = "<function name=\"write_file\">\
+             <param name=\"path\">src/util.rs</param>\
+             <param name=\"contents\"><![CDATA[pub fn double(x: i64) -> i64 {\n    x * 2\n}]]></param>\
+             </function>";
+        let calls = dialect().parse(raw).unwrap();
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments["path"], "src/util.rs");
+        // newlines, `<` and `>` survive untouched — no escaping, no entity decoding
+        assert_eq!(
+            calls[0].arguments["contents"],
+            "pub fn double(x: i64) -> i64 {\n    x * 2\n}"
+        );
+    }
+
+    // The model reasons in prose and then calls; the parser must find the block, and
+    // must return nothing when the turn was a plain answer.
+    #[test]
+    fn finds_a_call_after_prose_and_ignores_a_reply_with_none() {
+        let calls = dialect()
+            .parse("I'll read it first.\n<function name=\"list_dir\"><param name=\"path\">src</param></function>")
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["path"], "src");
+
+        assert!(dialect()
+            .parse("The file defines add, factorial and is_prime.")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn parses_several_calls_in_one_reply() {
+        let raw = "<function name=\"read_file\"><param name=\"path\">a.rs</param></function>\
+                   <function name=\"read_file\"><param name=\"path\">b.rs</param></function>";
+        let calls = dialect().parse(raw).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].arguments["path"], "b.rs");
+    }
+
+    // Truncated output (hit the token cap mid-call) must degrade to no call rather than
+    // a malformed one the tool loop would try to execute.
+    #[test]
+    fn a_truncated_call_does_not_panic() {
+        let calls = dialect().parse("<function name=\"read_file\"><param name=\"pa").unwrap();
+        assert_eq!(calls.len(), 1, "the name was complete");
+        assert!(
+            calls[0].arguments.get("pa").is_none(),
+            "the half-written param is dropped, not invented"
+        );
+        assert!(dialect().parse("<function name=\"read_fi").unwrap().is_empty());
+    }
+
+    // Exposed->canonical renaming must apply to this format too, like json-array.
+    #[test]
+    fn exposed_names_map_back_to_canonical() {
+        let names = HashMap::from([("run_command".to_string(), "sh".to_string())]);
+        let d = ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::MiniCpmXml, names);
+        let calls = d
+            .parse(r#"<function name="sh"><param name="command">cargo test</param></function>"#)
+            .unwrap();
+        assert_eq!(calls[0].name, "run_command");
     }
 }

@@ -33,12 +33,43 @@ struct ResponsesRequest<'a> {
     // daemon's /v1/responses parser is the next step. Upgrade to whatever the
     // daemon actually reads (header vs body field) once pinned down.
     metadata: serde_json::Value,
+    /// Tool declarations. hipfire feeds these to the model's chat template, which
+    /// renders the `<tools>` block the model was trained to read — without it the
+    /// template's `{% if tools %}` branch never fires and the model is never told a
+    /// tool exists. Omitted entirely when we have no tools to declare.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a serde_json::Value>,
+    /// Thinking mode. Absent means non-thinking, which is what every Corrode call was
+    /// getting by default — a reasoning model run with reasoning switched off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
 pub struct ResponsesReply {
     #[serde(default)]
     pub output_text: String,
+    /// Output items. Reasoning rides here rather than inside `output_text`, so the
+    /// answer stays clean and the reasoning is still recoverable.
+    #[serde(default)]
+    pub output: Vec<OutputItem>,
+}
+
+#[derive(Deserialize)]
+pub struct OutputItem {
+    #[serde(default)]
+    pub reasoning_content: String,
+}
+
+impl ResponsesReply {
+    /// The model's reasoning, if it thought and the server surfaced it.
+    pub fn reasoning(&self) -> &str {
+        self.output
+            .iter()
+            .map(|item| item.reasoning_content.as_str())
+            .find(|r| !r.is_empty())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Serialize)]
@@ -104,11 +135,34 @@ impl Client {
         input: &str,
         priority: Priority,
     ) -> anyhow::Result<String> {
+        Ok(self
+            .respond_full(model, input, priority, None, None)
+            .await?
+            .0)
+    }
+
+    /// One completion, declaring tools and/or requesting thinking. Returns
+    /// `(answer, reasoning)`.
+    ///
+    /// Declaring tools is what lets a model emit its OWN tool calls — MiniCPM5 answers
+    /// in `<function name="…"><param name="…">` once its template renders the `<tools>`
+    /// block, no Needle in the loop. `effort` selects the thinking mode
+    /// (`none`/`minimal`/`low`/`medium`/`high`); absent means non-thinking.
+    pub async fn respond_full(
+        &self,
+        model: &str,
+        input: &str,
+        priority: Priority,
+        tools: Option<&serde_json::Value>,
+        effort: Option<&str>,
+    ) -> anyhow::Result<(String, String)> {
         let req = ResponsesRequest {
             model,
             input,
             max_output_tokens: self.max_output_tokens,
             metadata: serde_json::json!({ "hipfire_priority": priority.as_u8() }),
+            tools,
+            reasoning_effort: effort,
         };
         let mut rb = self
             .http
@@ -118,7 +172,8 @@ impl Client {
             rb = rb.bearer_auth(key);
         }
         let reply: ResponsesReply = rb.send().await?.error_for_status()?.json().await?;
-        Ok(reply.output_text)
+        let reasoning = reply.reasoning().to_string();
+        Ok((reply.output_text, reasoning))
     }
 
     /// Embed `input` with an embedding model (`/v1/embeddings`) — code/doc/skill

@@ -820,6 +820,86 @@ mod tests {
         // Needle tests, deliberately not asserted here.
     }
 
+    // The native path, end to end and Needle-free: Corrode declares its own tools on the
+    // request, hipfire's template renders the model's `<tools>` block, the model emits
+    // its own XML call, and the dialect parses it straight into a ToolCall the ToolBox
+    // runs. This is the loop the Needle shim exists to substitute for — here it isn't
+    // in it at all.
+    //   HIPFIRE_BASE_URL=http://127.0.0.1:11435 CORRODE_MODEL=<id> \
+    //     cargo test -p corrode-daemon -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires a live hipfire + the demo-repo submodule"]
+    async fn a_model_drives_its_own_tool_call_without_needle() {
+        use crate::dialect::{ParseFormat, SchemaFormat, ToolDialect};
+        use crate::tools::{ToolBox, EXEC_TOOLS};
+        let Some(repo) = demo_repo() else {
+            eprintln!("skipped: fixtures/demo-repo not checked out");
+            return;
+        };
+        let base_url = std::env::var("HIPFIRE_BASE_URL")
+            .unwrap_or_else(|_| crate::hipfire::DEFAULT_BASE_URL.to_string());
+        let client = Client::new(&base_url, std::env::var("HIPFIRE_API_KEY").ok());
+        let Ok(models) = client.list_models().await else {
+            eprintln!("skipped: no hipfire at {base_url}");
+            return;
+        };
+        let model = std::env::var("CORRODE_MODEL")
+            .ok()
+            .or_else(|| models.first().cloned())
+            .expect("hipfire serves a model");
+
+        // Corrode's canonical tools, rendered for a chat model. The `type`/`function`
+        // envelope is what the chat templates serialize with `tool | tojson`.
+        let rendered: serde_json::Value =
+            serde_json::from_str(&ToolDialect::new(
+                SchemaFormat::OpenAiNested,
+                ParseFormat::MiniCpmXml,
+                std::collections::HashMap::new(),
+            )
+            .render(EXEC_TOOLS))
+            .expect("rendered tools are JSON");
+        let tools = serde_json::Value::Array(
+            rendered
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| serde_json::json!({"type": "function", "function": t}))
+                .collect(),
+        );
+
+        // Thinking off: the model deliberates itself out of calling when it is on, and
+        // a direct imperative is what the tool loop should be issuing anyway.
+        let (answer, reasoning) = client
+            .respond_full(
+                &model,
+                "Read the file src/lib.rs.",
+                Priority::Default,
+                Some(&tools),
+                Some("none"),
+            )
+            .await
+            .expect("generation");
+        eprintln!("answer: {answer}\nreasoning: {} chars", reasoning.len());
+
+        let dialect = ToolDialect::new(
+            SchemaFormat::OpenAiNested,
+            ParseFormat::MiniCpmXml,
+            std::collections::HashMap::new(),
+        );
+        let calls = dialect.parse(&answer).expect("parse");
+        eprintln!("calls: {calls:?}");
+        let call = calls.first().expect("the model emitted a tool call");
+        assert_eq!(call.name, "read_file");
+
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&repo)),
+            repo.clone(),
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let observation = toolbox.execute(call).await;
+        assert!(observation.contains("pub fn is_prime"), "got: {observation}");
+    }
+
     // The hipfire-free dispatch path: DocQuery without a graph store reports itself
     // unavailable (Error) rather than hanging or panicking. Guards the match, not the
     // network. (The real pty terminal path is covered in `terminal.rs`.)
