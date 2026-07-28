@@ -13,3 +13,6 @@
 [submodule "fixtures/demo-repo"]
 	path = fixtures/demo-repo
 	url = https://github.com/xynexus/corrode-demo
+[submodule "third_party/minicpm"]
+	path = third_party/minicpm
+	url = https://github.com/OpenBMB/MiniCPM
