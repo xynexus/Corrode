@@ -724,6 +724,102 @@ mod tests {
         assert!(observation.contains("test result: ok"), "got: {observation}");
     }
 
+    // The whole loop, for real: a Prompt goes into the daemon, hipfire plans it, the
+    // swarm runs the subtasks against the demo repo, and events stream back — no mocks
+    // on any leg. Needs a live hipfire (HIPFIRE_BASE_URL, CORRODE_MODEL) plus the Needle
+    // assets and the submodule:
+    //   HIPFIRE_BASE_URL=http://host:11435 CORRODE_MODEL=<id> \
+    //     cargo test -p corrode-daemon --features needle -- --ignored --nocapture
+    //
+    // ponytail: the turn is "done" when events go quiet — there's no turn-complete event
+    // to wait on. Add one (AgentEvent::TurnComplete) and this drops the idle timeout.
+    #[cfg(feature = "needle")]
+    #[tokio::test]
+    #[ignore = "requires a live hipfire + Needle assets + the demo-repo submodule"]
+    async fn a_prompt_runs_the_swarm_against_the_demo_repo() {
+        use std::time::Duration;
+        let Some(repo) = demo_repo() else {
+            eprintln!("skipped: fixtures/demo-repo not checked out");
+            return;
+        };
+        let base_url = std::env::var("HIPFIRE_BASE_URL")
+            .unwrap_or_else(|_| crate::hipfire::DEFAULT_BASE_URL.to_string());
+        let client = Client::new(&base_url, std::env::var("HIPFIRE_API_KEY").ok());
+        let Ok(models) = client.list_models().await else {
+            eprintln!("skipped: no hipfire at {base_url}");
+            return;
+        };
+        // The model under test: CORRODE_MODEL, else whatever hipfire serves first.
+        let model = std::env::var("CORRODE_MODEL")
+            .ok()
+            .or_else(|| models.first().cloned())
+            .expect("hipfire serves at least one model");
+        eprintln!("model: {model} (small: {})", roles::is_small_model(&model));
+
+        let embed = roles::default_embedding_model(&models).map(str::to_string);
+        let skills = SkillContext::build(&repo, &client, embed).await;
+        let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
+            .expect("load Needle")
+            .expect("Needle assets present");
+        let daemon = Arc::new(Daemon::new(
+            Swarm::new(client, 4),
+            RoleModels::uniform(&model),
+            None,
+            Arc::new(PassthroughVfs::new(&repo)),
+            skills,
+            Some(Arc::new(caller)),
+            repo.clone(),
+            Arc::new(Dialects::default()),
+        ));
+
+        let (ctx, crx) = mpsc::channel(16);
+        let (etx, mut erx) = mpsc::channel(64);
+        tokio::spawn(Arc::clone(&daemon).run(crx, etx));
+        ctx.send(AgentCommand::Prompt {
+            text: "Report which functions src/lib.rs defines.".into(),
+            priority: Priority::Default,
+        })
+        .await
+        .unwrap();
+
+        // Drain until the turn settles, approving any mutating call the swarm proposes
+        // (unattended: nothing here would answer the gate otherwise, and it fails closed).
+        let (mut outputs, mut approvals, mut errors) = (Vec::new(), Vec::new(), Vec::new());
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(120), erx.recv()).await {
+            match ev {
+                AgentEvent::SubagentOutput { id, text } => {
+                    eprintln!("--- subagent {id} ---\n{text}\n");
+                    outputs.push(text);
+                }
+                AgentEvent::ApprovalRequest { id, action } => {
+                    eprintln!("--- approval {id}: {action} -> approving");
+                    approvals.push(action);
+                    ctx.send(AgentCommand::ApprovalResponse { id, approved: true })
+                        .await
+                        .unwrap();
+                }
+                AgentEvent::Error { message } => {
+                    eprintln!("--- error: {message}");
+                    errors.push(message);
+                }
+                other => eprintln!("--- {other:?}"),
+            }
+        }
+        drop(ctx);
+
+        eprintln!(
+            "settled: {} outputs, {} approvals, {} errors",
+            outputs.len(),
+            approvals.len(),
+            errors.len()
+        );
+        assert!(errors.is_empty(), "daemon reported errors: {errors:?}");
+        assert!(!outputs.is_empty(), "the swarm produced no subagent output");
+        // Whether the small model actually drove a tool is a property of the model +
+        // the tool-loop prompt, not of this wiring — reported above, asserted in the
+        // Needle tests, deliberately not asserted here.
+    }
+
     // The hipfire-free dispatch path: DocQuery without a graph store reports itself
     // unavailable (Error) rather than hanging or panicking. Guards the match, not the
     // network. (The real pty terminal path is covered in `terminal.rs`.)
