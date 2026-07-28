@@ -1,5 +1,21 @@
 # TODO: Finetune Needle on Corrode's tool set
 
+> **Status (2026-07-28): largely superseded for models with a native tool dialect.**
+>
+> This plan assumed small models cannot format tool calls. That was measured against
+> models that had never been *told* a tool existed: hipfire's `/v1/responses` dropped the
+> `tools` field, so the chat template's `{% if tools %}` branch never rendered. With the
+> block rendered, MiniCPM5-1B emits correct calls unaided — including the multi-param
+> `write_file` this document calls the "primary target", where CDATA removes the JSON
+> escaping the base weights get wrong. Corrode now parses that dialect directly
+> (`ParseFormat::MiniCpmXml`) and hipfire constrains it at the token level, so a
+> malformed call is unreachable rather than merely unlikely.
+>
+> Still relevant for models with **no** native tool support — Needle remains the path
+> there. The remaining failure is *judgement*, not format: see
+> [`tool-call-judgement.md`](./tool-call-judgement.md).
+
+
 **Goal:** make the Needle tool-caller reliably produce Corrode's tool calls — valid
 JSON, correct tool selection, and full multi-field argument extraction — so the
 single-param workarounds we built to cope with the base weights can be retired.
