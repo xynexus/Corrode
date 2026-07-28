@@ -54,6 +54,23 @@ Write plain English, not JSON. Omit the line if no follow-up is needed.",
     )
 }
 
+/// Compose a turn for a model that emits its own tool calls.
+///
+/// Deliberately does NOT teach a call syntax: the tools are declared on the request and
+/// the model's chat template renders the format it was trained on. Describing a second
+/// syntax here would compete with that one. The shared prefix still leads, so hipfire
+/// reuses the KV prefill across the swarm; only the scratchpad tail grows.
+pub fn native_tool_prompt(context_prefix: &str, role: Role, task: &str, scratchpad: &str) -> String {
+    format!(
+        "{context_prefix}\n\n[role: {}]\n{task}\n{scratchpad}\n\
+You have tools available. Call one when you need it — you will get the result and can \
+continue. Never guess a file's contents: read it first. When you have enough to answer, \
+reply with your final answer and no tool call. Optionally end with:\n\
+NEXT: <one plain-English follow-up task>",
+        role.as_str()
+    )
+}
+
 /// Compose a tool-loop turn for a small model: the shared prefix, the role+task, the
 /// scratchpad of tool calls/results so far, then instructions. The model acts by writing
 /// a plain-English `TOOL:` line (Needle structures it — the small model never writes a

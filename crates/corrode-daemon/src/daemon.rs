@@ -158,13 +158,35 @@ impl Daemon {
                     let role = task.role;
                     let prompt = task.prompt.clone();
                     async move {
-                        // Small models can't construct tool-call JSON, so they run the
-                        // Needle-mediated tool-execution loop. Larger models (or a build
-                        // without a Needle caller) do a single-shot response as before.
+                        // Three paths, most capable first:
+                        //  1. the model emits its own tool calls (its dialect says so) —
+                        //     declare tools on the request and parse the reply directly.
+                        //  2. otherwise a small model runs the Needle-mediated loop,
+                        //     which reconstructs a call from a plain-English line.
+                        //  3. anything else answers single-shot, as before.
+                        // Size alone used to decide this, which sent a 1B through Needle
+                        // even when it could call tools better itself.
                         // `artifacts` collects the files a tool-loop task wrote (its code
                         // nodes in provenance).
                         let mut artifacts = Vec::new();
-                        let output = if let (true, Some(caller)) =
+                        let role_dialect = dialects.resolve(&model);
+                        let output = if role_dialect.emits_own_calls() {
+                            run_native_tool_loop(
+                                &client,
+                                &model,
+                                band,
+                                role_dialect,
+                                ToolBox::new(vfs, root, skill_scripts),
+                                &approvals,
+                                &prefix,
+                                role,
+                                &prompt,
+                                &events,
+                                id,
+                                &mut artifacts,
+                            )
+                            .await
+                        } else if let (true, Some(caller)) =
                             (roles::is_small_model(&model), tool_caller.clone())
                         {
                             run_tool_loop(
@@ -420,6 +442,89 @@ const MAX_TOOL_STEPS: usize = 6;
 /// Needle errors come back as observations (the model can recover), not hard failures;
 /// only a model-generation error aborts the loop.
 #[allow(clippy::too_many_arguments)]
+/// Run one tool call: mutating ones (write_file / run_command / run_skill_script) pass
+/// through the human approval gate first, read-only ones go straight through. A
+/// successful write authors a code node, so its path is recorded for provenance.
+///
+/// Shared by both loops — the gate must not depend on how the call was produced.
+async fn gate_and_execute(
+    call: &crate::toolcall::ToolCall,
+    toolbox: &ToolBox,
+    approvals: &ApprovalGate,
+    events: &mpsc::Sender<AgentEvent>,
+    written: &mut Vec<String>,
+) -> String {
+    if crate::tools::is_mutating(call)
+        && !approvals
+            .request(events, crate::tools::describe(call))
+            .await
+    {
+        return format!("denied: {} was not approved", crate::tools::describe(call));
+    }
+    let observation = toolbox.execute(call).await;
+    if call.name == "write_file" && observation.starts_with("wrote") {
+        if let Some(path) = call.arguments.get("path").and_then(|p| p.as_str()) {
+            written.push(path.to_string());
+        }
+    }
+    observation
+}
+
+/// The tool loop for models that emit their own calls.
+///
+/// The tools are declared on the request, so hipfire's chat template renders the block
+/// the model was trained to read and it answers in its own syntax — which the dialect
+/// parses directly. No Needle: nothing has to reconstruct the call from prose, so the
+/// multi-param and truncation failures that motivated the Needle finetune cannot occur.
+///
+/// Thinking defaults to off (`CORRODE_REASONING_EFFORT` overrides): with reasoning on,
+/// these models talk themselves out of calling — measured on MiniCPM5-1B, which
+/// deliberated past its budget instead of emitting a call it had already chosen.
+#[allow(clippy::too_many_arguments)]
+async fn run_native_tool_loop(
+    client: &Client,
+    model: &str,
+    band: Priority,
+    dialect: &crate::dialect::ToolDialect,
+    toolbox: ToolBox,
+    approvals: &ApprovalGate,
+    prefix: &str,
+    role: Role,
+    task: &str,
+    events: &mpsc::Sender<AgentEvent>,
+    id: u64,
+    written: &mut Vec<String>,
+) -> anyhow::Result<String> {
+    let tools = dialect.request_tools(crate::tools::EXEC_TOOLS);
+    let effort = std::env::var("CORRODE_REASONING_EFFORT").unwrap_or_else(|_| "none".to_string());
+    let mut scratchpad = String::new();
+    let mut last = String::new();
+    for _ in 0..MAX_TOOL_STEPS {
+        let prompt = planner::native_tool_prompt(prefix, role, task, &scratchpad);
+        let (text, _reasoning) = client
+            .respond_full(model, &prompt, band, Some(&tools), Some(&effort))
+            .await?;
+        let _ = events
+            .send(AgentEvent::SubagentOutput {
+                id,
+                text: text.clone(),
+            })
+            .await;
+        last = text.clone();
+
+        let calls = dialect.parse(&text).unwrap_or_default();
+        let Some(call) = calls.first() else {
+            return Ok(text); // no call -> this turn is the final answer
+        };
+        let observation = gate_and_execute(call, &toolbox, approvals, events, written).await;
+        scratchpad.push_str(&format!(
+            "\nCALLED: {}\nRESULT: {observation}\n",
+            crate::tools::describe(call)
+        ));
+    }
+    Ok(last)
+}
+
 async fn run_tool_loop(
     client: &Client,
     model: &str,
@@ -465,24 +570,7 @@ async fn run_tool_loop(
         let raw = tokio::task::spawn_blocking(move || toolcaller.generate(&query, &schema)).await;
         let observation = match raw.map(|r| r.and_then(|raw| dialect.parse(&raw))) {
             Ok(Ok(calls)) => match calls.first() {
-                // Mutating calls (write_file / run_command) need a human's go-ahead;
-                // read-only calls run straight through.
-                Some(c) if crate::tools::is_mutating(c) => {
-                    if approvals.request(events, crate::tools::describe(c)).await {
-                        let obs = toolbox.execute(c).await;
-                        // A successful write authors a code node — record its path so
-                        // provenance can link it to this task.
-                        if c.name == "write_file" && obs.starts_with("wrote") {
-                            if let Some(path) = c.arguments.get("path").and_then(|p| p.as_str()) {
-                                written.push(path.to_string());
-                            }
-                        }
-                        obs
-                    } else {
-                        format!("denied: {} was not approved", crate::tools::describe(c))
-                    }
-                }
-                Some(c) => toolbox.execute(c).await,
+                Some(c) => gate_and_execute(c, &toolbox, approvals, events, written).await,
                 None => "error: no tool call produced".to_string(),
             },
             Ok(Err(e)) => format!("error: tool-call construction failed: {e}"),
@@ -769,7 +857,8 @@ mod tests {
             skills,
             Some(Arc::new(caller)),
             repo.clone(),
-            Arc::new(Dialects::default()),
+            // load() so CORRODE_TOOL_DIALECTS can put a model on its native dialect
+            Arc::new(Dialects::load()),
         ));
 
         let (ctx, crx) = mpsc::channel(16);

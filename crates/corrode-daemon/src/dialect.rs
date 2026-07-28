@@ -134,6 +134,27 @@ impl ToolDialect {
         json!({"name": self.exposed(t.name), "description": t.description, "parameters": params})
     }
 
+    /// Whether this model emits tool calls itself, so the request should declare tools
+    /// and the reply is parsed directly — no Needle in the loop. False for dialects
+    /// whose calls are constructed for the model (the Needle-flat / json-array default).
+    pub fn emits_own_calls(&self) -> bool {
+        matches!(self.parse, ParseFormat::MiniCpmXml)
+    }
+
+    /// Tools rendered for the `tools` field of a chat/responses request.
+    ///
+    /// Chat templates serialize each entry with `tool | tojson`, and the models are
+    /// trained on the nested `{"type":"function","function":{…}}` envelope — so the
+    /// envelope belongs here rather than at each call site.
+    pub fn request_tools(&self, tools: &[Tool]) -> Value {
+        Value::Array(
+            tools
+                .iter()
+                .map(|t| json!({"type": "function", "function": self.render_tool(t)}))
+                .collect(),
+        )
+    }
+
     /// Parse a model's raw reply into canonical [`ToolCall`]s (exposed names mapped back).
     pub fn parse(&self, raw: &str) -> anyhow::Result<Vec<ToolCall>> {
         let trimmed = raw.trim().trim_start_matches("<tool_call>").trim();
