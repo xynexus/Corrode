@@ -95,8 +95,27 @@ Then `list_dir(".git/revisions")` is not merely corrected after the fact, it is
   JSON Schema, so no wire extension is needed.
 - Risk: free-text params (`contents`, `command`) must stay unconstrained; only params
   with a closed, known set get this. Getting that wrong wedges generation.
-- Caveat: a large value set costs a longer allowed-continuations scan per constrained
-  token. Bound it (e.g. skip the constraint above N candidates) and measure.
+- **Measured** (`cargo test -p hipfire-runtime --release -- --ignored --nocapture
+  grammar_cost`, 129k vocab, after the per-position hoist):
+
+  | candidates | per constrained token | per 20-token call |
+  |---:|---:|---:|
+  | 1 | 0.32 ms | 6 ms |
+  | 4 | ~1.2 ms | 24 ms |
+  | 16 | 4.38 ms | 88 ms |
+  | 64 | ~20 ms | 400 ms |
+  | 256 | 81 ms | 1.6 s |
+  | 1024 | 320 ms | 6.4 s |
+
+  Free positions cost 0.0008 ms, and 55% of a real call's tokens are constrained.
+
+  **So the value set must be capped at ~64 candidates** (≈400 ms per call, tolerable);
+  256+ is not viable. A repo listing longer than the cap should fall back to
+  unconstrained and lean on items 2–3 instead — correction after the fact rather than
+  a 1.6 s stall per call.
+
+  The scan is still O(vocab × candidates). Bucketing candidates by first byte, or a trie
+  over continuations, would raise the cap; do that only if a real value set exceeds 64.
 
 ### 5. Shared observation memory across the swarm — *larger, fixes (4)*
 
