@@ -25,21 +25,21 @@ type SessionMap = Arc<Mutex<HashMap<String, Session>>>;
 
 /// The daemon's live terminal sessions, keyed by client-chosen session id. The map
 /// is shared with each session's reader thread so it can evict itself on exit.
-#[derive(Default)]
 pub struct Terminals {
     sessions: SessionMap,
+    /// Where spawned shells start: the daemon's repo root (`CORRODE_REPO`).
+    cwd: std::path::PathBuf,
 }
 
 impl Terminals {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(cwd: std::path::PathBuf) -> Self {
+        Self {
+            sessions: SessionMap::default(),
+            cwd,
+        }
     }
 
     /// Spawn a pty+shell for `id` if absent, streaming its output to `events`.
-    // ponytail: sessions aren't reaped from the map on disconnect (the shell is
-    // killed, but the stale entry lingers) and a `exit`ed shell can't be respawned
-    // under the same id — fine for the single-terminal scaffold; add lifecycle mgmt
-    // when multi-session lands. cwd is the daemon's cwd; set it to CORRODE_REPO later.
     fn ensure(&self, id: &str, events: &Sender<AgentEvent>, size: PtySize) -> anyhow::Result<()> {
         let mut map = self.sessions.lock().unwrap();
         if map.contains_key(id) {
@@ -54,6 +54,7 @@ impl Terminals {
         let mut cmd = CommandBuilder::new(shell);
         cmd.arg("-i");
         cmd.env("TERM", "xterm-256color");
+        cmd.cwd(&self.cwd);
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave); // so the master read hits EOF when the shell exits
         let mut reader = pair.master.try_clone_reader()?;
@@ -141,16 +142,18 @@ mod tests {
     #[tokio::test]
     async fn pty_runs_a_shell_and_streams_output() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let terms = Terminals::new();
+        let terms = Terminals::new(env!("CARGO_MANIFEST_DIR").into());
         terms.resize("t", 80, 24, &tx).unwrap(); // opens the pty + shell
-        terms.input("t", b"echo corrode-ok\n", &tx).unwrap();
+        terms.input("t", b"echo corrode-ok && pwd\n", &tx).unwrap();
 
         let mut seen = Vec::new();
         let found = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(ev) = rx.recv().await {
                 if let AgentEvent::TerminalOutput { data, .. } = ev {
                     seen.extend_from_slice(&data);
-                    if String::from_utf8_lossy(&seen).contains("corrode-ok") {
+                    let text = String::from_utf8_lossy(&seen);
+                    // marker proves the shell ran; pwd proves it started in `cwd`
+                    if text.contains("corrode-ok") && text.contains(env!("CARGO_MANIFEST_DIR")) {
                         return true;
                     }
                 }
@@ -162,7 +165,7 @@ mod tests {
 
         assert!(
             found,
-            "shell should echo the marker; got: {}",
+            "shell should echo the marker from the given cwd; got: {}",
             String::from_utf8_lossy(&seen)
         );
     }

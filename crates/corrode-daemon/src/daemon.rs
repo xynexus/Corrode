@@ -74,7 +74,7 @@ impl Daemon {
             roles,
             graph,
             vfs,
-            terminals: Terminals::new(),
+            terminals: Terminals::new(repo_root.clone()),
             skills,
             tool_caller,
             approvals: Arc::new(ApprovalGate::default()),
@@ -126,8 +126,8 @@ impl Daemon {
                 // Seed the reactive plan graph with the decomposition, rooted at a plan
                 // node. The scheduler fans ready tasks to the swarm and grows the graph
                 // as agents emit follow-up work (a test contract, a research spin-off) —
-                // dataflow, not a fixed fan-out. Concurrency is bounded by the swarm's
-                // inflight semaphore inside `execute`, not here.
+                // dataflow, not a fixed fan-out. Real concurrency is hipfire's to bound
+                // (admission control against its VRAM budget); nothing is capped here.
                 let plan_id = format!(
                     "plan-{}",
                     self.next_plan_id
@@ -138,13 +138,20 @@ impl Daemon {
                     graph.add(s.role, s.prompt, Vec::new());
                 }
 
-                plan_graph::run_reactive(&mut graph, |task| {
+                let fanout = fanout_k();
+                let review_model = self
+                    .roles
+                    .model_for(Role::Review)
+                    .unwrap_or_default()
+                    .to_string();
+                let execute = |task: plan_graph::PlanTask| {
                     let client = self.swarm.client();
                     let model = self
                         .roles
                         .model_for(task.role)
                         .unwrap_or_default()
                         .to_string();
+                    let review_model = review_model.clone();
                     let band = planner::band_for(task.role);
                     let prefix = prefix.clone();
                     let events = events.clone();
@@ -158,45 +165,23 @@ impl Daemon {
                     let role = task.role;
                     let prompt = task.prompt.clone();
                     async move {
-                        // Three paths, most capable first:
-                        //  1. the model emits its own tool calls (its dialect says so) —
-                        //     declare tools on the request and parse the reply directly.
-                        //  2. otherwise a small model runs the Needle-mediated loop,
-                        //     which reconstructs a call from a plain-English line.
-                        //  3. anything else answers single-shot, as before.
-                        // Size alone used to decide this, which sent a 1B through Needle
-                        // even when it could call tools better itself.
                         // `artifacts` collects the files a tool-loop task wrote (its code
-                        // nodes in provenance).
+                        // nodes in provenance). Coder tasks fan out K read-only proposal
+                        // attempts first when CORRODE_FANOUT > 1; everything else runs
+                        // the capability paths directly (see `run_task`).
                         let mut artifacts = Vec::new();
-                        let role_dialect = dialects.resolve(&model);
-                        let output = if role_dialect.emits_own_calls() {
-                            run_native_tool_loop(
+                        let toolbox = ToolBox::new(vfs, root, skill_scripts);
+                        let output = if role == Role::Coder && fanout > 1 {
+                            run_fanout(
+                                fanout,
                                 &client,
                                 &model,
+                                &review_model,
                                 band,
-                                role_dialect,
-                                ToolBox::new(vfs, root, skill_scripts),
-                                &approvals,
-                                &prefix,
-                                role,
-                                &prompt,
-                                &events,
-                                id,
-                                &mut artifacts,
-                            )
-                            .await
-                        } else if let (true, Some(caller)) =
-                            (roles::is_small_model(&model), tool_caller.clone())
-                        {
-                            run_tool_loop(
-                                &client,
-                                &model,
-                                band,
-                                caller,
-                                ToolBox::new(vfs, root, skill_scripts),
-                                &approvals,
                                 &dialects,
+                                tool_caller.clone(),
+                                toolbox,
+                                &approvals,
                                 &prefix,
                                 role,
                                 &prompt,
@@ -206,17 +191,23 @@ impl Daemon {
                             )
                             .await
                         } else {
-                            let full = planner::subagent_prompt(&prefix, role, &prompt);
-                            let out = client.respond(&model, &full, band).await;
-                            if let Ok(text) = &out {
-                                let _ = events
-                                    .send(AgentEvent::SubagentOutput {
-                                        id,
-                                        text: text.clone(),
-                                    })
-                                    .await;
-                            }
-                            out
+                            run_task(
+                                &client,
+                                &model,
+                                band,
+                                &dialects,
+                                tool_caller.clone(),
+                                toolbox,
+                                &approvals,
+                                &prefix,
+                                role,
+                                &prompt,
+                                &events,
+                                id,
+                                &mut artifacts,
+                                false,
+                            )
+                            .await
                         };
 
                         let emitted = match &output {
@@ -236,8 +227,21 @@ impl Daemon {
                             artifacts,
                         }
                     }
-                })
-                .await;
+                };
+                plan_graph::run_reactive(&mut graph, &execute).await;
+
+                // One plan-level review pass over the settled work: the review role
+                // reads the digest (and, through its tools, the written files) and
+                // routes fixes through the normal follow-up channel; the second
+                // reactive drive runs the review task and whatever it emits.
+                // ponytail: one round — loop-until-clean is the upgrade once fix
+                // quality is measured.
+                if plan_review_enabled() {
+                    if let Some(digest) = graph.review_digest(REVIEW_OUTPUT_CAP) {
+                        graph.add(Role::Review, planner::plan_review_task(&digest), Vec::new());
+                        plan_graph::run_reactive(&mut graph, &execute).await;
+                    }
+                }
 
                 // Tasks left pending after the scheduler settled had a failed or
                 // unmet dependency (a failed emitter) — surface them rather than
@@ -432,19 +436,99 @@ repository.\n",
 /// and runaway loops.
 const MAX_TOOL_STEPS: usize = 6;
 
-/// The Needle-mediated tool-execution loop for a small model.
-///
-/// Each turn the model responds (streamed as `SubagentOutput`). If it wrote a `TOOL:`
-/// line, Needle structures that plain-English intent into a call — the small model
-/// never writes JSON — `toolbox` executes it against the repo, and the observation is
-/// appended to the scratchpad for the next turn. The loop ends when a turn has no
-/// `TOOL:` line (that text is the final answer) or the step budget is spent. Tool and
-/// Needle errors come back as observations (the model can recover), not hard failures;
-/// only a model-generation error aborts the loop.
+/// Byte cap per proposal fed to the fan-out judge — bounds the judge tail while the
+/// shared prefix stays byte-identical (KV reuse).
+const PROPOSAL_CAP: usize = 4096;
+
+/// How long a speculative extra attempt (Opportunistic band) may keep the ensemble
+/// waiting. Attempt 1 runs at the role's band and is never timed out; without this,
+/// a starved straggler holds the whole Default-band task hostage (priority
+/// inversion). ponytail: fixed grace — race extras against attempt 1 + margin if
+/// this measurably discards useful proposals.
+const FANOUT_EXTRA_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Byte cap per task output in the plan-review digest.
+const REVIEW_OUTPUT_CAP: usize = 2048;
+
+/// `CORRODE_FANOUT`: how many read-only proposal attempts a coder task fans out
+/// before executing (1 = off, today's single-shot behavior).
+/// ponytail: clamped to 8 — hipfire's admission control is the real limit; raise
+/// the cap when a wider ensemble measurably helps.
+fn fanout_k() -> usize {
+    std::env::var("CORRODE_FANOUT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|k| k.clamp(1, 8))
+        .unwrap_or(1)
+}
+
+/// `CORRODE_PLAN_REVIEW`: the plan-level review pass, on unless set to `0`/`false`.
+fn plan_review_enabled() -> bool {
+    !matches!(
+        std::env::var("CORRODE_PLAN_REVIEW").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
+/// Per-task memory of tool calls already made, keyed on (tool, canonical args).
+/// The model provably ignores fed-back errors (the same failing `run_command` was
+/// observed re-issued 3×, burning 3 approval prompts), so repeats are suppressed by
+/// the harness: skip the gate and execution, return the prior observation plus a note
+/// that the next step must differ. A successful mutating call clears the memory —
+/// repo state changed, so a legitimate re-read after a write is never suppressed.
+/// ponytail: per-task, not per-turn; TODO item 5 widens this to the swarm.
+#[derive(Default)]
+struct SeenCalls(std::collections::HashMap<String, String>);
+
+impl SeenCalls {
+    /// Key with object keys sorted at every level, so semantically identical calls
+    /// collide regardless of the order the model emitted the arguments in.
+    fn key(call: &crate::toolcall::ToolCall) -> String {
+        fn canon(v: &serde_json::Value) -> serde_json::Value {
+            match v {
+                serde_json::Value::Object(m) => {
+                    let mut entries: Vec<_> = m.iter().map(|(k, v)| (k.clone(), canon(v))).collect();
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                    serde_json::Value::Object(entries.into_iter().collect())
+                }
+                serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(canon).collect()),
+                scalar => scalar.clone(),
+            }
+        }
+        format!("{} {}", call.name, canon(&call.arguments))
+    }
+
+    /// The prior observation for an exact repeat, wrapped in the already-tried note.
+    fn repeat(&self, call: &crate::toolcall::ToolCall) -> Option<String> {
+        self.0.get(&Self::key(call)).map(|obs| {
+            format!(
+                "note: this exact call was already tried; its result is repeated below \
+                 unchanged. Do not repeat it — your next step must differ.\n{obs}"
+            )
+        })
+    }
+
+    /// Record a call's observation. A mutating call that actually ran (`wrote …` /
+    /// `exit 0:`) invalidates everything first; failed or denied ones stay recorded
+    /// so their repeats are suppressed too.
+    fn record(&mut self, call: &crate::toolcall::ToolCall, observation: &str) {
+        if crate::tools::is_mutating(call)
+            && (observation.starts_with("wrote") || observation.starts_with("exit 0:"))
+        {
+            self.0.clear();
+        }
+        self.0.insert(Self::key(call), observation.to_string());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-/// Run one tool call: mutating ones (write_file / run_command / run_skill_script) pass
+/// Run one tool call: an exact repeat short-circuits to its prior observation (see
+/// [`SeenCalls`]); mutating ones (write_file / run_command / run_skill_script) pass
 /// through the human approval gate first, read-only ones go straight through. A
 /// successful write authors a code node, so its path is recorded for provenance.
+/// `read_only` (a fan-out proposal pass) turns mutating calls into a no-op
+/// observation instead — no execution and, crucially, no approval prompt, so K
+/// speculative attempts never spam the human.
 ///
 /// Shared by both loops — the gate must not depend on how the call was produced.
 async fn gate_and_execute(
@@ -453,13 +537,29 @@ async fn gate_and_execute(
     approvals: &ApprovalGate,
     events: &mpsc::Sender<AgentEvent>,
     written: &mut Vec<String>,
+    seen: &mut SeenCalls,
+    read_only: bool,
 ) -> String {
+    if let Some(prior) = seen.repeat(call) {
+        return prior;
+    }
+    if read_only && crate::tools::is_mutating(call) {
+        let note = format!(
+            "read-only pass: {} was not executed. Describe the change in your final \
+             answer instead — a reviewer picks what gets implemented.",
+            crate::tools::describe(call)
+        );
+        seen.record(call, &note);
+        return note;
+    }
     if crate::tools::is_mutating(call)
         && !approvals
             .request(events, crate::tools::describe(call))
             .await
     {
-        return format!("denied: {} was not approved", crate::tools::describe(call));
+        let denied = format!("denied: {} was not approved", crate::tools::describe(call));
+        seen.record(call, &denied);
+        return denied;
     }
     let observation = toolbox.execute(call).await;
     if call.name == "write_file" && observation.starts_with("wrote") {
@@ -467,6 +567,7 @@ async fn gate_and_execute(
             written.push(path.to_string());
         }
     }
+    seen.record(call, &observation);
     observation
 }
 
@@ -494,11 +595,13 @@ async fn run_native_tool_loop(
     events: &mpsc::Sender<AgentEvent>,
     id: u64,
     written: &mut Vec<String>,
+    read_only: bool,
 ) -> anyhow::Result<String> {
     let tools = dialect.request_tools(crate::tools::EXEC_TOOLS);
     let effort = std::env::var("CORRODE_REASONING_EFFORT").unwrap_or_else(|_| "none".to_string());
     let mut scratchpad = String::new();
     let mut last = String::new();
+    let mut seen = SeenCalls::default();
     for _ in 0..MAX_TOOL_STEPS {
         let prompt = planner::native_tool_prompt(prefix, role, task, &scratchpad);
         let (text, _reasoning) = client
@@ -516,7 +619,9 @@ async fn run_native_tool_loop(
         let Some(call) = calls.first() else {
             return Ok(text); // no call -> this turn is the final answer
         };
-        let observation = gate_and_execute(call, &toolbox, approvals, events, written).await;
+        let observation =
+            gate_and_execute(call, &toolbox, approvals, events, written, &mut seen, read_only)
+                .await;
         scratchpad.push_str(&format!(
             "\nCALLED: {}\nRESULT: {observation}\n",
             crate::tools::describe(call)
@@ -525,6 +630,15 @@ async fn run_native_tool_loop(
     Ok(last)
 }
 
+/// The Needle-mediated tool-execution loop for a small model.
+///
+/// Each turn the model responds (streamed as `SubagentOutput`). If it wrote a `TOOL:`
+/// line, Needle structures that plain-English intent into a call — the small model
+/// never writes JSON — `toolbox` executes it against the repo, and the observation is
+/// appended to the scratchpad for the next turn. The loop ends when a turn has no
+/// `TOOL:` line (that text is the final answer) or the step budget is spent. Tool and
+/// Needle errors come back as observations (the model can recover), not hard failures;
+/// only a model-generation error aborts the loop.
 async fn run_tool_loop(
     client: &Client,
     model: &str,
@@ -539,6 +653,7 @@ async fn run_tool_loop(
     events: &mpsc::Sender<AgentEvent>,
     id: u64,
     written: &mut Vec<String>,
+    read_only: bool,
 ) -> anyhow::Result<String> {
     // Render the exec toolset in the tool-call model's dialect once; parse each reply
     // with the same dialect (which maps its tool names back to canonical).
@@ -546,6 +661,7 @@ async fn run_tool_loop(
     let schema = dialect.render(crate::tools::EXEC_TOOLS);
     let mut scratchpad = String::new();
     let mut last = String::new();
+    let mut seen = SeenCalls::default();
     for _ in 0..MAX_TOOL_STEPS {
         let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
         let text = client.respond(model, &prompt, band).await?;
@@ -570,7 +686,10 @@ async fn run_tool_loop(
         let raw = tokio::task::spawn_blocking(move || toolcaller.generate(&query, &schema)).await;
         let observation = match raw.map(|r| r.and_then(|raw| dialect.parse(&raw))) {
             Ok(Ok(calls)) => match calls.first() {
-                Some(c) => gate_and_execute(c, &toolbox, approvals, events, written).await,
+                Some(c) => {
+                    gate_and_execute(c, &toolbox, approvals, events, written, &mut seen, read_only)
+                        .await
+                }
                 None => "error: no tool call produced".to_string(),
             },
             Ok(Err(e)) => format!("error: tool-call construction failed: {e}"),
@@ -580,6 +699,157 @@ async fn run_tool_loop(
     }
     // Step budget spent: hand back the last turn as the answer.
     Ok(last)
+}
+
+/// One full execution of a task: pick the capability path and run it.
+///  1. the model emits its own tool calls (its dialect says so) — declare tools on
+///     the request and parse the reply directly.
+///  2. otherwise a small model runs the Needle-mediated loop, which reconstructs a
+///     call from a plain-English line.
+///  3. anything else answers single-shot.
+/// `read_only` marks a fan-out proposal pass: mutating tool calls become no-op
+/// observations (see [`gate_and_execute`]) without touching the paths themselves.
+#[allow(clippy::too_many_arguments)]
+async fn run_task(
+    client: &Client,
+    model: &str,
+    band: Priority,
+    dialects: &Dialects,
+    tool_caller: Option<Arc<dyn ToolCaller>>,
+    toolbox: ToolBox,
+    approvals: &ApprovalGate,
+    prefix: &str,
+    role: Role,
+    task: &str,
+    events: &mpsc::Sender<AgentEvent>,
+    id: u64,
+    written: &mut Vec<String>,
+    read_only: bool,
+) -> anyhow::Result<String> {
+    let role_dialect = dialects.resolve(model);
+    if role_dialect.emits_own_calls() {
+        run_native_tool_loop(
+            client, model, band, role_dialect, toolbox, approvals, prefix, role, task, events,
+            id, written, read_only,
+        )
+        .await
+    } else if let (true, Some(caller)) = (roles::is_small_model(model), tool_caller) {
+        run_tool_loop(
+            client, model, band, caller, toolbox, approvals, dialects, prefix, role, task,
+            events, id, written, read_only,
+        )
+        .await
+    } else {
+        let full = planner::subagent_prompt(prefix, role, task);
+        let out = client.respond(model, &full, band).await;
+        if let Ok(text) = &out {
+            let _ = events
+                .send(AgentEvent::SubagentOutput {
+                    id,
+                    text: text.clone(),
+                })
+                .await;
+        }
+        out
+    }
+}
+
+/// Fan a coder task out as `k` read-only proposal attempts, judge them, execute once.
+///
+/// The attempts run concurrently on the same shared prefix (hipfire batches them
+/// prefix-shared); the first keeps the role's band, the rest are speculative and go
+/// Opportunistic — idle GPU only, per the scheduler contract. The review model then
+/// judges the surviving proposals into one directive, and the task executes once,
+/// writable, steered by it. Scaffolding failures degrade to plain execution: the
+/// ensemble may improve the task, never fail it.
+#[allow(clippy::too_many_arguments)]
+async fn run_fanout(
+    k: usize,
+    client: &Client,
+    model: &str,
+    review_model: &str,
+    band: Priority,
+    dialects: &Dialects,
+    tool_caller: Option<Arc<dyn ToolCaller>>,
+    toolbox: ToolBox,
+    approvals: &ApprovalGate,
+    prefix: &str,
+    role: Role,
+    task: &str,
+    events: &mpsc::Sender<AgentEvent>,
+    id: u64,
+    written: &mut Vec<String>,
+) -> anyhow::Result<String> {
+    let attempts = (0..k).map(|i| {
+        let attempt_task = planner::fanout_attempt_task(task, i + 1, k);
+        let attempt_band = if i == 0 { band } else { Priority::Opportunistic };
+        let toolbox = toolbox.clone();
+        let tool_caller = tool_caller.clone();
+        async move {
+            let mut sink = Vec::new(); // read-only: no artifacts can land
+            let fut = run_task(
+                client, model, attempt_band, dialects, tool_caller, toolbox, approvals,
+                prefix, role, &attempt_task, events, id, &mut sink, true,
+            );
+            if i == 0 {
+                fut.await
+            } else {
+                match tokio::time::timeout(FANOUT_EXTRA_GRACE, fut).await {
+                    Ok(res) => res,
+                    Err(_) => Err(anyhow::anyhow!("fanout attempt {} timed out", i + 1)),
+                }
+            }
+        }
+    });
+    let results = futures_util::future::join_all(attempts).await;
+    let failed = results.iter().filter(|r| r.is_err()).count();
+    if failed > 0 {
+        // The ensemble degrades silently by design; the operator still gets a trace.
+        eprintln!("fanout: {failed}/{k} attempts failed or timed out");
+    }
+    let mut proposals: Vec<String> = results.into_iter().filter_map(Result::ok).collect();
+    for p in &mut proposals {
+        if p.len() > PROPOSAL_CAP {
+            p.truncate(crate::tools::floor_char_boundary(p, PROPOSAL_CAP));
+            p.push_str("\n… (truncated)");
+        }
+    }
+
+    let mut steered = task.to_string();
+    if proposals.len() >= 2 {
+        let judge_prompt = planner::fanout_judge_prompt(prefix, task, &proposals);
+        match client
+            .respond(review_model, &judge_prompt, planner::band_for(Role::Review))
+            .await
+        {
+            Ok(directive) => {
+                let _ = events
+                    .send(AgentEvent::SubagentOutput {
+                        id,
+                        text: format!("[fanout judge] {directive}"),
+                    })
+                    .await;
+                steered = format!(
+                    "{task}\n\nA reviewer judged {} independent proposals and synthesized \
+                     this directive — follow it:\n{directive}",
+                    proposals.len()
+                );
+            }
+            Err(e) => eprintln!("fanout: judge failed, executing unsteered: {e}"),
+        }
+    } else if let [only] = proposals.as_slice() {
+        // A lone survivor skips the judge but still informs the implementer — the
+        // exploration is already paid for.
+        steered = format!(
+            "{task}\n\nOne read-only exploration proposed this — weigh it before \
+             implementing:\n{only}"
+        );
+    }
+    run_task(
+        client, model, band, dialects, tool_caller, toolbox, approvals, prefix, role,
+        &steered, events, id, written, false,
+    )
+    .await
 }
 
 /// Extract the follow-up task a subagent proposed in its reply.
@@ -717,6 +987,114 @@ mod tests {
         );
         // Needle classifies the role from the instruction (tool selection).
         assert_eq!(emits[0].role, Role::Review);
+    }
+
+    // The harness-enforced repeat suppression: an exact repeat comes back as the prior
+    // observation plus the already-tried note, args collide regardless of key order, a
+    // successful mutating call clears the memory (a re-read after a write must run for
+    // real), and a *failing* mutating call does not (its 3×-observed retry stays dead).
+    #[test]
+    fn repeated_calls_are_suppressed_until_a_mutating_call_lands() {
+        let call = |name: &str, args: serde_json::Value| crate::toolcall::ToolCall {
+            name: name.to_string(),
+            arguments: args,
+        };
+        let mut seen = SeenCalls::default();
+
+        let read = call("read_file", serde_json::json!({"path": "src/lib.rs"}));
+        assert!(seen.repeat(&read).is_none(), "first call is not a repeat");
+        seen.record(&read, "contents of src/lib.rs:\nfn f() {}");
+        let suppressed = seen.repeat(&read).expect("exact repeat is suppressed");
+        assert!(suppressed.starts_with("note: this exact call was already tried"));
+        assert!(suppressed.ends_with("contents of src/lib.rs:\nfn f() {}"));
+
+        // Key order is not identity: semantically identical args collide.
+        let a = call("write_file", serde_json::json!({"path": "a.rs", "contents": "x"}));
+        let b = call("write_file", serde_json::json!({"contents": "x", "path": "a.rs"}));
+        seen.record(&a, "denied: write_file a.rs was not approved");
+        assert!(seen.repeat(&b).is_some(), "reordered args must collide");
+
+        // A failing mutating call does NOT invalidate — its repeat stays suppressed.
+        let bad = call("run_command", serde_json::json!({"command": "carg test"}));
+        seen.record(&bad, "exit 127:\ncarg: command not found");
+        assert!(seen.repeat(&bad).is_some());
+        assert!(seen.repeat(&read).is_some(), "reads survive a failed command");
+
+        // A successful mutating call clears everything: the re-read runs for real.
+        seen.record(&a, "wrote 1 bytes to a.rs");
+        assert!(seen.repeat(&read).is_none(), "read after write must not be suppressed");
+        assert!(seen.repeat(&bad).is_none());
+        assert!(seen.repeat(&a).is_some(), "the write itself stays recorded");
+    }
+
+    // A read-only pass (a fan-out proposal attempt) neither executes a mutating call
+    // nor prompts for approval — K speculative attempts must not spam the human —
+    // while plain reads still run for real.
+    #[tokio::test]
+    async fn read_only_pass_blocks_mutations_without_asking() {
+        let dir = std::env::temp_dir().join(format!("corrode-fanout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), b"fn f() {}").unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let approvals = ApprovalGate::default();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut written = Vec::new();
+        let mut seen = SeenCalls::default();
+
+        let write = crate::toolcall::ToolCall {
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "lib.rs", "contents": "boom"}),
+        };
+        // timeout, not await: if the read-only check regressed to after the approval
+        // request, this would block on a oneshot nobody resolves — fail, don't hang.
+        let obs = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            gate_and_execute(&write, &toolbox, &approvals, &tx, &mut written, &mut seen, true),
+        )
+        .await
+        .expect("read-only gate must not block on approval");
+        assert!(obs.starts_with("read-only pass:"), "got: {obs}");
+        assert!(written.is_empty(), "no artifact from a blocked write");
+        assert!(rx.try_recv().is_err(), "no approval request was emitted");
+        assert_eq!(std::fs::read(dir.join("lib.rs")).unwrap(), b"fn f() {}");
+
+        let read = crate::toolcall::ToolCall {
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "lib.rs"}),
+        };
+        let obs =
+            gate_and_execute(&read, &toolbox, &approvals, &tx, &mut written, &mut seen, true)
+                .await;
+        assert!(obs.contains("fn f() {}"), "got: {obs}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The env knobs parse defensively: junk/0/unset mean off, the width is clamped.
+    // (No other test reads these vars, so set_var is race-free here.)
+    #[test]
+    fn fanout_and_review_knobs_parse_defensively() {
+        std::env::remove_var("CORRODE_FANOUT");
+        assert_eq!(fanout_k(), 1);
+        std::env::set_var("CORRODE_FANOUT", "0");
+        assert_eq!(fanout_k(), 1);
+        std::env::set_var("CORRODE_FANOUT", "99");
+        assert_eq!(fanout_k(), 8);
+        std::env::set_var("CORRODE_FANOUT", "abc");
+        assert_eq!(fanout_k(), 1);
+        std::env::remove_var("CORRODE_FANOUT");
+
+        std::env::remove_var("CORRODE_PLAN_REVIEW");
+        assert!(plan_review_enabled());
+        std::env::set_var("CORRODE_PLAN_REVIEW", "0");
+        assert!(!plan_review_enabled());
+        std::env::set_var("CORRODE_PLAN_REVIEW", "false");
+        assert!(!plan_review_enabled());
+        std::env::remove_var("CORRODE_PLAN_REVIEW");
     }
 
     // No NEXT: line -> no emission (and Needle isn't even called).
