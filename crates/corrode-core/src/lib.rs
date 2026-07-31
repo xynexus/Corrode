@@ -184,4 +184,32 @@ mod tests {
             r#"{"OverlayFallback":{"UnknownDivergence":{"first_diff_offset":7}}}"#
         );
     }
+
+    #[test]
+    fn agent_wire_shape_is_externally_tagged() {
+        // Pin the exact `/agent` frames the webui speaks; a stray serde attribute
+        // (rename/tagging change) would break the front-end silently otherwise.
+        // Deserialize is checked by re-serializing (the enums have no PartialEq).
+        fn pin<T: Serialize + for<'a> Deserialize<'a>>(v: &T, json: &str) {
+            assert_eq!(serde_json::to_string(v).unwrap(), json);
+            let back: T = serde_json::from_str(json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+        pin(
+            &AgentCommand::Prompt { text: "hi".into(), priority: Priority::Default },
+            r#"{"Prompt":{"text":"hi","priority":64}}"#,
+        );
+        pin(
+            &AgentCommand::ApprovalResponse { id: 7, approved: true },
+            r#"{"ApprovalResponse":{"id":7,"approved":true}}"#,
+        );
+        pin(
+            &AgentEvent::ApprovalRequest { id: 7, action: "write src/main.rs".into() },
+            r#"{"ApprovalRequest":{"id":7,"action":"write src/main.rs"}}"#,
+        );
+        pin(
+            &AgentEvent::SubagentOutput { id: 3, text: "done".into() },
+            r#"{"SubagentOutput":{"id":3,"text":"done"}}"#,
+        );
+    }
 }

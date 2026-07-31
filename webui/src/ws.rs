@@ -21,6 +21,7 @@ pub fn spawn_agent(
     shared: Shared,
     log: RwSignal<Vec<String>>,
     entries: RwSignal<Vec<(String, bool)>>,
+    approvals: RwSignal<Vec<(u64, String)>>,
 ) -> UnboundedSender<AgentCommand> {
     let (cmd_tx, mut cmd_rx) = unbounded::<AgentCommand>();
 
@@ -52,7 +53,7 @@ pub fn spawn_agent(
                 Message::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
             };
             match serde_json::from_str::<AgentEvent>(&txt) {
-                Ok(ev) => apply_event(ev, &shared, log, entries),
+                Ok(ev) => apply_event(ev, &shared, log, entries, approvals),
                 Err(e) => log.update(|l| l.push(format!("[ws] undecodable event: {e}"))),
             }
         }
@@ -67,6 +68,7 @@ fn apply_event(
     shared: &Shared,
     log: RwSignal<Vec<String>>,
     entries: RwSignal<Vec<(String, bool)>>,
+    approvals: RwSignal<Vec<(u64, String)>>,
 ) {
     match ev {
         // Terminal bytes -> the xterm.js terminal.
@@ -87,6 +89,11 @@ fn apply_event(
         }
         AgentEvent::SubagentOutput { id, text } => {
             log.update(|l| l.push(format!("[agent {id}] {text}")))
+        }
+        // A mutating tool call blocked on a human; the console renders the queue
+        // with approve/deny buttons that reply `ApprovalResponse`.
+        AgentEvent::ApprovalRequest { id, action } => {
+            approvals.update(|a| a.push((id, action)))
         }
         AgentEvent::DocAnswer { text, grounded_on } => {
             log.update(|l| l.push(format!("[doc] {text}  (grounded: {})", grounded_on.join(", "))))

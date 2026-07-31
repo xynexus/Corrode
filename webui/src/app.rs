@@ -13,13 +13,14 @@ use crate::{egui_panel, term, ws};
 const SESSION: &str = "web";
 
 /// Render one agent message (Markdown, possibly with `$…$` LaTeX) to HTML. KaTeX
-/// renders the math afterward, over the mounted element.
-// ponytail: agent output is trusted here (local daemon); sanitize before inner_html
-// if untrusted content can reach it.
+/// renders the math afterward, over the mounted element. Raw HTML in the Markdown
+/// is dropped — this feeds inner_html, so pass-through would be script injection.
 fn md_to_html(md: &str) -> String {
-    use pulldown_cmark::{html, Parser};
+    use pulldown_cmark::{html, Event, Parser};
     let mut out = String::new();
-    html::push_html(&mut out, Parser::new(md));
+    let no_html =
+        Parser::new(md).filter(|e| !matches!(e, Event::Html(_) | Event::InlineHtml(_)));
+    html::push_html(&mut out, no_html);
     out
 }
 
@@ -39,8 +40,9 @@ pub fn App() -> impl IntoView {
     let shared = model::shared();
     let log = RwSignal::new(Vec::<String>::new());
     let entries = RwSignal::new(Vec::<(String, bool)>::new());
+    let approvals = RwSignal::new(Vec::<(u64, String)>::new());
 
-    let cmd_tx = ws::spawn_agent(agent_ws_url(), shared.clone(), log, entries);
+    let cmd_tx = ws::spawn_agent(agent_ws_url(), shared.clone(), log, entries, approvals);
 
     // xterm.js terminal: mount on the div once Leptos renders it. Keystrokes ->
     // TerminalInput, geometry -> TerminalResize; pty output arrives via ws::write.
@@ -143,6 +145,27 @@ pub fn App() -> impl IntoView {
 
             <section class="agent">
                 <div node_ref=console_ref class="log"></div>
+                <ul class="approvals">
+                    {move || approvals.get().into_iter().map(|(id, action)| {
+                        let decide = {
+                            let cmd_tx = cmd_tx.clone();
+                            move |approved: bool| {
+                                let _ = cmd_tx.unbounded_send(
+                                    AgentCommand::ApprovalResponse { id, approved },
+                                );
+                                approvals.update(|a| a.retain(|(i, _)| *i != id));
+                            }
+                        };
+                        let deny = decide.clone();
+                        view! {
+                            <li class="approval">
+                                <span>{action}</span>
+                                <button on:click=move |_| decide(true)>"approve"</button>
+                                <button on:click=move |_| deny(false)>"deny"</button>
+                            </li>
+                        }
+                    }).collect_view()}
+                </ul>
                 <div class="prompt">
                     <input
                         prop:value=move || prompt.get()

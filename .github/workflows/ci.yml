@@ -18,3 +18,13 @@ jobs:
       # ubuntu-latest ships a stable Rust toolchain; no setup step needed.
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
+
+  webui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # webui is outside the workspace (own Cargo.toml, wasm-only) — check it on
+      # its own target from its own directory.
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo check --target wasm32-unknown-unknown --locked
+        working-directory: webui
