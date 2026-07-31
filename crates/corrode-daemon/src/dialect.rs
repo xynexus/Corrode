@@ -5,8 +5,9 @@
 //!
 //! Dialects are matched to the tool-call model by id via a glob config file
 //! (`CORRODE_TOOL_DIALECTS`, a JSON map of `model-glob -> profile`, `"default"` for the
-//! fallback). With no config, the built-in default is Needle's flat schema + JSON-array
-//! calls + no renames — i.e. exactly today's behavior.
+//! fallback; the file replaces the built-ins wholesale). With no config, one built-in
+//! rule routes MiniCPM models to their native XML dialect (the measured-better path);
+//! every other model gets Needle's flat schema + JSON-array calls + no renames.
 
 use crate::toolcall::ToolCall;
 use serde::Deserialize;
@@ -183,9 +184,15 @@ pub struct Dialects {
 }
 
 impl Default for Dialects {
+    /// Built-in rules: MiniCPM models emit their own XML calls natively — the
+    /// measured-better path (see `docs/todo/finetune-needle-toolset.md`) — so they skip
+    /// the Needle shim out of the box. Everything else falls to the Needle default.
     fn default() -> Self {
         Self {
-            rules: Vec::new(),
+            rules: vec![(
+                "*minicpm*".to_string(),
+                ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::MiniCpmXml, HashMap::new()),
+            )],
             default: ToolDialect::default(),
         }
     }
@@ -237,11 +244,16 @@ impl Dialects {
     }
 }
 
-/// Trailing-`*` prefix glob (or exact match). Enough for model-id patterns like
-/// `needle*`, `zaya1-8b*`, or an exact id — no glob crate needed.
+/// Trailing-`*` prefix glob, `*infix*` contains, or exact match — case-insensitive,
+/// like every model-id match in `roles` (served ids are mixed-case, e.g. MiniCPM5-1B).
+/// Enough for patterns like `needle*`, `*minicpm*`, or an exact id — no glob crate needed.
 fn glob_match(pattern: &str, id: &str) -> bool {
+    let (pattern, id) = (pattern.to_lowercase(), id.to_lowercase());
     match pattern.strip_suffix('*') {
-        Some(prefix) => id.starts_with(prefix),
+        Some(rest) => match rest.strip_prefix('*') {
+            Some(infix) => id.contains(infix),
+            None => id.starts_with(rest),
+        },
         None => pattern == id,
     }
 }
@@ -318,6 +330,32 @@ mod tests {
         assert_eq!(calls[0].arguments["command"], "ls");
         assert!(d.parse("   ").unwrap().is_empty());
         assert!(d.parse("[{not json").is_err());
+    }
+
+    #[test]
+    fn builtin_default_routes_minicpm_natively_needle_flat_otherwise() {
+        let d = Dialects::default();
+        // MiniCPM ids (any case, any position) take the native path: nested schema,
+        // XML parse, the model emits its own calls.
+        let m = d.resolve("MiniCPM5-1B");
+        assert_eq!(m.schema, SchemaFormat::OpenAiNested);
+        assert!(m.emits_own_calls());
+        // Everything else — including the Needle caller's own id — stays on today's
+        // Needle-flat / json-array default.
+        for id in ["needle", "zaya1-8b"] {
+            let n = d.resolve(id);
+            assert_eq!(n.schema, SchemaFormat::NeedleFlat);
+            assert!(!n.emits_own_calls());
+        }
+    }
+
+    #[test]
+    fn user_config_overrides_the_builtin_minicpm_rule() {
+        // A config file replaces the built-ins wholesale, so its minicpm rule wins.
+        let cfg = r#"{"*minicpm*": {"schema":"needle-flat","parse":"json-array"}}"#;
+        let d = Dialects::parse_config(cfg.to_string()).unwrap();
+        assert!(!d.resolve("MiniCPM5-1B").emits_own_calls());
+        assert_eq!(d.resolve("MiniCPM5-1B").schema, SchemaFormat::NeedleFlat);
     }
 
     #[test]
