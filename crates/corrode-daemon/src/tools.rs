@@ -2,14 +2,14 @@
 //!
 //! Small models can't be trusted to construct tool-call JSON, so in the tool-execution
 //! loop ([`crate::daemon`]) a small model states its intent in plain English on a
-//! `TOOL:` line, and Needle turns that into a structured call against [`TOOL_SCHEMAS`].
+//! `TOOL:` line, and Needle turns that into a structured call against [`EXEC_TOOLS`].
 //! [`ToolBox`] then executes the call against the daemon's real capabilities and hands
 //! back an observation the model reads on its next turn.
 //!
-//! The initial toolset is deliberately READ-ONLY (`read_file`, `list_dir`) — a swarm of
-//! small models acting on the repo should observe before it can mutate. ponytail:
-//! `write_file` / `run_command` need sandboxing + the daemon's action-approval gate
-//! before they join the set.
+//! Mutating tools (`write_file` / `run_command` / `run_skill_script`) sit behind the
+//! daemon's human approval gate before [`ToolBox::execute`] runs them. ponytail: they
+//! still execute unsandboxed on the host — sandboxing is the remaining gap before
+//! approvals can be relaxed for unattended swarms.
 
 use crate::dialect::{Param, Tool};
 use crate::toolcall::ToolCall;
@@ -122,6 +122,7 @@ pub fn describe(call: &ToolCall) -> String {
 /// Executes tool calls against the daemon's VFS (and, for `run_command`/`run_skill_script`,
 /// the repo root as the working directory). Holds shared/owned state so it can live in
 /// the (`'static`) tool-loop future rather than borrowing the daemon.
+#[derive(Clone)]
 pub struct ToolBox {
     vfs: Arc<dyn Vfs>,
     root: PathBuf,
@@ -253,7 +254,7 @@ impl ToolBox {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
                 let (shown, truncated) = if text.len() > MAX_READ_BYTES {
-                    (&text[..MAX_READ_BYTES], true)
+                    (&text[..floor_char_boundary(&text, MAX_READ_BYTES)], true)
                 } else {
                     (text.as_ref(), false)
                 };
@@ -263,7 +264,7 @@ impl ToolBox {
                 }
                 out
             }
-            Err(e) => format!("error: could not read {path}: {e}"),
+            Err(e) => self.path_error("read", path, &e).await,
         }
     }
 
@@ -284,8 +285,49 @@ impl ToolBox {
                 }
                 out
             }
-            Err(e) => format!("error: could not list {path}: {e}"),
+            Err(e) => self.path_error("list", path, &e).await,
         }
+    }
+
+    /// A readable error for a failed `read_file`/`list_dir`. A path that doesn't stat is
+    /// a miss (likely hallucinated): name it and suggest near-matches so the model gets
+    /// a corrective observation instead of a raw errno. A path that stats but still
+    /// failed keeps the underlying error (permissions, is-a-directory, …).
+    async fn path_error(&self, verb: &str, path: &str, e: &anyhow::Error) -> String {
+        if self.vfs.stat(path).await.is_ok() {
+            return format!("error: could not {verb} {path}: {e}");
+        }
+        let close = self.near_matches(path).await;
+        let mut out = format!("error: no such path '{path}'");
+        if !close.is_empty() {
+            out.push_str(&format!(". Did you mean '{}'?", close.join("', '")));
+        }
+        out
+    }
+
+    /// Up to 3 entries near a missing path, from its parent's listing (the root listing
+    /// when the parent is absent too), closest final component first.
+    async fn near_matches(&self, path: &str) -> Vec<String> {
+        let trimmed = path.trim_end_matches('/');
+        let (parent, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let entries = match self.vfs.list(parent).await {
+            Ok(entries) => entries,
+            Err(_) => self.vfs.list("").await.unwrap_or_default(),
+        };
+        let name = name.to_ascii_lowercase();
+        let mut scored: Vec<(usize, String)> = entries
+            .into_iter()
+            .filter_map(|e| {
+                let last = e.path.rsplit('/').next().unwrap_or_default().to_ascii_lowercase();
+                closeness(&name, &last).map(|d| (d, e.path))
+            })
+            .collect();
+        scored.sort();
+        scored.truncate(3);
+        scored.into_iter().map(|(_, p)| p).collect()
     }
 }
 
@@ -306,10 +348,50 @@ fn format_command_output(out: std::process::Output) -> String {
         text.push_str(&String::from_utf8_lossy(&out.stderr));
     }
     if text.len() > MAX_CMD_BYTES {
-        text.truncate(MAX_CMD_BYTES);
+        text.truncate(floor_char_boundary(&text, MAX_CMD_BYTES));
         text.push_str("\n… (truncated)");
     }
     format!("exit {}:\n{}", out.status.code().unwrap_or(-1), text.trim())
+}
+
+/// Largest index `<= max` on a char boundary — truncating mid-multibyte-char panics.
+pub(crate) fn floor_char_boundary(s: &str, max: usize) -> usize {
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+/// Whether a candidate final component is near a missing one — `Some(edit distance)`
+/// when it's close (substring containment, a 3-char shared prefix, or an edit distance
+/// within half the longer length), `None` otherwise. Lower is closer.
+fn closeness(miss: &str, cand: &str) -> Option<usize> {
+    let d = edit_distance(miss, cand);
+    let prefix = miss
+        .bytes()
+        .zip(cand.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    (miss.contains(cand) || cand.contains(miss) || prefix >= 3 || d * 2 <= miss.len().max(cand.len()))
+        .then_some(d)
+}
+
+/// Levenshtein distance, two-row DP — path components are short, so O(a·b) is nothing.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let step = (prev[j] + usize::from(ca != cb))
+                .min(prev[j + 1] + 1)
+                .min(cur[j] + 1);
+            cur.push(step);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 /// Resolve a skill-relative script to a concrete path: `<skill>/scripts/<rel>` if it
@@ -409,6 +491,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    async fn truncation_never_splits_a_multibyte_char() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = std::env::temp_dir().join(format!("corrode-tools-mb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 3-byte chars: 4096 % 3 != 0, so a byte-index truncation lands mid-char.
+        let big = "€".repeat(MAX_READ_BYTES / 3 + 2);
+        std::fs::write(dir.join("mb.txt"), big.as_bytes()).unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(HashMap::new()),
+        );
+        let read = toolbox
+            .execute(&ToolCall {
+                name: "read_file".into(),
+                arguments: json!({"path": "mb.txt"}),
+            })
+            .await;
+        assert!(read.contains("truncated"), "got: {read}");
+
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: "€".repeat(MAX_CMD_BYTES / 3 + 2).into_bytes(),
+            stderr: Vec::new(),
+        };
+        assert!(format_command_output(out).contains("truncated"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn is_mutating_classifies_write_and_run() {
         let call = |n: &str| ToolCall {
@@ -494,6 +607,59 @@ mod tests {
         assert!(run("nope/greet.sh").await.contains("no installed skill named"));
         assert!(run("ghost.sh").await.contains("no installed skill has a script"));
         assert!(run("greeter/../../../bin/sh").await.contains("invalid script"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn missing_path_gets_a_corrective_suggestion() {
+        let dir = std::env::temp_dir().join(format!("corrode-suggest-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("readme.md"), b"docs").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), b"pub fn x() {}").unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(HashMap::new()),
+        );
+        let read = |path: &str| {
+            let tb = &toolbox;
+            let path = path.to_string();
+            async move {
+                tb.execute(&ToolCall {
+                    name: "read_file".into(),
+                    arguments: json!({ "path": path }),
+                })
+                .await
+            }
+        };
+
+        // A near-miss on the final component names the miss and suggests the neighbor.
+        let close = read("src/lib.sr").await;
+        assert!(close.contains("no such path 'src/lib.sr'"), "got: {close}");
+        assert!(close.contains("Did you mean 'src/lib.rs'?"), "got: {close}");
+
+        // An absent parent falls back to suggesting from the root listing.
+        let orphan = read("nope/readme.md").await;
+        assert!(orphan.contains("Did you mean 'readme.md'?"), "got: {orphan}");
+
+        // Nothing close -> the miss is named without a bogus suggestion.
+        let far = read("zzz.qqq").await;
+        assert!(far.contains("no such path 'zzz.qqq'"), "got: {far}");
+        assert!(!far.contains("Did you mean"), "got: {far}");
+
+        // list_dir gets the same treatment.
+        let listed = toolbox
+            .execute(&ToolCall {
+                name: "list_dir".into(),
+                arguments: json!({"path": "srcs"}),
+            })
+            .await;
+        assert!(listed.contains("Did you mean 'src'?"), "got: {listed}");
+
+        // A path that exists but fails another way keeps the underlying error.
+        let is_dir = read("src").await;
+        assert!(is_dir.starts_with("error: could not read src:"), "got: {is_dir}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

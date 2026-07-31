@@ -23,8 +23,6 @@ pub trait Vfs: Send + Sync {
     async fn list(&self, dir: &str) -> anyhow::Result<Vec<FileNodeView>>;
     /// Attributes for a single path — what FUSE `getattr`/`lookup` needs, without
     /// listing (and scanning) the whole parent directory per call.
-    // ponytail: no loop caller yet; wired by the FUSE adapter's getattr/lookup.
-    #[allow(dead_code)]
     async fn stat(&self, path: &str) -> anyhow::Result<FileNodeView>;
     // ponytail: read/write have no loop caller yet; wired with ReadFile/WriteFile
     // commands when the explorer's file open/edit lands. Covered by the vfs test.
