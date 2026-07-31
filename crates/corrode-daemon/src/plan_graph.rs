@@ -20,6 +20,9 @@ use std::future::Future;
 
 pub type TaskId = u64;
 
+/// Byte cap on a provenance node's label (the task prompt can be arbitrarily long).
+const LABEL_CAP: usize = 200;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Pending,
@@ -116,6 +119,8 @@ struct Node {
     emitted_by: Option<TaskId>,
     /// Repo paths this task produced (via `write_file`) — the code nodes it authored.
     artifacts: Vec<String>,
+    /// The task's final answer, once `Done` — what the plan-level review pass reads.
+    output: Option<String>,
 }
 
 #[derive(Default)]
@@ -150,6 +155,7 @@ impl PlanGraph {
             status: Status::Pending,
             emitted_by: None,
             artifacts: Vec::new(),
+            output: None,
         });
         id
     }
@@ -166,6 +172,54 @@ impl PlanGraph {
         if let Some(n) = self.nodes.iter_mut().find(|n| n.task.id == id) {
             n.artifacts = artifacts;
         }
+    }
+
+    /// Record a task's final answer.
+    fn set_output(&mut self, id: TaskId, output: &str) {
+        if let Some(n) = self.nodes.iter_mut().find(|n| n.task.id == id) {
+            n.output = Some(output.to_string());
+        }
+    }
+
+    /// A compact digest of the settled plan for the review pass: every `Done` task's
+    /// role, prompt, output (capped at `per_task_cap` bytes), and written paths, plus
+    /// a line per `Failed` task — the reviewer must see the gaps, not only the wins.
+    /// `None` when nothing completed — there is nothing to review.
+    pub fn review_digest(&self, per_task_cap: usize) -> Option<String> {
+        let done: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|n| n.status == Status::Done)
+            .collect();
+        if done.is_empty() {
+            return None;
+        }
+        let mut digest = String::new();
+        for n in done {
+            digest.push_str(&format!(
+                "task {} [{}]: {}\n",
+                n.task.id,
+                n.task.role.as_str(),
+                n.task.prompt
+            ));
+            if let Some(out) = &n.output {
+                let end = crate::tools::floor_char_boundary(out, per_task_cap);
+                digest.push_str(&format!("output: {}\n", &out[..end]));
+            }
+            if !n.artifacts.is_empty() {
+                digest.push_str(&format!("wrote: {}\n", n.artifacts.join(", ")));
+            }
+            digest.push('\n');
+        }
+        for n in self.nodes.iter().filter(|n| n.status == Status::Failed) {
+            digest.push_str(&format!(
+                "task {} [{}] FAILED: {}\n",
+                n.task.id,
+                n.task.role.as_str(),
+                n.task.prompt
+            ));
+        }
+        Some(digest)
     }
 
     fn node_ref(&self, id: TaskId) -> String {
@@ -186,6 +240,9 @@ impl PlanGraph {
         let mut edges = Vec::new();
         for n in &self.nodes {
             let task_ref = self.node_ref(n.task.id);
+            // Labels are for display/query — cap them so a digest-bearing prompt (the
+            // plan-review task) doesn't duplicate every task's output into the store.
+            let label_end = crate::tools::floor_char_boundary(&n.task.prompt, LABEL_CAP);
             nodes.push(ProvNode {
                 id: task_ref.clone(),
                 kind: if n.emitted_by.is_some() {
@@ -193,7 +250,7 @@ impl PlanGraph {
                 } else {
                     NodeKind::Task
                 },
-                label: n.task.prompt.clone(),
+                label: n.task.prompt[..label_end].to_string(),
             });
             edges.push(ProvEdge::new(&task_ref, "part_of", &plan));
             if let Some(emitter) = n.emitted_by {
@@ -277,6 +334,9 @@ where
                 Status::Failed
             },
         );
+        if let Ok(text) = &outcome.output {
+            graph.set_output(id, text); // what the plan-level review pass reads
+        }
         graph.set_artifacts(id, outcome.artifacts); // code nodes this task produced
         for emit in outcome.emitted {
             let deps = if emit.after_emitter { vec![id] } else { vec![] };
@@ -441,6 +501,95 @@ mod tests {
         assert!(pos("test add").is_some(), "emitted test task ran");
         assert!(pos("write add") < pos("test add"), "emitted test runs after its emitter");
         assert!(g.stuck().is_empty(), "everything scheduled");
+    }
+
+    // The plan-level review round: after the first drive settles, the digest carries the
+    // done work (prompt, output, artifacts), a review task appended to the SAME graph is
+    // driven by a second `run_reactive` with the SAME executor, and the fix it emits
+    // runs too — provenance then links fix -emitted_from-> review.
+    #[tokio::test]
+    async fn review_round_reads_the_digest_and_runs_emitted_fixes() {
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut g = PlanGraph::new("plan-9");
+        g.add(Role::Coder, "write add()", vec![]);
+
+        let rec = order.clone();
+        let execute = move |task: PlanTask| {
+            let rec = rec.clone();
+            async move {
+                rec.lock().unwrap().push(task.prompt.clone());
+                let emitted = if task.prompt.contains("review the plan") {
+                    vec![Emit {
+                        role: Role::Coder,
+                        prompt: "fix the overflow in add()".into(),
+                        after_emitter: true,
+                    }]
+                } else {
+                    vec![]
+                };
+                let artifacts = if task.prompt.contains("write add") {
+                    vec!["src/math.rs".to_string()]
+                } else {
+                    vec![]
+                };
+                Outcome {
+                    output: Ok(format!("done: {}", task.prompt)),
+                    emitted,
+                    artifacts,
+                }
+            }
+        };
+
+        run_reactive(&mut g, &execute).await;
+        let digest = g.review_digest(4096).expect("done work yields a digest");
+        assert!(digest.contains("write add()"), "digest: {digest}");
+        assert!(digest.contains("output: done: write add()"));
+        assert!(digest.contains("wrote: src/math.rs"));
+
+        let review = g.add(Role::Review, "review the plan's work", vec![]);
+        run_reactive(&mut g, &execute).await;
+
+        let ord = order.lock().unwrap().clone();
+        let pos = |needle: &str| ord.iter().position(|p| p.contains(needle));
+        assert!(pos("review the plan") < pos("fix the overflow"), "fix runs after review");
+        // coder + review + fix, exactly once each — the review drive must never
+        // re-execute settled tasks (that would mean duplicate real writes).
+        assert_eq!(ord.len(), 3, "settled tasks re-ran: {ord:?}");
+        assert!(g.stuck().is_empty());
+
+        // The emitted fix is a contract of the review task in provenance.
+        let prov = g.provenance();
+        assert!(prov.edges.iter().any(|e| e.rel == "emitted_from"
+            && e.to == format!("plan-9:task:{review}")));
+
+        // Nothing done -> nothing to review.
+        assert!(PlanGraph::default().review_digest(4096).is_none());
+    }
+
+    // The digest caps outputs on a char boundary (no mid-multibyte panic) and names
+    // failed tasks — the reviewer must see the gaps, not only the wins.
+    #[tokio::test]
+    async fn review_digest_caps_output_and_reports_failures() {
+        let mut g = PlanGraph::default();
+        g.add(Role::Coder, "big output", vec![]);
+        g.add(Role::Coder, "doomed", vec![]);
+        run_reactive(&mut g, |task: PlanTask| async move {
+            Outcome {
+                output: if task.prompt.contains("doomed") {
+                    Err(anyhow::anyhow!("boom"))
+                } else {
+                    Ok("€".repeat(50)) // 3-byte chars: cap 10 falls mid-char
+                },
+                emitted: vec![],
+                artifacts: vec![],
+            }
+        })
+        .await;
+
+        let digest = g.review_digest(10).expect("one done task");
+        let out_line = digest.lines().find(|l| l.starts_with("output:")).unwrap();
+        assert_eq!(out_line, "output: €€€", "capped on a char boundary");
+        assert!(digest.contains("task 1 [coder] FAILED: doomed"), "digest: {digest}");
     }
 
     // The provenance graph a plan produces: a coder task emits a contract and writes a

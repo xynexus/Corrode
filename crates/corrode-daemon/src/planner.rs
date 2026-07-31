@@ -90,6 +90,50 @@ NEXT: <one plain-English follow-up task>",
     )
 }
 
+/// The task text for one read-only proposal attempt in a coder fan-out
+/// (`CORRODE_FANOUT`). The attempt explores but cannot mutate; its deliverable is a
+/// proposal the review judge weighs against its siblings'. Variation lives in this
+/// tail — the shared prefix stays byte-identical, so hipfire batches the whole
+/// ensemble prefix-shared.
+pub fn fanout_attempt_task(task: &str, attempt: usize, of: usize) -> String {
+    format!(
+        "{task}\n[proposal {attempt}/{of}: this pass is read-only — explore as needed, then \
+end with your proposed approach and the exact changes to make. A reviewer compares \
+independent proposals and one implementer executes the winner.]"
+    )
+}
+
+/// The full judge prompt for a fan-out: shared prefix first (byte-identical — KV
+/// reuse), then the task and every surviving proposal in the tail.
+pub fn fanout_judge_prompt(context_prefix: &str, task: &str, proposals: &[String]) -> String {
+    let mut tail = format!(
+        "[role: review]\nYou are judging {} independent proposals for this task:\n{task}\n",
+        proposals.len()
+    );
+    for (i, p) in proposals.iter().enumerate() {
+        tail.push_str(&format!("\n--- proposal {} ---\n{p}\n", i + 1));
+    }
+    tail.push_str(
+        "\nPick the strongest approach, folding in anything clearly better from the others, \
+and reply with ONE precise directive for the implementing agent — the concrete changes, \
+files, and checks. Reply with only the directive.",
+    );
+    format!("{context_prefix}\n\n{tail}")
+}
+
+/// The task text for the plan-level review pass: the settled plan's digest, plus an
+/// instruction to verify against the repo and route fixes through the normal
+/// follow-up channel (`NEXT:` line -> emitted fix task).
+pub fn plan_review_task(digest: &str) -> String {
+    format!(
+        "Review the work this plan just completed. The digest below lists each task, its \
+output, and the files it wrote. Verify against the actual repo — read the written files \
+rather than trusting the outputs. If you find a defect or a gap, name the single most \
+important fix as your NEXT: line; if the work holds, say so and emit no follow-up.\n\n\
+{digest}"
+    )
+}
+
 #[derive(Deserialize)]
 struct RawSubtask {
     role: String,
@@ -181,5 +225,29 @@ mod tests {
     #[test]
     fn parse_plan_returns_empty_on_junk() {
         assert!(parse_plan("no json here").is_empty());
+    }
+
+    // Fan-out prompts obey the same KV-reuse invariant as subagent prompts: the shared
+    // prefix leads the judge prompt, and attempt variation lives after the task text.
+    #[test]
+    fn fanout_and_review_prompts_keep_the_shared_prefix_leading() {
+        let prefix = "SHARED-CONTEXT-DIGEST";
+        let judge = fanout_judge_prompt(
+            prefix,
+            "write the parser",
+            &["use nom".into(), "hand-roll it".into()],
+        );
+        assert!(judge.starts_with(prefix));
+        assert!(judge.contains("write the parser"), "judge sees the task");
+        assert!(judge.contains("--- proposal 1 ---\nuse nom"));
+        assert!(judge.contains("--- proposal 2 ---\nhand-roll it"));
+
+        let attempt = fanout_attempt_task("write the parser", 2, 3);
+        assert!(attempt.starts_with("write the parser"));
+        assert!(attempt.contains("[proposal 2/3"));
+
+        let review = plan_review_task("task 0 [coder]: write the parser\nwrote: src/parser.rs");
+        assert!(review.contains("NEXT:"));
+        assert!(review.ends_with("wrote: src/parser.rs"));
     }
 }
