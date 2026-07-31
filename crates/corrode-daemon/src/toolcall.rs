@@ -24,10 +24,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One tool invocation Needle decoded: a tool name and its JSON arguments.
-// ponytail: dead in the base build until the tool-execution loop consumes calls;
-// exercised by tests and the `needle` backend now.
-#[allow(dead_code)]
+/// One tool invocation a tool-call model decoded: a tool name and its JSON
+/// arguments. Consumed by the tool-execution loops (`tools.rs`) in every build.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     pub name: String,

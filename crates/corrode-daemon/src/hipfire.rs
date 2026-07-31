@@ -27,11 +27,9 @@ struct ResponsesRequest<'a> {
     /// Hard cap on generated tokens. Without it a slow model generates until EOS
     /// and one subagent can hog the GPU for minutes, starving the rest of the swarm.
     max_output_tokens: u32,
-    // ponytail: hipfire carries scheduler priority on the internal WorkloadSpec,
-    // but the exact HTTP wire field for per-request priority isn't a stable
-    // documented header yet — passing it in `metadata` and confirming against the
-    // daemon's /v1/responses parser is the next step. Upgrade to whatever the
-    // daemon actually reads (header vs body field) once pinned down.
+    /// Scheduler priority band. hipfire's /v1/responses parser reads
+    /// `metadata.hipfire_priority` (a top-level `priority` field, the chat-route
+    /// convention, would also work); absent/malformed falls back to the default band.
     metadata: serde_json::Value,
     /// Tool declarations. hipfire feeds these to the model's chat template, which
     /// renders the `<tools>` block the model was trained to read — without it the

@@ -40,14 +40,23 @@ async fn handle_socket(socket: WebSocket, daemon: Arc<Daemon>) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCommand>(64);
     let (ev_tx, mut ev_rx) = mpsc::channel::<AgentEvent>(64);
 
+    let err_tx = ev_tx.clone();
     let recv = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_rx.next().await {
             match msg {
                 Message::Text(t) => {
-                    // ignore malformed frames; stop if the loop's receiver is gone
-                    if let Ok(cmd) = serde_json::from_str::<AgentCommand>(t.as_str()) {
-                        if cmd_tx.send(cmd).await.is_err() {
-                            break;
+                    // stop if the loop's receiver is gone; echo malformed frames
+                    // back as an Error so browser-side protocol bugs surface
+                    match serde_json::from_str::<AgentCommand>(t.as_str()) {
+                        Ok(cmd) => {
+                            if cmd_tx.send(cmd).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let frame: String = t.chars().take(120).collect();
+                            let message = format!("malformed command frame ({e}): {frame}");
+                            let _ = err_tx.send(AgentEvent::Error { message }).await;
                         }
                     }
                 }
