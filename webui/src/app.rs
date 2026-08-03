@@ -24,6 +24,43 @@ fn md_to_html(md: &str) -> String {
     out
 }
 
+/// HTML-escape untrusted text bound for `inner_html` (tool observations echo repo
+/// content; markdown filtering doesn't apply to these non-markdown entries).
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// One console entry -> its HTML. Typed rendering: agent output stays markdown
+/// (badge-colored per subagent via a golden-angle hue), tool results collapse into
+/// a native `<details>` (no JS), turns render as dividers, errors in red.
+fn entry_html(e: &ws::LogEntry) -> String {
+    use ws::LogEntry::*;
+    match e {
+        Agent { id, text } => {
+            let hue = (*id * 137) % 360;
+            format!(
+                "<div class=\"msg agent\"><span class=\"agent-badge\" \
+                 style=\"background:hsl({hue} 45% 28%)\">a{id}</span>\
+                 <div class=\"agent-body\">{}</div></div>",
+                md_to_html(text)
+            )
+        }
+        Tool { call, observation } => format!(
+            "<details class=\"tool\"><summary>{}</summary><pre>{}</pre></details>",
+            esc(call),
+            esc(observation)
+        ),
+        Turn { plan_id } => format!("<div class=\"turn\">turn {} settled</div>", esc(plan_id)),
+        Doc { text, grounded_on } => format!(
+            "<div class=\"msg doc\">{}<div class=\"grounded\">grounded: {}</div></div>",
+            md_to_html(text),
+            esc(&grounded_on.join(", "))
+        ),
+        Error(m) => format!("<div class=\"msg error\">{}</div>", esc(m)),
+        Ws(m) => format!("<div class=\"msg ws\">{}</div>", esc(m)),
+    }
+}
+
 /// Same-origin `/agent` websocket URL, `ws://` or `wss://` per the page scheme.
 fn agent_ws_url() -> String {
     let loc = web_sys::window().expect("window").location();
@@ -38,11 +75,15 @@ fn agent_ws_url() -> String {
 #[component]
 pub fn App() -> impl IntoView {
     let shared = model::shared();
-    let log = RwSignal::new(Vec::<String>::new());
+    let log = RwSignal::new(Vec::<ws::LogEntry>::new());
     let entries = RwSignal::new(Vec::<(String, bool)>::new());
     let approvals = RwSignal::new(Vec::<(u64, String)>::new());
+    // In-flight turn indicator: set on Prompt, cleared by TurnComplete. ponytail:
+    // one flag, not per-plan tracking — a second concurrent prompt's completion
+    // reads as idle early; track plan ids when concurrent turns matter.
+    let busy = RwSignal::new(false);
 
-    let cmd_tx = ws::spawn_agent(agent_ws_url(), shared.clone(), log, entries, approvals);
+    let cmd_tx = ws::spawn_agent(agent_ws_url(), shared.clone(), log, entries, approvals, busy);
 
     // xterm.js terminal: mount on the div once Leptos renders it. Keystrokes ->
     // TerminalInput, geometry -> TerminalResize; pty output arrives via ws::write.
@@ -87,11 +128,7 @@ pub fn App() -> impl IntoView {
     // two-effect ordering race), and it auto-scrolls to the newest message.
     let console_ref = NodeRef::<html::Div>::new();
     Effect::new(move |_| {
-        let html = log
-            .get()
-            .iter()
-            .map(|m| format!("<div class=\"msg\">{}</div>", md_to_html(m)))
-            .collect::<String>();
+        let html = log.get().iter().map(entry_html).collect::<String>();
         if let Some(div) = console_ref.get() {
             let el: web_sys::HtmlElement = div.unchecked_into();
             el.set_inner_html(&html);
@@ -111,6 +148,7 @@ pub fn App() -> impl IntoView {
                     priority: Priority::Default,
                 });
                 prompt.set(String::new());
+                busy.set(true);
             }
         }
     };
@@ -124,7 +162,12 @@ pub fn App() -> impl IntoView {
     };
 
     view! {
-        <header class="topbar"><span class="brand">"Corrode"</span>" swarm console"</header>
+        <header class="topbar">
+            <span class="brand">"Corrode"</span>" swarm console"
+            <span class="status" class:busy=move || busy.get()>
+                {move || if busy.get() { "working…" } else { "idle" }}
+            </span>
+        </header>
         <div class="cols">
             <section class="explorer">
                 <div class="bar">

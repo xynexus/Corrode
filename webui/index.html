@@ -66,9 +66,50 @@
       .terminal .xterm, .terminal .xterm-viewport { height: 100% !important; }
       .graph-canvas { flex: 2; width: 100%; min-height: 0; display: block; }
 
+      .status {
+        float: right; color: #8b929c; font-size: 12px;
+      }
+      .status.busy { color: #e0b04b; }
+      .status.busy::before {
+        content: ""; display: inline-block; width: 8px; height: 8px;
+        margin-right: 6px; border-radius: 50%; background: #e0b04b;
+        animation: pulse 1.2s ease-in-out infinite;
+      }
+      @keyframes pulse { 50% { opacity: 0.25; } }
+
       .log { flex: 1; overflow: auto; padding: 8px 10px; }
       .log .msg { padding: 5px 0; border-bottom: 1px solid #1c1f24; }
       .log .msg:last-child { border-bottom: 0; }
+      .agent-badge {
+        display: inline-block; font: 11px/1 ui-monospace, monospace;
+        color: #d7dbe0; border-radius: 4px; padding: 3px 6px; margin: 2px 0;
+      }
+      .agent-body { margin-top: 2px; }
+      .log details.tool {
+        margin: 4px 0; border: 1px solid #262a30; border-radius: 5px;
+        background: #101216;
+      }
+      .log details.tool summary {
+        cursor: pointer; padding: 4px 8px; color: #7fb069;
+        font-family: ui-monospace, monospace; font-size: 12px;
+      }
+      .log details.tool pre { margin: 0; border: 0; border-top: 1px solid #262a30; }
+      .log .turn {
+        margin: 8px 0; text-align: center; color: #8b929c; font-size: 12px;
+        border-top: 1px dashed #363b42; padding-top: 4px;
+      }
+      .log .error { color: #e06c60; }
+      .log .ws { color: #8b929c; font-size: 12px; }
+      .log .doc .grounded { color: #8b929c; font-size: 12px; }
+      .approvals { list-style: none; margin: 0; padding: 0; }
+      .approvals .approval {
+        display: flex; gap: 6px; align-items: center; padding: 6px 10px;
+        border-top: 1px solid #4b3a1e; background: #1d1812;
+      }
+      .approvals .approval span {
+        flex: 1; font-family: ui-monospace, monospace; font-size: 12px;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
       .log .msg :first-child { margin-top: 0; }
       .log .msg :last-child { margin-bottom: 0; }
       .log pre {

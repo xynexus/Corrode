@@ -14,21 +14,35 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::model::Shared;
 
+/// One agent-console entry, typed at receive time so the view styles each event
+/// kind instead of pattern-matching strings back apart.
+#[derive(Clone)]
+pub enum LogEntry {
+    Agent { id: u64, text: String },
+    Tool { call: String, observation: String },
+    Turn { plan_id: String },
+    Doc { text: String, grounded_on: Vec<String> },
+    Error(String),
+    /// Socket-level notices (open failure, undecodable frame, close).
+    Ws(String),
+}
+
 /// Open the socket, wire both pump loops, and return the sender UI callbacks push
 /// `AgentCommand`s into. Failures surface in `log` rather than panicking.
 pub fn spawn_agent(
     url: String,
     shared: Shared,
-    log: RwSignal<Vec<String>>,
+    log: RwSignal<Vec<LogEntry>>,
     entries: RwSignal<Vec<(String, bool)>>,
     approvals: RwSignal<Vec<(u64, String)>>,
+    busy: RwSignal<bool>,
 ) -> UnboundedSender<AgentCommand> {
     let (cmd_tx, mut cmd_rx) = unbounded::<AgentCommand>();
 
     let ws = match WebSocket::open(&url) {
         Ok(ws) => ws,
         Err(e) => {
-            log.update(|l| l.push(format!("[ws] open failed: {e:?}")));
+            log.update(|l| l.push(LogEntry::Ws(format!("open failed: {e:?}"))));
             return cmd_tx;
         }
     };
@@ -53,11 +67,11 @@ pub fn spawn_agent(
                 Message::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
             };
             match serde_json::from_str::<AgentEvent>(&txt) {
-                Ok(ev) => apply_event(ev, &shared, log, entries, approvals),
-                Err(e) => log.update(|l| l.push(format!("[ws] undecodable event: {e}"))),
+                Ok(ev) => apply_event(ev, &shared, log, entries, approvals, busy),
+                Err(e) => log.update(|l| l.push(LogEntry::Ws(format!("undecodable event: {e}")))),
             }
         }
-        log.update(|l| l.push("[ws] agent socket closed".into()));
+        log.update(|l| l.push(LogEntry::Ws("agent socket closed".into())));
     });
 
     cmd_tx
@@ -66,9 +80,10 @@ pub fn spawn_agent(
 fn apply_event(
     ev: AgentEvent,
     shared: &Shared,
-    log: RwSignal<Vec<String>>,
+    log: RwSignal<Vec<LogEntry>>,
     entries: RwSignal<Vec<(String, bool)>>,
     approvals: RwSignal<Vec<(u64, String)>>,
+    busy: RwSignal<bool>,
 ) {
     match ev {
         // Terminal bytes -> the xterm.js terminal.
@@ -88,7 +103,7 @@ fn apply_event(
             entries.set(rows);
         }
         AgentEvent::SubagentOutput { id, text } => {
-            log.update(|l| l.push(format!("[agent {id}] {text}")))
+            log.update(|l| l.push(LogEntry::Agent { id, text }))
         }
         // A mutating tool call blocked on a human; the console renders the queue
         // with approve/deny buttons that reply `ApprovalResponse`.
@@ -96,14 +111,15 @@ fn apply_event(
             approvals.update(|a| a.push((id, action)))
         }
         AgentEvent::DocAnswer { text, grounded_on } => {
-            log.update(|l| l.push(format!("[doc] {text}  (grounded: {})", grounded_on.join(", "))))
+            log.update(|l| l.push(LogEntry::Doc { text, grounded_on }))
         }
         AgentEvent::ToolResult { call, observation, .. } => {
-            log.update(|l| l.push(format!("[tool] {call} -> {observation}")))
+            log.update(|l| l.push(LogEntry::Tool { call, observation }))
         }
         AgentEvent::TurnComplete { plan_id } => {
-            log.update(|l| l.push(format!("[turn {plan_id} complete]")))
+            busy.set(false);
+            log.update(|l| l.push(LogEntry::Turn { plan_id }));
         }
-        AgentEvent::Error { message } => log.update(|l| l.push(format!("[error] {message}"))),
+        AgentEvent::Error { message } => log.update(|l| l.push(LogEntry::Error(message))),
     }
 }
