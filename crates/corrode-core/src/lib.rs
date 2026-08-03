@@ -139,6 +139,13 @@ pub enum AgentEvent {
     /// a human's go-ahead. Reply with `AgentCommand::ApprovalResponse` carrying this
     /// `id`. `action` is a human-readable description of exactly what will happen.
     ApprovalRequest { id: u64, action: String },
+    /// One tool call resolved in subagent `id`'s loop: `call` is its human-readable
+    /// description, `observation` what came back (capped; the model still gets the
+    /// full text). Suppressed repeats and denied calls stream here too.
+    ToolResult { id: u64, call: String, observation: String },
+    /// The Prompt turn settled: every task ran and provenance persisted. Clients
+    /// wait on this, not on the stream going quiet.
+    TurnComplete { plan_id: String },
     Error { message: String },
 }
 
@@ -210,6 +217,18 @@ mod tests {
         pin(
             &AgentEvent::SubagentOutput { id: 3, text: "done".into() },
             r#"{"SubagentOutput":{"id":3,"text":"done"}}"#,
+        );
+        pin(
+            &AgentEvent::ToolResult {
+                id: 3,
+                call: "run_command: cargo test".into(),
+                observation: "exit 0:\nok".into(),
+            },
+            r#"{"ToolResult":{"id":3,"call":"run_command: cargo test","observation":"exit 0:\nok"}}"#,
+        );
+        pin(
+            &AgentEvent::TurnComplete { plan_id: "plan-0".into() },
+            r#"{"TurnComplete":{"plan_id":"plan-0"}}"#,
         );
     }
 }

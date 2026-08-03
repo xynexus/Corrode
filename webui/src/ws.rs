@@ -98,6 +98,12 @@ fn apply_event(
         AgentEvent::DocAnswer { text, grounded_on } => {
             log.update(|l| l.push(format!("[doc] {text}  (grounded: {})", grounded_on.join(", "))))
         }
+        AgentEvent::ToolResult { call, observation, .. } => {
+            log.update(|l| l.push(format!("[tool] {call} -> {observation}")))
+        }
+        AgentEvent::TurnComplete { plan_id } => {
+            log.update(|l| l.push(format!("[turn {plan_id} complete]")))
+        }
         AgentEvent::Error { message } => log.update(|l| l.push(format!("[error] {message}"))),
     }
 }
