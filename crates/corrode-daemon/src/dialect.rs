@@ -31,6 +31,13 @@ pub struct Tool {
     pub params: &'static [Param],
 }
 
+/// Per-request value sets for params with a closed, known set: `(tool, param) ->
+/// allowed values`. Rendered as a standard JSON-Schema `enum` array — the carrier
+/// hipfire's grammar derives value constraints from — in the OpenAI-nested schema
+/// only; the Needle-flat rendering ignores it (no enum in Needle's training shape).
+/// Absent (or a missing key) leaves the rendering byte-identical to today's.
+pub type ParamValues = HashMap<(String, String), Vec<String>>;
+
 /// How a model wants the tools JSON shaped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaFormat {
@@ -100,12 +107,13 @@ impl ToolDialect {
     }
 
     /// Render canonical tools into the schema JSON string this model expects.
-    pub fn render(&self, tools: &[Tool]) -> String {
-        let arr: Vec<Value> = tools.iter().map(|t| self.render_tool(t)).collect();
+    /// `values` is the optional per-request value overlay (see [`ParamValues`]).
+    pub fn render(&self, tools: &[Tool], values: Option<&ParamValues>) -> String {
+        let arr: Vec<Value> = tools.iter().map(|t| self.render_tool(t, values)).collect();
         Value::Array(arr).to_string()
     }
 
-    fn render_tool(&self, t: &Tool) -> Value {
+    fn render_tool(&self, t: &Tool, values: Option<&ParamValues>) -> Value {
         let params = match self.schema {
             SchemaFormat::NeedleFlat => {
                 let mut m = Map::new();
@@ -121,10 +129,15 @@ impl ToolDialect {
                 let mut props = Map::new();
                 let mut required = Vec::new();
                 for p in t.params {
-                    props.insert(
-                        p.name.to_string(),
-                        json!({"type": p.ty, "description": p.description}),
-                    );
+                    let mut prop = Map::new();
+                    prop.insert("type".to_string(), json!(p.ty));
+                    prop.insert("description".to_string(), json!(p.description));
+                    if let Some(vals) =
+                        values.and_then(|v| v.get(&(t.name.to_string(), p.name.to_string())))
+                    {
+                        prop.insert("enum".to_string(), json!(vals));
+                    }
+                    props.insert(p.name.to_string(), Value::Object(prop));
                     if p.required {
                         required.push(Value::String(p.name.to_string()));
                     }
@@ -146,12 +159,14 @@ impl ToolDialect {
     ///
     /// Chat templates serialize each entry with `tool | tojson`, and the models are
     /// trained on the nested `{"type":"function","function":{…}}` envelope — so the
-    /// envelope belongs here rather than at each call site.
-    pub fn request_tools(&self, tools: &[Tool]) -> Value {
+    /// envelope belongs here rather than at each call site. `values` as in [`render`].
+    ///
+    /// [`render`]: Self::render
+    pub fn request_tools(&self, tools: &[Tool], values: Option<&ParamValues>) -> Value {
         Value::Array(
             tools
                 .iter()
-                .map(|t| json!({"type": "function", "function": self.render_tool(t)}))
+                .map(|t| json!({"type": "function", "function": self.render_tool(t, values)}))
                 .collect(),
         )
     }
@@ -300,7 +315,7 @@ mod tests {
     #[test]
     fn needle_flat_render_matches_the_native_shape() {
         let d = ToolDialect::default();
-        let s = d.render(TOOLS);
+        let s = d.render(TOOLS, None);
         assert!(s.contains(r#""name":"run_command""#));
         assert!(s.contains(r#""command":{"type":"string""#));
         assert!(s.contains(r#""required":true"#));
@@ -311,11 +326,46 @@ mod tests {
     fn openai_nested_render_and_name_rename() {
         let names = HashMap::from([("run_command".to_string(), "bash".to_string())]);
         let d = ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::JsonArray, names);
-        let s = d.render(TOOLS);
+        let s = d.render(TOOLS, None);
         assert!(s.contains(r#""name":"bash""#), "renamed to the exposed name");
         assert!(s.contains(r#""type":"object""#));
         assert!(s.contains(r#""properties""#));
         assert!(s.contains(r#""required":["command"]"#));
+    }
+
+    // The grammar value constraint rides a standard JSON-Schema `enum`
+    // (docs/todo/tool-call-judgement.md item 4). With no overlay the bytes are
+    // pinned — hipfire derives its ToolSchema from this block, so a stray key
+    // would change what every model sees.
+    #[test]
+    fn no_overlay_keeps_the_nested_render_byte_identical() {
+        let d = ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::JsonArray, HashMap::new());
+        assert_eq!(
+            d.render(TOOLS, None),
+            r#"[{"name":"run_command","description":"Run a shell command.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The command."}},"required":["command"]}}]"#
+        );
+    }
+
+    #[test]
+    fn values_overlay_adds_enum_only_where_named_and_only_nested() {
+        let overlay: ParamValues = HashMap::from([(
+            ("run_command".to_string(), "command".to_string()),
+            vec!["cargo test".to_string(), "cargo build".to_string()],
+        )]);
+        let nested =
+            ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::JsonArray, HashMap::new());
+        let s = nested.render(TOOLS, Some(&overlay));
+        assert!(s.contains(r#""enum":["cargo test","cargo build"]"#), "got: {s}");
+        // The request envelope carries the same overlay through.
+        let req = nested.request_tools(TOOLS, Some(&overlay)).to_string();
+        assert!(req.contains(r#""enum":["cargo test","cargo build"]"#), "got: {req}");
+        // A (tool, param) the overlay doesn't name is untouched.
+        let other: ParamValues =
+            HashMap::from([(("read_file".to_string(), "path".to_string()), vec!["x".into()])]);
+        assert_eq!(nested.render(TOOLS, Some(&other)), nested.render(TOOLS, None));
+        // The Needle-flat rendering ignores the overlay entirely.
+        let flat = ToolDialect::default();
+        assert_eq!(flat.render(TOOLS, Some(&overlay)), flat.render(TOOLS, None));
     }
 
     #[test]

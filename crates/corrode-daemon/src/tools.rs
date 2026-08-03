@@ -84,6 +84,11 @@ pub const EXEC_TOOLS: &[Tool] = &[
     },
 ];
 
+/// Hard cap on path-enum candidates for the grammar value constraint. hipfire's scan
+/// is O(vocab × candidates): 64 ≈ 400 ms per call (tolerable), 256+ stalls — measured
+/// in docs/todo/tool-call-judgement.md item 4. Over the cap sends NO path enum.
+const MAX_PATH_VALUES: usize = 64;
+
 /// Cap on how many bytes of a file a `read_file` observation carries back into the
 /// model's context — enough to be useful without blowing the window.
 const MAX_READ_BYTES: usize = 4096;
@@ -141,6 +146,69 @@ impl ToolBox {
             root,
             skill_scripts,
         }
+    }
+
+    /// Per-task value sets for the grammar value constraint (item 4 of
+    /// docs/todo/tool-call-judgement.md): `read_file`/`list_dir` paths from a VFS
+    /// walk, `run_skill_script` targets from the installed skills. `write_file.path`
+    /// and `run_command.command` are free text and must NEVER be constrained — a
+    /// closed set there would wedge generation. Recomputed per task execution (repo
+    /// state moves between tasks); the walk cap keeps it cheap.
+    pub async fn param_values(&self) -> crate::dialect::ParamValues {
+        let mut values = crate::dialect::ParamValues::new();
+        if let Some(paths) = self.walk_paths().await {
+            if !paths.is_empty() {
+                values.insert(("read_file".into(), "path".into()), paths.clone());
+                values.insert(("list_dir".into(), "path".into()), paths);
+            }
+        }
+        // Real `skill/script` pairs — the resolver's canonical form. A bare skill
+        // name is NOT resolvable (it would be read as a script filename), so a
+        // name-only enum would grammar-force strings that always fail.
+        let mut targets: Vec<String> = self
+            .skill_scripts
+            .iter()
+            .flat_map(|(name, dir)| {
+                std::fs::read_dir(dir.join("scripts"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| e.path().is_file())
+                    .filter_map(move |e| Some(format!("{name}/{}", e.file_name().to_str()?)))
+            })
+            .collect();
+        if !targets.is_empty() {
+            targets.sort();
+            values.insert(("run_skill_script".into(), "target".into()), targets);
+        }
+        values
+    }
+
+    /// Every repo path (files AND directories), breadth-first, `.git` and `target`
+    /// pruned (noise — `.git/revisions` must simply be absent, not enumerated).
+    /// `None` past [`MAX_PATH_VALUES`] or on any listing error: a partial enum would
+    /// make real paths unreachable, so over-cap falls back to no constraint and leans
+    /// on the corrective observations instead (items 2–3 of the TODO).
+    async fn walk_paths(&self) -> Option<Vec<String>> {
+        // "." seeds the set so the repo root itself stays a legal list_dir target.
+        let mut paths = vec![".".to_string()];
+        let mut queue = std::collections::VecDeque::from([String::new()]);
+        while let Some(dir) = queue.pop_front() {
+            for e in self.vfs.list(&dir).await.ok()? {
+                let name = e.path.rsplit('/').next().unwrap_or("");
+                if e.is_dir && matches!(name, ".git" | "target") {
+                    continue;
+                }
+                if paths.len() >= MAX_PATH_VALUES {
+                    return None;
+                }
+                if e.is_dir {
+                    queue.push_back(e.path.clone());
+                }
+                paths.push(e.path);
+            }
+        }
+        Some(paths)
     }
 
     /// Run one tool call and return an observation string (result or a readable error —
@@ -660,6 +728,71 @@ mod tests {
         // A path that exists but fails another way keeps the underlying error.
         let is_dir = read("src").await;
         assert!(is_dir.starts_with("error: could not read src:"), "got: {is_dir}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The values overlay (grammar value constraint, TODO item 4): paths for the
+    // read-only tools from a pruned recursive walk, skill names for run_skill_script,
+    // free-text params never constrained, and the hard cap dropping the path enum
+    // entirely (never partially) when the repo outgrows it.
+    #[tokio::test]
+    async fn param_values_walks_prunes_caps_and_never_constrains_free_text() {
+        let dir = std::env::temp_dir().join(format!("corrode-values-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join("readme.md"), b"d").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), b"x").unwrap();
+        std::fs::write(dir.join(".git/HEAD"), b"ref").unwrap();
+        std::fs::create_dir_all(dir.join("skill/scripts")).unwrap();
+        std::fs::write(dir.join("skill/scripts/test.sh"), b"#!/bin/sh").unwrap();
+        let mut skills = HashMap::new();
+        skills.insert("run-tests".to_string(), dir.join("skill"));
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(skills),
+        );
+
+        let v = toolbox.param_values().await;
+        let paths = v.get(&("read_file".into(), "path".into())).unwrap();
+        assert!(paths.contains(&".".to_string()), "root stays reachable: {paths:?}");
+        assert!(paths.contains(&"src".to_string()), "dirs included: {paths:?}");
+        assert!(paths.contains(&"src/lib.rs".to_string()), "recursive: {paths:?}");
+        assert!(paths.contains(&"readme.md".to_string()));
+        assert!(
+            !paths.iter().any(|p| p.starts_with(".git") || p.starts_with("target")),
+            ".git/target pruned, got: {paths:?}"
+        );
+        assert_eq!(v.get(&("list_dir".into(), "path".into())), Some(paths));
+        // The target enum carries resolver-canonical `skill/script` pairs — a bare
+        // skill name would be grammar-forced but never resolve.
+        assert_eq!(
+            v.get(&("run_skill_script".into(), "target".into())),
+            Some(&vec!["run-tests/test.sh".to_string()])
+        );
+        // Free-text params must never carry a constraint (TODO item 4's risk note).
+        assert!(v.get(&("write_file".into(), "path".into())).is_none());
+        assert!(v.get(&("run_command".into(), "command".into())).is_none());
+
+        // Over the cap: NO path enum at all (fallback to corrective observations),
+        // while the skill enum — small and closed — stays.
+        for i in 0..MAX_PATH_VALUES {
+            std::fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let v = toolbox.param_values().await;
+        assert!(v.get(&("read_file".into(), "path".into())).is_none());
+        assert!(v.get(&("list_dir".into(), "path".into())).is_none());
+        assert!(v.get(&("run_skill_script".into(), "target".into())).is_some());
+
+        // A walk error (unlistable root) also means no path constraint.
+        let broken = ToolBox::new(
+            Arc::new(PassthroughVfs::new(dir.join("gone"))),
+            dir.clone(),
+            Arc::new(HashMap::new()),
+        );
+        assert!(broken.param_values().await.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -111,6 +111,13 @@ impl Daemon {
     async fn handle(&self, cmd: AgentCommand, events: &mpsc::Sender<AgentEvent>) {
         match cmd {
             AgentCommand::Prompt { text, priority } => {
+                // The plan id exists before planning so TurnComplete is unconditional:
+                // clients wait on it as the turn's terminal signal on every exit path.
+                let plan_id = format!(
+                    "plan-{}",
+                    self.next_plan_id
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
                 let (subtasks, prefix) = match self.plan(&text, priority).await {
                     Ok(planned) => planned,
                     Err(e) => {
@@ -119,6 +126,7 @@ impl Daemon {
                                 message: format!("planning failed: {e}"),
                             })
                             .await;
+                        let _ = events.send(AgentEvent::TurnComplete { plan_id }).await;
                         return;
                     }
                 };
@@ -128,11 +136,6 @@ impl Daemon {
                 // as agents emit follow-up work (a test contract, a research spin-off) —
                 // dataflow, not a fixed fan-out. Real concurrency is hipfire's to bound
                 // (admission control against its VRAM budget); nothing is capped here.
-                let plan_id = format!(
-                    "plan-{}",
-                    self.next_plan_id
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                );
                 let mut graph = plan_graph::PlanGraph::new(&plan_id);
                 for s in subtasks {
                     graph.add(s.role, s.prompt, Vec::new());
@@ -261,6 +264,10 @@ impl Daemon {
                 // Persist the plan's provenance (plan <- task/contract <- code) to the
                 // graph store, so the code<->task<->plan lineage is queryable.
                 self.persist_provenance(&graph);
+
+                // The turn's end is explicit: clients (and the e2e) wait on this
+                // event, not on the stream going quiet.
+                let _ = events.send(AgentEvent::TurnComplete { plan_id }).await;
             }
             AgentCommand::DocQuery { question } => {
                 let ev = match &self.graph {
@@ -450,6 +457,10 @@ const FANOUT_EXTRA_GRACE: std::time::Duration = std::time::Duration::from_secs(1
 /// Byte cap per task output in the plan-review digest.
 const REVIEW_OUTPUT_CAP: usize = 2048;
 
+/// Byte cap on a `ToolResult` event's observation — bounds the event stream only;
+/// the model's scratchpad still gets the full text.
+const TOOL_RESULT_CAP: usize = 2048;
+
 /// `CORRODE_FANOUT`: how many read-only proposal attempts a coder task fans out
 /// before executing (1 = off, today's single-shot behavior).
 /// ponytail: clamped to 8 — hipfire's admission control is the real limit; raise
@@ -531,43 +542,57 @@ impl SeenCalls {
 /// speculative attempts never spam the human.
 ///
 /// Shared by both loops — the gate must not depend on how the call was produced.
+/// Every outcome (executed, suppressed repeat, denied, read-only note) is streamed
+/// as a `ToolResult` for subagent `id` before it returns, capped for the wire.
 async fn gate_and_execute(
     call: &crate::toolcall::ToolCall,
     toolbox: &ToolBox,
     approvals: &ApprovalGate,
     events: &mpsc::Sender<AgentEvent>,
+    id: u64,
     written: &mut Vec<String>,
     seen: &mut SeenCalls,
     read_only: bool,
 ) -> String {
-    if let Some(prior) = seen.repeat(call) {
-        return prior;
-    }
-    if read_only && crate::tools::is_mutating(call) {
+    let observation = if let Some(prior) = seen.repeat(call) {
+        prior
+    } else if read_only && crate::tools::is_mutating(call) {
         let note = format!(
             "read-only pass: {} was not executed. Describe the change in your final \
              answer instead — a reviewer picks what gets implemented.",
             crate::tools::describe(call)
         );
         seen.record(call, &note);
-        return note;
-    }
-    if crate::tools::is_mutating(call)
+        note
+    } else if crate::tools::is_mutating(call)
         && !approvals
             .request(events, crate::tools::describe(call))
             .await
     {
         let denied = format!("denied: {} was not approved", crate::tools::describe(call));
         seen.record(call, &denied);
-        return denied;
-    }
-    let observation = toolbox.execute(call).await;
-    if call.name == "write_file" && observation.starts_with("wrote") {
-        if let Some(path) = call.arguments.get("path").and_then(|p| p.as_str()) {
-            written.push(path.to_string());
+        denied
+    } else {
+        let observation = toolbox.execute(call).await;
+        if call.name == "write_file" && observation.starts_with("wrote") {
+            if let Some(path) = call.arguments.get("path").and_then(|p| p.as_str()) {
+                written.push(path.to_string());
+            }
         }
+        seen.record(call, &observation);
+        observation
+    };
+    let mut shown = observation.clone();
+    if shown.len() > TOOL_RESULT_CAP {
+        shown.truncate(crate::tools::floor_char_boundary(&shown, TOOL_RESULT_CAP));
     }
-    seen.record(call, &observation);
+    let _ = events
+        .send(AgentEvent::ToolResult {
+            id,
+            call: crate::tools::describe(call),
+            observation: shown,
+        })
+        .await;
     observation
 }
 
@@ -597,7 +622,18 @@ async fn run_native_tool_loop(
     written: &mut Vec<String>,
     read_only: bool,
 ) -> anyhow::Result<String> {
-    let tools = dialect.request_tools(crate::tools::EXEC_TOOLS);
+    // Per-task values overlay: params with a closed, known set (read/list paths,
+    // skill targets) carry a JSON-Schema `enum`, which hipfire's grammar turns into
+    // a hard constraint — an invented path becomes unreachable, not merely corrected
+    // after the fact. ponytail: computed once per task — a within-task write can add
+    // a path the enum lacks (the model then can't read it back this task); recompute
+    // per step after a successful mutating call if that measurably bites. Also: the
+    // tools JSON renders ahead of the shared prefix, so once a mid-turn write lands,
+    // later tasks' tools bytes diverge and KV prefix-sharing splits for the rest of
+    // the turn (CLAUDE.md constraint 2) — accepted; a per-turn overlay would make
+    // fanout attempts blind to each other's era instead.
+    let values = toolbox.param_values().await;
+    let tools = dialect.request_tools(crate::tools::EXEC_TOOLS, Some(&values));
     let effort = std::env::var("CORRODE_REASONING_EFFORT").unwrap_or_else(|_| "none".to_string());
     let mut scratchpad = String::new();
     let mut last = String::new();
@@ -620,7 +656,7 @@ async fn run_native_tool_loop(
             return Ok(text); // no call -> this turn is the final answer
         };
         let observation =
-            gate_and_execute(call, &toolbox, approvals, events, written, &mut seen, read_only)
+            gate_and_execute(call, &toolbox, approvals, events, id, written, &mut seen, read_only)
                 .await;
         scratchpad.push_str(&format!(
             "\nCALLED: {}\nRESULT: {observation}\n",
@@ -658,7 +694,7 @@ async fn run_tool_loop(
     // Render the exec toolset in the tool-call model's dialect once; parse each reply
     // with the same dialect (which maps its tool names back to canonical).
     let dialect = dialects.resolve(caller.model_id());
-    let schema = dialect.render(crate::tools::EXEC_TOOLS);
+    let schema = dialect.render(crate::tools::EXEC_TOOLS, None);
     let mut scratchpad = String::new();
     let mut last = String::new();
     let mut seen = SeenCalls::default();
@@ -687,8 +723,10 @@ async fn run_tool_loop(
         let observation = match raw.map(|r| r.and_then(|raw| dialect.parse(&raw))) {
             Ok(Ok(calls)) => match calls.first() {
                 Some(c) => {
-                    gate_and_execute(c, &toolbox, approvals, events, written, &mut seen, read_only)
-                        .await
+                    gate_and_execute(
+                        c, &toolbox, approvals, events, id, written, &mut seen, read_only,
+                    )
+                    .await
                 }
                 None => "error: no tool call produced".to_string(),
             },
@@ -879,7 +917,7 @@ async fn emit_followups(
         Some(caller) => {
             // Render the role tools in the caller's dialect, classify, parse back.
             let dialect = dialects.resolve(caller.model_id());
-            let schema = dialect.render(plan_graph::ROLE_TOOLS);
+            let schema = dialect.render(plan_graph::ROLE_TOOLS, None);
             let query = instruction.clone();
             let raw =
                 tokio::task::spawn_blocking(move || caller.generate(&query, &schema)).await;
@@ -1053,12 +1091,20 @@ mod tests {
         // request, this would block on a oneshot nobody resolves — fail, don't hang.
         let obs = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            gate_and_execute(&write, &toolbox, &approvals, &tx, &mut written, &mut seen, true),
+            gate_and_execute(&write, &toolbox, &approvals, &tx, 0, &mut written, &mut seen, true),
         )
         .await
         .expect("read-only gate must not block on approval");
         assert!(obs.starts_with("read-only pass:"), "got: {obs}");
         assert!(written.is_empty(), "no artifact from a blocked write");
+        // The only event is the ToolResult trace — never an ApprovalRequest.
+        match rx.try_recv().expect("a ToolResult event") {
+            AgentEvent::ToolResult { call, observation, .. } => {
+                assert!(call.starts_with("write_file"), "got: {call}");
+                assert!(observation.starts_with("read-only pass:"), "got: {observation}");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
         assert!(rx.try_recv().is_err(), "no approval request was emitted");
         assert_eq!(std::fs::read(dir.join("lib.rs")).unwrap(), b"fn f() {}");
 
@@ -1067,9 +1113,13 @@ mod tests {
             arguments: serde_json::json!({"path": "lib.rs"}),
         };
         let obs =
-            gate_and_execute(&read, &toolbox, &approvals, &tx, &mut written, &mut seen, true)
+            gate_and_execute(&read, &toolbox, &approvals, &tx, 0, &mut written, &mut seen, true)
                 .await;
         assert!(obs.contains("fn f() {}"), "got: {obs}");
+        assert!(
+            matches!(rx.try_recv(), Ok(AgentEvent::ToolResult { .. })),
+            "the executed read is traced too"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1133,7 +1183,7 @@ mod tests {
             .expect("Needle assets present");
         let dialect = ToolDialect::default();
         let raw = caller
-            .generate("read the file src/lib.rs", &dialect.render(EXEC_TOOLS))
+            .generate("read the file src/lib.rs", &dialect.render(EXEC_TOOLS, None))
             .expect("generation");
         let calls = dialect.parse(&raw).expect("parse");
         eprintln!("calls: {calls:?}");
@@ -1175,7 +1225,7 @@ mod tests {
         let raw = caller
             .generate(
                 "run the test.sh script from the run-tests skill",
-                &dialect.render(EXEC_TOOLS),
+                &dialect.render(EXEC_TOOLS, None),
             )
             .expect("generation");
         let calls = dialect.parse(&raw).expect("parse");
@@ -1197,8 +1247,8 @@ mod tests {
     //   HIPFIRE_BASE_URL=http://host:11435 CORRODE_MODEL=<id> \
     //     cargo test -p corrode-daemon --features needle -- --ignored --nocapture
     //
-    // ponytail: the turn is "done" when events go quiet — there's no turn-complete event
-    // to wait on. Add one (AgentEvent::TurnComplete) and this drops the idle timeout.
+    // The turn's end is explicit (AgentEvent::TurnComplete): the drain exits on it,
+    // and the per-event timeout is only a guard against a wedged run.
     #[cfg(feature = "needle")]
     #[tokio::test]
     #[ignore = "requires a live hipfire + Needle assets + the demo-repo submodule"]
@@ -1249,9 +1299,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Drain until the turn settles, approving any mutating call the swarm proposes
+        // Drain until TurnComplete, approving any mutating call the swarm proposes
         // (unattended: nothing here would answer the gate otherwise, and it fails closed).
         let (mut outputs, mut approvals, mut errors) = (Vec::new(), Vec::new(), Vec::new());
+        let mut tool_results: Vec<(String, String)> = Vec::new();
         while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(120), erx.recv()).await {
             match ev {
                 AgentEvent::SubagentOutput { id, text } => {
@@ -1265,6 +1316,14 @@ mod tests {
                         .await
                         .unwrap();
                 }
+                AgentEvent::ToolResult { id, call, observation } => {
+                    eprintln!("--- tool [{id}] {call} -> {observation}");
+                    tool_results.push((call, observation));
+                }
+                AgentEvent::TurnComplete { plan_id } => {
+                    eprintln!("--- turn {plan_id} complete");
+                    break;
+                }
                 AgentEvent::Error { message } => {
                     eprintln!("--- error: {message}");
                     errors.push(message);
@@ -1275,8 +1334,9 @@ mod tests {
         drop(ctx);
 
         eprintln!(
-            "settled: {} outputs, {} approvals, {} errors",
+            "settled: {} outputs, {} tool results, {} approvals, {} errors",
             outputs.len(),
+            tool_results.len(),
             approvals.len(),
             errors.len()
         );
@@ -1285,6 +1345,44 @@ mod tests {
         // Whether the small model actually drove a tool is a property of the model +
         // the tool-loop prompt, not of this wiring — reported above, asserted in the
         // Needle tests, deliberately not asserted here.
+
+        // Structural guarantees the event stream carries regardless of what the model
+        // chose to do:
+        // (1) A hallucinated read/list path comes back as the corrective observation
+        //     ("no such path …"), never the raw errno. Scoped to read_file/list_dir —
+        //     a shell command's own output may legitimately contain the errno text.
+        for (call, obs) in &tool_results {
+            if call.starts_with("read_file") || call.starts_with("list_dir") {
+                assert!(
+                    !obs.contains("No such file or directory"),
+                    "raw errno leaked past the corrective path: {call} -> {obs}"
+                );
+            }
+        }
+        // (2) Repeat suppression: an exact repeat within a task is answered from
+        //     memory (the "already tried" note) without re-executing — so every
+        //     *executed* mutating result burned exactly one approval. Events carry no
+        //     task id, so "at most one executed observation per duplicate call" can't
+        //     be asserted soundly across tasks (two tasks may legitimately run the
+        //     same call, each with its own approval); the sound global form is that
+        //     executed mutating results never exceed the approvals granted.
+        let executed_mutating = tool_results
+            .iter()
+            .filter(|(call, obs)| {
+                ["write_file", "run_command", "run_skill_script"]
+                    .iter()
+                    .any(|m| call.starts_with(m))
+                    && !obs.starts_with("note: this exact call was already tried")
+                    && !obs.starts_with("read-only pass:")
+                    && !obs.starts_with("denied:")
+            })
+            .count();
+        assert!(
+            executed_mutating <= approvals.len(),
+            "{executed_mutating} executed mutating tool results but only {} approvals — \
+             a suppressed repeat must not have executed",
+            approvals.len()
+        );
     }
 
     // The native path, end to end and Needle-free: Corrode declares its own tools on the
@@ -1323,7 +1421,7 @@ mod tests {
                 ParseFormat::MiniCpmXml,
                 std::collections::HashMap::new(),
             )
-            .render(EXEC_TOOLS))
+            .render(EXEC_TOOLS, None))
             .expect("rendered tools are JSON");
         let tools = serde_json::Value::Array(
             rendered
