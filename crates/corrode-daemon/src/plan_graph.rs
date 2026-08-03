@@ -23,6 +23,14 @@ pub type TaskId = u64;
 /// Byte cap on a provenance node's label (the task prompt can be arbitrarily long).
 const LABEL_CAP: usize = 200;
 
+/// Total tasks a plan may grow to (seeded + emitted). The initial plan is capped at
+/// [`crate::planner`]'s MAX_SUBTASKS, but emitted follow-ups were unbounded — and a
+/// swarm whose tasks reliably succeed emits a self-sustaining chain (measured: 65
+/// emissions and 80 minutes on a one-line prompt once the value constraints made
+/// tool calls stop dead-ending). Emissions past the cap are dropped.
+/// ponytail: fixed cap — make it budget-aware with per-request cost when tracked.
+const MAX_PLAN_TASKS: usize = 24;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Pending,
@@ -339,6 +347,10 @@ where
         }
         graph.set_artifacts(id, outcome.artifacts); // code nodes this task produced
         for emit in outcome.emitted {
+            if graph.nodes.len() >= MAX_PLAN_TASKS {
+                eprintln!("plan {}: task budget ({MAX_PLAN_TASKS}) reached, dropping emission", graph.plan_id);
+                break;
+            }
             let deps = if emit.after_emitter { vec![id] } else { vec![] };
             let emitted_id = graph.add(emit.role, emit.prompt, deps);
             graph.set_emitted_by(emitted_id, id); // the emitted task is a contract of `id`
@@ -564,6 +576,34 @@ mod tests {
 
         // Nothing done -> nothing to review.
         assert!(PlanGraph::default().review_digest(4096).is_none());
+    }
+
+    // A task chain that never dries on its own (every task emits a follow-up) must
+    // settle at the plan's task budget instead of running forever.
+    #[tokio::test]
+    async fn emission_chain_settles_at_the_task_budget() {
+        let mut g = PlanGraph::new("plan-cap");
+        g.add(Role::Coder, "task 0", vec![]);
+        let ran = Arc::new(Mutex::new(0usize));
+        let counter = ran.clone();
+        run_reactive(&mut g, move |_task: PlanTask| {
+            let counter = counter.clone();
+            async move {
+                *counter.lock().unwrap() += 1;
+                Outcome {
+                    output: Ok("done".into()),
+                    emitted: vec![Emit {
+                        role: Role::Coder,
+                        prompt: "again".into(),
+                        after_emitter: true,
+                    }],
+                    artifacts: vec![],
+                }
+            }
+        })
+        .await;
+        assert_eq!(*ran.lock().unwrap(), MAX_PLAN_TASKS, "settles exactly at the budget");
+        assert!(g.stuck().is_empty());
     }
 
     // The digest caps outputs on a char boundary (no mid-multibyte panic) and names

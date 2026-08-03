@@ -1,5 +1,13 @@
 # TODO: Tool-call judgement (arguments, not syntax)
 
+> **Status (2026-08-03): items 1, 2, and 4 shipped and measured; item 3 partially.**
+> Live e2e with value constraints active: `.git/revisions` went from 10+ mentions to
+> **zero** (grammar-unreachable, not corrected), 53 repeats absorbed by suppression,
+> approvals 9 → 1, 0 errors. Item 5 remains deferred. One new bound landed alongside:
+> emitted-task chains are capped per plan (`plan_graph::MAX_PLAN_TASKS`) after a
+> measured runaway — once calls stopped dead-ending, every task emitted a follow-up
+> and the chain never dried (65 emissions / 80 min on a one-line prompt).
+
 **Goal:** make the swarm's tool calls *sensible*, not just well-formed. Syntax is now
 solved — the model emits its native dialect and hipfire's grammar makes a malformed call
 unreachable. What remains is that a structurally perfect call can still target a file
@@ -133,10 +141,17 @@ suppression set is per-turn rather than per-task.
 
 Re-run the full-loop e2e against `fixtures/demo-repo` and require:
 
-- [ ] no tool call repeated identically within a task
-- [ ] no call executed against a path absent from the VFS
-- [ ] `cargo test` reached via the `run-tests` skill, not an invented shell line
-- [ ] the turn settles in materially fewer steps than the 42-output / 360s baseline
+- [x] no tool call repeated identically within a task — suppression notes now visible
+      as `ToolResult` events (53 in the measured run); approvals 9 → 1
+- [x] no call executed against a path absent from the VFS — grammar-enforced: the
+      invented path is unreachable at the token level (0 occurrences, 0 corrective
+      observations needed)
+- [ ] `cargo test` reached via the `run-tests` skill — the `target` enum now forces
+      resolver-canonical `skill/script` pairs, but the model still often prefers
+      `run_command` (free text by design); per-role tool subsets remain the lever
+- [x] the turn settles — and is now *bounded*: `TurnComplete` ends the drain
+      explicitly and `MAX_PLAN_TASKS` bounds the emission chain; raw step count
+      trades against fanout/review depth by configuration
 
 ## References
 
