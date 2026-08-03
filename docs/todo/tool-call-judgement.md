@@ -1,6 +1,8 @@
 # TODO: Tool-call judgement (arguments, not syntax)
 
-> **Status (2026-08-03): items 1, 2, and 4 shipped and measured; item 3 partially.**
+> **Status (2026-08-03): items 1–4 shipped and measured; all acceptance boxes but
+> one closed, and the last (skill-routed verification) closed with per-role tool
+> subsets — the measured run's only approval was the run-tests skill itself.**
 > Live e2e with value constraints active: `.git/revisions` went from 10+ mentions to
 > **zero** (grammar-unreachable, not corrected), 53 repeats absorbed by suppression,
 > approvals 9 → 1, 0 errors. Item 5 remains deferred. One new bound landed alongside:
@@ -146,9 +148,10 @@ Re-run the full-loop e2e against `fixtures/demo-repo` and require:
 - [x] no call executed against a path absent from the VFS — grammar-enforced: the
       invented path is unreachable at the token level (0 occurrences, 0 corrective
       observations needed)
-- [ ] `cargo test` reached via the `run-tests` skill — the `target` enum now forces
-      resolver-canonical `skill/script` pairs, but the model still often prefers
-      `run_command` (free text by design); per-role tool subsets remain the lever
+- [x] `cargo test` reached via the `run-tests` skill — per-role tool subsets
+      (`tools::role_tools`) removed raw shell from every non-coder role, and the
+      measured run's ONLY approval was `run_skill_script run-tests/test.sh`
+      (grammar-forced to the resolver-canonical target); zero junk shell lines
 - [x] the turn settles — and is now *bounded*: `TurnComplete` ends the drain
       explicitly and `MAX_PLAN_TASKS` bounds the emission chain; raw step count
       trades against fanout/review depth by configuration

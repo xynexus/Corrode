@@ -44,6 +44,19 @@ pub const EXEC_TOOLS: &[Tool] = &[
             required: true,
         }],
     },
+    // Order is load-bearing: role_tools slices contiguous prefixes off this array
+    // (observe | +skills | full), so the read-only pair leads, skills sit before the
+    // sharp mutating pair.
+    Tool {
+        name: "run_skill_script",
+        description: "Run a script bundled with an installed skill.",
+        params: &[Param {
+            name: "target",
+            ty: "string",
+            description: "The skill and script as skill/script (e.g. impeccable/hook.mjs), or just the script name.",
+            required: true,
+        }],
+    },
     Tool {
         name: "write_file",
         description: "Create or overwrite a file with the given contents.",
@@ -72,17 +85,24 @@ pub const EXEC_TOOLS: &[Tool] = &[
             required: true,
         }],
     },
-    Tool {
-        name: "run_skill_script",
-        description: "Run a script bundled with an installed skill.",
-        params: &[Param {
-            name: "target",
-            ty: "string",
-            description: "The skill and script as skill/script (e.g. impeccable/hook.mjs), or just the script name.",
-            required: true,
-        }],
-    },
 ];
+
+/// The exec tools a role may use. Harness-enforced, not suggested: the declared set
+/// is all the grammar (native path) or the rendered schema (Needle path) can ever
+/// produce, so an out-of-role call is unreachable rather than discouraged.
+/// Research/architect observe; review verifies through skills — `run_command` was
+/// its measured misuse (docs/todo/tool-call-judgement.md item 3) — and only the
+/// coder gets the full set. Costs cross-role KV sharing: the tools JSON renders
+/// ahead of the shared prefix, so roles with different sets no longer prefix-share
+/// on a common model (within-role sharing, including fan-out attempts, is intact).
+pub fn role_tools(role: crate::roles::Role) -> &'static [Tool] {
+    use crate::roles::Role;
+    match role {
+        Role::Coder => EXEC_TOOLS,
+        Role::Review => &EXEC_TOOLS[..3],
+        Role::Research | Role::Architect | Role::Orchestration => &EXEC_TOOLS[..2],
+    }
+}
 
 /// Hard cap on path-enum candidates for the grammar value constraint. hipfire's scan
 /// is O(vocab × candidates): 64 ≈ 400 ms per call (tolerable), 256+ stalls — measured
@@ -588,6 +608,34 @@ mod tests {
         assert!(format_command_output(out).contains("truncated"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The role subsets are the enforcement: observing roles get zero mutating tools
+    // (they can never block on approval), review verifies through skills but has no
+    // raw shell, and only the coder holds the full set. Guards the slice indices
+    // against an EXEC_TOOLS reorder.
+    #[test]
+    fn role_tools_slice_by_privilege() {
+        use crate::roles::Role;
+        let names = |r| {
+            role_tools(r)
+                .iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(Role::Coder).len(), EXEC_TOOLS.len());
+        assert_eq!(names(Role::Review), vec!["read_file", "list_dir", "run_skill_script"]);
+        for role in [Role::Research, Role::Architect, Role::Orchestration] {
+            assert!(
+                role_tools(role).iter().all(|t| {
+                    !is_mutating(&ToolCall {
+                        name: t.name.into(),
+                        arguments: serde_json::json!({}),
+                    })
+                }),
+                "{role:?} must hold no mutating tool"
+            );
+        }
     }
 
     #[test]

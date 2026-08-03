@@ -633,7 +633,7 @@ async fn run_native_tool_loop(
     // the turn (CLAUDE.md constraint 2) — accepted; a per-turn overlay would make
     // fanout attempts blind to each other's era instead.
     let values = toolbox.param_values().await;
-    let tools = dialect.request_tools(crate::tools::EXEC_TOOLS, Some(&values));
+    let tools = dialect.request_tools(crate::tools::role_tools(role), Some(&values));
     let effort = std::env::var("CORRODE_REASONING_EFFORT").unwrap_or_else(|_| "none".to_string());
     let mut scratchpad = String::new();
     let mut last = String::new();
@@ -694,7 +694,7 @@ async fn run_tool_loop(
     // Render the exec toolset in the tool-call model's dialect once; parse each reply
     // with the same dialect (which maps its tool names back to canonical).
     let dialect = dialects.resolve(caller.model_id());
-    let schema = dialect.render(crate::tools::EXEC_TOOLS, None);
+    let schema = dialect.render(crate::tools::role_tools(role), None);
     let mut scratchpad = String::new();
     let mut last = String::new();
     let mut seen = SeenCalls::default();

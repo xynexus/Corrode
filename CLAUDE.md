@@ -217,6 +217,10 @@ path unchanged. Path args come through Needle cleanly (paths tokenize well); too
 *selection* sharpens with the planned finetune. `Daemon`'s `vfs` is `Arc<dyn Vfs>` so the
 loop's `'static` future owns a clone.
 
+Tools are **per-role subsets** (`tools::role_tools`), harness-enforced: the declared
+set is all the grammar/schema can produce, so an out-of-role call is unreachable.
+Research/architect observe (read-only — never block on approval); review adds
+`run_skill_script` but has no raw shell; only the coder gets the full set.
 Tools: `read_file`, `list_dir` (read-only) run straight through; `write_file`,
 `run_command`, and `run_skill_script` (run a skill's bundled `scripts/`, resolved by a
 `skill/script` or bare-script `target`) are **mutating/executing** (`tools::is_mutating`)
