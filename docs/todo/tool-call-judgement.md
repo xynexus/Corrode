@@ -1,8 +1,11 @@
 # TODO: Tool-call judgement (arguments, not syntax)
 
-> **Status (2026-08-03): items 1–4 shipped and measured; all acceptance boxes but
-> one closed, and the last (skill-routed verification) closed with per-role tool
-> subsets — the measured run's only approval was the run-tests skill itself.**
+> **Status (2026-08-03): all five items shipped. Items 1–4 measured (all acceptance
+> boxes closed); item 5 landed as the turn-shared observation memory — one
+> `SeenCalls` per Prompt turn, siblings served from cache, a mutating call gated
+> once per turn, and a swarm-activity digest in every launching task's tail (KV
+> prefix untouched). Fan-out attempts keep private maps so read-only notes can't
+> suppress the real execution.**
 > Live e2e with value constraints active: `.git/revisions` went from 10+ mentions to
 > **zero** (grammar-unreachable, not corrected), 53 repeats absorbed by suppression,
 > approvals 9 → 1, 0 errors. Item 5 remains deferred. One new bound landed alongside:
@@ -136,6 +139,16 @@ knowledge, not its own blank scratchpad.
 
 Defer until 1–4 land: it is the largest change and partly subsumed by (1) once the
 suppression set is per-turn rather than per-task.
+
+**Shipped exactly that way**: the item-1 map became per-turn (`SeenCalls` behind an
+`Arc<Mutex>` shared by every task's loops), so a sibling's identical call returns the
+cached observation, and a mutating call faces the human once per turn. On top, the
+map keeps an execution-ordered activity log whose digest (newest 20 lines) rides
+each launching task's *tail*, so tasks start from the swarm's knowledge without
+touching the byte-identical shared prefix. Invalidation carries over: a successful
+mutating call drops both the cache and the advertised log. Fan-out proposal
+attempts deliberately keep private maps — their "read-only pass" notes must never
+suppress the turn's real, writable execution of the same call.
 
 ---
 

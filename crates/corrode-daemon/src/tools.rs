@@ -128,6 +128,14 @@ pub fn is_mutating(call: &ToolCall) -> bool {
 /// prompt so a person knows exactly what they're authorizing.
 pub fn describe(call: &ToolCall) -> String {
     match call.name.as_str() {
+        "read_file" => format!(
+            "read_file {}",
+            arg_str(call, "path").unwrap_or("<missing path>")
+        ),
+        "list_dir" => format!(
+            "list_dir {}",
+            arg_str(call, "path").unwrap_or("<missing path>")
+        ),
         "write_file" => format!(
             "write_file {}",
             arg_str(call, "path").unwrap_or("<missing path>")

@@ -217,6 +217,11 @@ path unchanged. Path args come through Needle cleanly (paths tokenize well); too
 *selection* sharpens with the planned finetune. `Daemon`'s `vfs` is `Arc<dyn Vfs>` so the
 loop's `'static` future owns a clone.
 
+Observation memory is **turn-wide** (`SeenCalls`, one per Prompt turn, shared by all
+tasks): a sibling's identical call is served from cache, a mutating call is
+approval-gated once per turn, a successful mutation invalidates everything, and each
+launching task's tail carries a digest of the swarm's activity so far (the shared
+prefix stays byte-identical). Fan-out attempts keep private maps.
 Tools are **per-role subsets** (`tools::role_tools`), harness-enforced: the declared
 set is all the grammar/schema can produce, so an out-of-role call is unreachable.
 Research/architect observe (read-only — never block on approval); review adds

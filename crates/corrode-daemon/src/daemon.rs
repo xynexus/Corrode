@@ -147,6 +147,11 @@ impl Daemon {
                     .model_for(Role::Review)
                     .unwrap_or_default()
                     .to_string();
+                // One observation memory for the whole turn (TODO item 5): every
+                // task shares it, so siblings get cached results instead of
+                // re-executing, and each launching task's tail carries a digest of
+                // what the swarm already did.
+                let turn_seen = Arc::new(std::sync::Mutex::new(SeenCalls::default()));
                 let execute = |task: plan_graph::PlanTask| {
                     let client = self.swarm.client();
                     let model = self
@@ -166,7 +171,13 @@ impl Daemon {
                     let dialects = Arc::clone(&self.dialects);
                     let id = task.id;
                     let role = task.role;
-                    let prompt = task.prompt.clone();
+                    // The swarm-knowledge digest rides the divergent tail — the
+                    // shared prefix stays byte-identical (KV reuse).
+                    let seen = Arc::clone(&turn_seen);
+                    let prompt = match seen.lock().unwrap().digest(TURN_DIGEST_LINES) {
+                        Some(d) => format!("{}\n\n{d}", task.prompt),
+                        None => task.prompt.clone(),
+                    };
                     async move {
                         // `artifacts` collects the files a tool-loop task wrote (its code
                         // nodes in provenance). Coder tasks fan out K read-only proposal
@@ -191,6 +202,7 @@ impl Daemon {
                                 &events,
                                 id,
                                 &mut artifacts,
+                                &seen,
                             )
                             .await
                         } else {
@@ -209,6 +221,7 @@ impl Daemon {
                                 id,
                                 &mut artifacts,
                                 false,
+                                &seen,
                             )
                             .await
                         };
@@ -481,15 +494,23 @@ fn plan_review_enabled() -> bool {
     )
 }
 
-/// Per-task memory of tool calls already made, keyed on (tool, canonical args).
-/// The model provably ignores fed-back errors (the same failing `run_command` was
-/// observed re-issued 3×, burning 3 approval prompts), so repeats are suppressed by
-/// the harness: skip the gate and execution, return the prior observation plus a note
-/// that the next step must differ. A successful mutating call clears the memory —
-/// repo state changed, so a legitimate re-read after a write is never suppressed.
-/// ponytail: per-task, not per-turn; TODO item 5 widens this to the swarm.
+/// Turn-wide memory of tool calls already made, keyed on (tool, canonical args) —
+/// TODO item 5: one map is shared by every task in a Prompt turn, so a sibling
+/// re-asking what the swarm already learned gets the cached observation instead of
+/// re-executing (and a mutating call is gated — or denied — once per turn, not once
+/// per task). The model provably ignores fed-back errors (the same failing
+/// `run_command` was observed re-issued 3×), so repeats are suppressed by the
+/// harness. A successful mutating call clears everything — repo state changed, so a
+/// legitimate re-read after a write is never suppressed. `log` keeps execution
+/// order; its digest rides each launching task's *tail* (the shared prefix stays
+/// byte-identical), so tasks start from the swarm's knowledge, not a blank slate.
+/// Fan-out proposal attempts keep PRIVATE maps: their "read-only pass" notes must
+/// never suppress the real, writable execution of the same call.
 #[derive(Default)]
-struct SeenCalls(std::collections::HashMap<String, String>);
+struct SeenCalls {
+    seen: std::collections::HashMap<String, String>,
+    log: Vec<String>,
+}
 
 impl SeenCalls {
     /// Key with object keys sorted at every level, so semantically identical calls
@@ -509,28 +530,56 @@ impl SeenCalls {
         format!("{} {}", call.name, canon(&call.arguments))
     }
 
-    /// The prior observation for an exact repeat, wrapped in the already-tried note.
+    /// The prior observation for an exact repeat, wrapped in the already-made note.
     fn repeat(&self, call: &crate::toolcall::ToolCall) -> Option<String> {
-        self.0.get(&Self::key(call)).map(|obs| {
+        self.seen.get(&Self::key(call)).map(|obs| {
             format!(
-                "note: this exact call was already tried; its result is repeated below \
-                 unchanged. Do not repeat it — your next step must differ.\n{obs}"
+                "note: this exact call was already made this turn (by you or a \
+                 sibling task); its result is repeated below unchanged. Do not \
+                 repeat it — take a different next step.\n{obs}"
             )
         })
     }
 
     /// Record a call's observation. A mutating call that actually ran (`wrote …` /
-    /// `exit 0:`) invalidates everything first; failed or denied ones stay recorded
-    /// so their repeats are suppressed too.
+    /// `exit 0:`) invalidates everything first — including the advertised log, which
+    /// would otherwise sell stale knowledge; failed or denied ones stay recorded so
+    /// their repeats are suppressed too.
     fn record(&mut self, call: &crate::toolcall::ToolCall, observation: &str) {
         if crate::tools::is_mutating(call)
             && (observation.starts_with("wrote") || observation.starts_with("exit 0:"))
         {
-            self.0.clear();
+            self.seen.clear();
+            self.log.clear();
         }
-        self.0.insert(Self::key(call), observation.to_string());
+        let first = observation.lines().next().unwrap_or("");
+        let end = crate::tools::floor_char_boundary(first, LOG_LINE_CAP);
+        self.log
+            .push(format!("{} -> {}", crate::tools::describe(call), &first[..end]));
+        self.seen.insert(Self::key(call), observation.to_string());
+    }
+
+    /// The turn's activity so far (newest `max` lines) for a launching task's tail.
+    fn digest(&self, max: usize) -> Option<String> {
+        if self.log.is_empty() {
+            return None;
+        }
+        let start = self.log.len().saturating_sub(max);
+        let mut d = String::from(
+            "Already done this turn by the swarm (an identical call returns its cached \
+             result instantly):\n",
+        );
+        for line in &self.log[start..] {
+            d.push_str(line);
+            d.push('\n');
+        }
+        Some(d)
     }
 }
+
+/// Newest activity lines a launching task sees, and the byte cap per line.
+const TURN_DIGEST_LINES: usize = 20;
+const LOG_LINE_CAP: usize = 96;
 
 #[allow(clippy::too_many_arguments)]
 /// Run one tool call: an exact repeat short-circuits to its prior observation (see
@@ -551,10 +600,14 @@ async fn gate_and_execute(
     events: &mpsc::Sender<AgentEvent>,
     id: u64,
     written: &mut Vec<String>,
-    seen: &mut SeenCalls,
+    seen: &std::sync::Mutex<SeenCalls>,
     read_only: bool,
 ) -> String {
-    let observation = if let Some(prior) = seen.repeat(call) {
+    // The map is turn-shared across concurrent tasks: lock only around map ops,
+    // never across an await (the approval gate can block for minutes). Two tasks
+    // racing the same fresh call may both execute — benign, same as pre-sharing.
+    let prior = seen.lock().unwrap().repeat(call);
+    let observation = if let Some(prior) = prior {
         prior
     } else if read_only && crate::tools::is_mutating(call) {
         let note = format!(
@@ -562,7 +615,7 @@ async fn gate_and_execute(
              answer instead — a reviewer picks what gets implemented.",
             crate::tools::describe(call)
         );
-        seen.record(call, &note);
+        seen.lock().unwrap().record(call, &note);
         note
     } else if crate::tools::is_mutating(call)
         && !approvals
@@ -570,7 +623,7 @@ async fn gate_and_execute(
             .await
     {
         let denied = format!("denied: {} was not approved", crate::tools::describe(call));
-        seen.record(call, &denied);
+        seen.lock().unwrap().record(call, &denied);
         denied
     } else {
         let observation = toolbox.execute(call).await;
@@ -579,7 +632,7 @@ async fn gate_and_execute(
                 written.push(path.to_string());
             }
         }
-        seen.record(call, &observation);
+        seen.lock().unwrap().record(call, &observation);
         observation
     };
     let mut shown = observation.clone();
@@ -621,6 +674,7 @@ async fn run_native_tool_loop(
     id: u64,
     written: &mut Vec<String>,
     read_only: bool,
+    seen: &std::sync::Mutex<SeenCalls>,
 ) -> anyhow::Result<String> {
     // Per-task values overlay: params with a closed, known set (read/list paths,
     // skill targets) carry a JSON-Schema `enum`, which hipfire's grammar turns into
@@ -637,7 +691,6 @@ async fn run_native_tool_loop(
     let effort = std::env::var("CORRODE_REASONING_EFFORT").unwrap_or_else(|_| "none".to_string());
     let mut scratchpad = String::new();
     let mut last = String::new();
-    let mut seen = SeenCalls::default();
     for _ in 0..MAX_TOOL_STEPS {
         let prompt = planner::native_tool_prompt(prefix, role, task, &scratchpad);
         let (text, _reasoning) = client
@@ -656,7 +709,7 @@ async fn run_native_tool_loop(
             return Ok(text); // no call -> this turn is the final answer
         };
         let observation =
-            gate_and_execute(call, &toolbox, approvals, events, id, written, &mut seen, read_only)
+            gate_and_execute(call, &toolbox, approvals, events, id, written, seen, read_only)
                 .await;
         scratchpad.push_str(&format!(
             "\nCALLED: {}\nRESULT: {observation}\n",
@@ -690,6 +743,7 @@ async fn run_tool_loop(
     id: u64,
     written: &mut Vec<String>,
     read_only: bool,
+    seen: &std::sync::Mutex<SeenCalls>,
 ) -> anyhow::Result<String> {
     // Render the exec toolset in the tool-call model's dialect once; parse each reply
     // with the same dialect (which maps its tool names back to canonical).
@@ -697,7 +751,6 @@ async fn run_tool_loop(
     let schema = dialect.render(crate::tools::role_tools(role), None);
     let mut scratchpad = String::new();
     let mut last = String::new();
-    let mut seen = SeenCalls::default();
     for _ in 0..MAX_TOOL_STEPS {
         let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
         let text = client.respond(model, &prompt, band).await?;
@@ -724,7 +777,7 @@ async fn run_tool_loop(
             Ok(Ok(calls)) => match calls.first() {
                 Some(c) => {
                     gate_and_execute(
-                        c, &toolbox, approvals, events, id, written, &mut seen, read_only,
+                        c, &toolbox, approvals, events, id, written, seen, read_only,
                     )
                     .await
                 }
@@ -763,18 +816,19 @@ async fn run_task(
     id: u64,
     written: &mut Vec<String>,
     read_only: bool,
+    seen: &std::sync::Mutex<SeenCalls>,
 ) -> anyhow::Result<String> {
     let role_dialect = dialects.resolve(model);
     if role_dialect.emits_own_calls() {
         run_native_tool_loop(
             client, model, band, role_dialect, toolbox, approvals, prefix, role, task, events,
-            id, written, read_only,
+            id, written, read_only, seen,
         )
         .await
     } else if let (true, Some(caller)) = (roles::is_small_model(model), tool_caller) {
         run_tool_loop(
             client, model, band, caller, toolbox, approvals, dialects, prefix, role, task,
-            events, id, written, read_only,
+            events, id, written, read_only, seen,
         )
         .await
     } else {
@@ -817,6 +871,7 @@ async fn run_fanout(
     events: &mpsc::Sender<AgentEvent>,
     id: u64,
     written: &mut Vec<String>,
+    seen: &std::sync::Mutex<SeenCalls>,
 ) -> anyhow::Result<String> {
     let attempts = (0..k).map(|i| {
         let attempt_task = planner::fanout_attempt_task(task, i + 1, k);
@@ -825,9 +880,12 @@ async fn run_fanout(
         let tool_caller = tool_caller.clone();
         async move {
             let mut sink = Vec::new(); // read-only: no artifacts can land
+            // Attempts get a PRIVATE map: their "read-only pass" notes must never
+            // suppress the turn map's real, writable execution of the same call.
+            let attempt_seen = std::sync::Mutex::new(SeenCalls::default());
             let fut = run_task(
                 client, model, attempt_band, dialects, tool_caller, toolbox, approvals,
-                prefix, role, &attempt_task, events, id, &mut sink, true,
+                prefix, role, &attempt_task, events, id, &mut sink, true, &attempt_seen,
             );
             if i == 0 {
                 fut.await
@@ -885,7 +943,7 @@ async fn run_fanout(
     }
     run_task(
         client, model, band, dialects, tool_caller, toolbox, approvals, prefix, role,
-        &steered, events, id, written, false,
+        &steered, events, id, written, false, seen,
     )
     .await
 }
@@ -1043,7 +1101,7 @@ mod tests {
         assert!(seen.repeat(&read).is_none(), "first call is not a repeat");
         seen.record(&read, "contents of src/lib.rs:\nfn f() {}");
         let suppressed = seen.repeat(&read).expect("exact repeat is suppressed");
-        assert!(suppressed.starts_with("note: this exact call was already tried"));
+        assert!(suppressed.starts_with("note: this exact call was already made this turn"));
         assert!(suppressed.ends_with("contents of src/lib.rs:\nfn f() {}"));
 
         // Key order is not identity: semantically identical args collide.
@@ -1081,7 +1139,7 @@ mod tests {
         let approvals = ApprovalGate::default();
         let (tx, mut rx) = mpsc::channel(4);
         let mut written = Vec::new();
-        let mut seen = SeenCalls::default();
+        let seen = std::sync::Mutex::new(SeenCalls::default());
 
         let write = crate::toolcall::ToolCall {
             name: "write_file".into(),
@@ -1091,7 +1149,7 @@ mod tests {
         // request, this would block on a oneshot nobody resolves — fail, don't hang.
         let obs = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            gate_and_execute(&write, &toolbox, &approvals, &tx, 0, &mut written, &mut seen, true),
+            gate_and_execute(&write, &toolbox, &approvals, &tx, 0, &mut written, &seen, true),
         )
         .await
         .expect("read-only gate must not block on approval");
@@ -1113,7 +1171,7 @@ mod tests {
             arguments: serde_json::json!({"path": "lib.rs"}),
         };
         let obs =
-            gate_and_execute(&read, &toolbox, &approvals, &tx, 0, &mut written, &mut seen, true)
+            gate_and_execute(&read, &toolbox, &approvals, &tx, 0, &mut written, &seen, true)
                 .await;
         assert!(obs.contains("fn f() {}"), "got: {obs}");
         assert!(
@@ -1145,6 +1203,57 @@ mod tests {
         std::env::set_var("CORRODE_PLAN_REVIEW", "false");
         assert!(!plan_review_enabled());
         std::env::remove_var("CORRODE_PLAN_REVIEW");
+    }
+
+    // Item 5: the turn-shared memory serves a sibling's identical call from cache
+    // (with the already-made note), the activity digest advertises what the swarm
+    // did for a launching task's tail, and a successful mutating call drops both —
+    // stale knowledge must be neither served nor advertised.
+    #[tokio::test]
+    async fn turn_memory_serves_siblings_and_digests_activity() {
+        let dir = std::env::temp_dir().join(format!("corrode-turnmem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), b"fn f() {}").unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let approvals = ApprovalGate::default();
+        let (tx, _rx) = mpsc::channel(16);
+        let mut written = Vec::new();
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let read = crate::toolcall::ToolCall {
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "lib.rs"}),
+        };
+
+        // "Task A" reads; "task B" (same shared map) asks again and gets the cache.
+        let a = gate_and_execute(&read, &toolbox, &approvals, &tx, 0, &mut written, &seen, false)
+            .await;
+        assert!(a.contains("fn f() {}"));
+        let b = gate_and_execute(&read, &toolbox, &approvals, &tx, 1, &mut written, &seen, false)
+            .await;
+        assert!(b.starts_with("note: this exact call was already made this turn"), "got: {b}");
+        assert!(b.contains("fn f() {}"), "the sibling still gets the knowledge");
+
+        // The digest advertises the activity, once, for a launching task's tail.
+        let digest = seen.lock().unwrap().digest(TURN_DIGEST_LINES).expect("activity");
+        assert!(digest.contains("read_file lib.rs ->"), "got: {digest}");
+        assert_eq!(digest.matches("read_file lib.rs").count(), 1, "cache hits are not re-logged");
+
+        // A successful mutating call invalidates cache AND digest.
+        let write = crate::toolcall::ToolCall {
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "lib.rs", "contents": "fn g() {}"}),
+        };
+        seen.lock().unwrap().record(&write, "wrote 9 bytes to lib.rs");
+        assert!(seen.lock().unwrap().repeat(&read).is_none(), "read re-executes after a write");
+        let digest = seen.lock().unwrap().digest(TURN_DIGEST_LINES).unwrap();
+        assert!(!digest.contains("read_file"), "stale reads are not advertised: {digest}");
+        assert!(digest.contains("write_file lib.rs ->"), "the write itself is: {digest}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // No NEXT: line -> no emission (and Needle isn't even called).
