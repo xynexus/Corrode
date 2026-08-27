@@ -16,3 +16,6 @@
 [submodule "third_party/minicpm"]
 	path = third_party/minicpm
 	url = https://github.com/OpenBMB/MiniCPM
+[submodule "third_party/docling.rs"]
+	path = third_party/docling.rs
+	url = https://github.com/docling-project/docling.rs.git
