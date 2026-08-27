@@ -70,8 +70,12 @@
       .tree { list-style: none; margin: 0; padding: 6px; overflow: auto; }
       .tree li { padding: 2px 6px; border-radius: 4px; white-space: nowrap; }
       .tree li.dir { color: #cbd3dd; }
-      .tree li.file { cursor: pointer; }
+      .tree li { cursor: pointer; }
       .tree li:hover { background: #1c1f24; }
+      .cwd { font-family: ui-monospace, monospace; font-size: 12px; color: #cbd3dd;
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .explorer-actions { display: flex; gap: 4px; flex: 0 0 auto; }
+      .explorer-actions button { padding: 2px 7px; }
 
       /* Center column: xterm terminal (top) + egui graph canvas (bottom). */
       .center { background: #0c0d10; }

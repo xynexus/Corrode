@@ -216,12 +216,24 @@ pub fn App() -> impl IntoView {
             }
         }
     };
+    // The explorer's current directory ("" = repo root). Navigating a dir sets this
+    // and re-lists; DirListing replaces the visible entries.
+    let cwd = RwSignal::new(String::new());
     let list_root = {
         let cmd_tx = cmd_tx.clone();
         move |_| {
-            let _ = cmd_tx.unbounded_send(AgentCommand::ListDir {
-                path: String::new(),
-            });
+            cwd.set(String::new());
+            let _ = cmd_tx.unbounded_send(AgentCommand::ListDir { path: String::new() });
+        }
+    };
+    // Go up one directory from the current cwd.
+    let go_up = {
+        let cmd_tx = cmd_tx.clone();
+        move |_| {
+            let here = cwd.get();
+            let parent = here.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or_default();
+            cwd.set(parent.clone());
+            let _ = cmd_tx.unbounded_send(AgentCommand::ListDir { path: parent });
         }
     };
 
@@ -316,8 +328,13 @@ pub fn App() -> impl IntoView {
         >
             <section class="explorer">
                 <div class="bar">
-                    <span>"explorer"</span>
-                    <button on:click=list_root>"list root"</button>
+                    <span class="cwd" title="current directory">
+                        {move || { let d = cwd.get(); if d.is_empty() { "/".to_string() } else { format!("/{d}") } }}
+                    </span>
+                    <span class="explorer-actions">
+                        <button on:click=go_up title="up one directory">"↑"</button>
+                        <button on:click=list_root>"root"</button>
+                    </span>
                 </div>
                 <div class="bar repo-bar">
                     <input
@@ -334,14 +351,20 @@ pub fn App() -> impl IntoView {
                         entries.get().into_iter().map(move |(path, is_dir)| {
                             let tx = tx.clone();
                             let p = path.clone();
+                            // Dir -> descend (set cwd + re-list); file -> read into the console.
                             let open = move |_| {
-                                if !is_dir {
+                                if is_dir {
+                                    cwd.set(p.clone());
+                                    let _ = tx.unbounded_send(AgentCommand::ListDir { path: p.clone() });
+                                } else {
                                     let _ = tx.unbounded_send(AgentCommand::ReadFile { path: p.clone() });
                                 }
                             };
+                            // Show just the basename — the bar shows the full cwd.
+                            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
                             view! {
                                 <li class:dir=is_dir class:file=!is_dir on:click=open>
-                                    {if is_dir { "📁 " } else { "📄 " }}{path}
+                                    {if is_dir { "📁 " } else { "📄 " }}{name}
                                 </li>
                             }
                         }).collect_view()
