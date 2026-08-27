@@ -67,7 +67,7 @@ default 0.35), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -> tool-profi
 — per-model tool names/schema/parse; absent -> the built-in Needle default),
 `CORRODE_NEEDLE_MODEL_ID` (dialect key for the Needle caller, default `needle`),
 `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
-`CORRODE_WEB_ADDR` (web bind, default `127.0.0.1:8787`), `CORRODE_DAEMON_URL`
+`CORRODE_WEB_ADDR` (web bind, default `0.0.0.0:8787`), `CORRODE_DAEMON_URL`
 (daemon ws the web proxies to), `CORRODE_MAX_TOKENS` (per-call output cap,
 default 1024), `CORRODE_FANOUT` (coder-task ensemble size — K read-only proposal
 attempts judged by the review model before one writable execution; default 1 = off,

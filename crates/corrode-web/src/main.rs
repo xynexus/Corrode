@@ -33,7 +33,7 @@ const INDEX: &str = include_str!("../index.html");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let addr = std::env::var("CORRODE_WEB_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
+    let addr = std::env::var("CORRODE_WEB_ADDR").unwrap_or_else(|_| "0.0.0.0:8787".to_string());
     let daemon_url = Arc::new(
         std::env::var("CORRODE_DAEMON_URL")
             .unwrap_or_else(|_| "ws://127.0.0.1:7878/agent".to_string()),
