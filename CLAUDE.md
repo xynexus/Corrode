@@ -91,7 +91,11 @@ on unless `0`/`false`), `CORRODE_SANDBOX` (bubblewrap-confine every spawned proc
 — `run_command`/`run_skill_script` and the web terminal — off unless `on`/`1`/`true`;
 see `sandbox.rs` + `docs/sessions-and-sandbox.md`), `CORRODE_SANDBOX_NET` (share the
 host network into the sandbox; off by default — needed for tools that fetch),
-`CORRODE_USERS` (path to a JSON `user -> {token, hipfire_token?}` table; present =
+`CORRODE_AUTO_APPROVE` (auto-approve every mutating tool call instead of blocking on
+a human — for unattended/headless swarms that would otherwise fail closed; off unless
+`1`/`true`/`on`, and meant to be paired with `CORRODE_SANDBOX` so writes/commands stay
+confined; each auto-approval is logged and the call still streams back as a
+`ToolResult`), `CORRODE_USERS` (path to a JSON `user -> {token, hipfire_token?}` table; present =
 auth on, connections must `Authenticate` before repo-scoped commands, and each
 user's `hipfire_token` — if set — attributes their swarm to a distinct hipfire
 principal for per-user fairness; absent = auth off, connections anonymous). The

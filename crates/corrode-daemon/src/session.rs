@@ -77,7 +77,7 @@ impl Session {
     ) -> Self {
         Self {
             terminals: Terminals::new(repo.repo_root.clone()).with_sandbox(sandbox),
-            approvals: Arc::new(ApprovalGate::default()),
+            approvals: Arc::new(ApprovalGate::from_env()),
             repo_root: repo.repo_root,
             graph: repo.graph,
             vfs: repo.vfs,

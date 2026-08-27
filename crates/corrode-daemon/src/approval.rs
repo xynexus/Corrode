@@ -8,6 +8,14 @@
 //!
 //! Fail closed: if the event can't be sent or the response channel is dropped (client
 //! gone), the action is DENIED. Read-only tools never pass through here.
+//!
+//! Opt-in auto-approve (`CORRODE_AUTO_APPROVE`): for unattended operation (a cron/
+//! headless swarm with no human to answer), the gate can auto-approve every mutating
+//! call. This is what lets the swarm actually write code on its own — otherwise every
+//! write blocks forever and fails closed. It is OFF by default and intended to be
+//! paired with the sandbox (`CORRODE_SANDBOX`), which confines those writes/commands
+//! to the repo; each auto-approval is logged, and the executed call still streams back
+//! as a `ToolResult` so the operator sees everything that ran.
 
 use corrode_core::AgentEvent;
 use std::collections::HashMap;
@@ -22,13 +30,33 @@ use tokio::sync::oneshot;
 pub struct ApprovalGate {
     pending: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
     next_id: AtomicU64,
+    /// When set, every request is auto-approved without a human (unattended mode).
+    auto_approve: bool,
 }
 
 impl ApprovalGate {
+    /// A gate whose auto-approve is read from `CORRODE_AUTO_APPROVE`
+    /// (`1`/`true`/`on`). Off otherwise — the human-in-the-loop default.
+    pub fn from_env() -> Self {
+        let auto_approve = matches!(
+            std::env::var("CORRODE_AUTO_APPROVE").ok().as_deref(),
+            Some("1") | Some("true") | Some("on")
+        );
+        Self {
+            auto_approve,
+            ..Default::default()
+        }
+    }
+
     /// Ask a human to approve `action`. Emits an `ApprovalRequest` and awaits the
     /// matching `ApprovalResponse`. Returns `false` (denied) if the event can't be sent
-    /// or the response channel is dropped.
+    /// or the response channel is dropped. With auto-approve on, returns `true`
+    /// immediately (the call still streams back as a `ToolResult` after it runs).
     pub async fn request(&self, events: &mpsc::Sender<AgentEvent>, action: String) -> bool {
+        if self.auto_approve {
+            eprintln!("auto-approved (CORRODE_AUTO_APPROVE): {action}");
+            return true;
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let rx = {
             let (tx, rx) = oneshot::channel();
@@ -94,5 +122,18 @@ mod tests {
         let (etx, erx) = mpsc::channel(1);
         drop(erx); // client gone
         assert!(!gate.request(&etx, "write file".into()).await);
+    }
+
+    #[tokio::test]
+    async fn auto_approve_grants_without_a_human() {
+        // Unattended mode: no responder, and the client channel is even dropped —
+        // fail-closed would deny, but auto-approve grants immediately.
+        let gate = ApprovalGate {
+            auto_approve: true,
+            ..Default::default()
+        };
+        let (etx, erx) = mpsc::channel(1);
+        drop(erx);
+        assert!(gate.request(&etx, "write file foo".into()).await);
     }
 }
