@@ -1,0 +1,25 @@
+[Unit]
+Description=Corrode agent daemon (swarm, VFS, embedded HelixDB)
+Documentation=file:%h/Corrode/CLAUDE.md
+# hipfire must be up for role resolution + generation. It isn't a systemd unit by
+# default (started via `hipfire start`), so we only order after the network and let
+# the daemon degrade to CORRODE_MODEL if hipfire is briefly unreachable. If you run
+# hipfire as its own unit, add: After=hipfire.service  Wants=hipfire.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# EnvironmentFile carries the deployment's config (see corrode.env.example). At
+# minimum set CORRODE_REPO; turn on the sandbox and auth for a real deployment.
+EnvironmentFile=%h/Corrode/deploy/corrode.env
+WorkingDirectory=%h/Corrode
+# Build first: cargo build -p corrode-daemon --release --features helix,docling
+#   (needs OpenSSL+pkg-config for helix — see CLAUDE.md). Point ExecStart at the
+#   built binary; use debug/ if you haven't built --release.
+ExecStart=%h/Corrode/target/release/corrode-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

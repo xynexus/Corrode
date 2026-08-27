@@ -1,0 +1,19 @@
+[Unit]
+Description=Corrode web frontend (serves the wasm UI, proxies /agent to the daemon)
+Documentation=file:%h/Corrode/CLAUDE.md
+After=corrode-daemon.service
+Wants=corrode-daemon.service
+
+[Service]
+Type=exec
+EnvironmentFile=%h/Corrode/deploy/corrode.env
+WorkingDirectory=%h/Corrode
+# Build the wasm bundle first: (cd webui && trunk build --release). corrode-web
+# embeds webui/dist at compile time, so also build it after the bundle exists:
+#   cargo build -p corrode-web --release
+ExecStart=%h/Corrode/target/release/corrode-web
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
