@@ -1,11 +1,17 @@
 # Corrode graph model
 
-**Status: design.** The graph-backed VFS is not yet implemented — `vfs.rs` ships a
-filesystem `PassthroughVfs` and `graph.rs`'s `HelixStore` methods are stubs. This
-document is the intended design the implementation grows into. The wire types it
-references that *do* exist (`FileNodeView.is_dir`/`.mode`, `ProjectionMode`,
-`FallbackReason`) live in `corrode-core`; the store is the embedded HelixDB
-(`graph::embedded::HelixStore`).
+**Status: design; store live, projectors pending.** The embedded HelixDB store is
+implemented and live under `--features helix` — `graph::embedded::HelixStore` does
+real LMDB writes (`upsert_node`/`add_edge`/`replace_doc`) and reads
+(`neighbors`/`doc_search`/`list_docs`/`code_nodes`), backing provenance persistence
+and doc GraphRAG. What's still pending is the graph-backed VFS *projection* itself:
+`vfs.rs` ships a filesystem `PassthroughVfs`, and the per-language projectors/composers
+(§4) that would materialize files *from* graph nodes (Composed/Overlay, §3) are not
+written — so files are still real on disk, not projected. The file→graph pivot
+(`FileNodeView.node_id`, §10) is wired: the daemon tags each listed file with its
+provenance `code` node so the explorer can jump a file to its lineage. The wire types
+(`FileNodeView.is_dir`/`.mode`/`.node_id`, `ProjectionMode`, `FallbackReason`) live in
+`corrode-core`.
 
 ---
 
