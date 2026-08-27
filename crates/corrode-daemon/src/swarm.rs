@@ -30,6 +30,8 @@ pub struct Task {
     pub prompt: String,
     pub priority: Priority,
     pub model: String,
+    /// Per-user hipfire bearer for fairness attribution (`None` = shared key).
+    pub owner_token: Option<String>,
 }
 
 pub struct Swarm {
@@ -65,7 +67,12 @@ impl Swarm {
             let inflight = Arc::clone(&self.inflight);
             futs.push(async move {
                 let _guard = inflight.acquire_owned().await.expect("semaphore not closed");
-                (i, client.respond(&task.model, &task.prompt, task.priority).await)
+                (
+                    i,
+                    client
+                        .respond(&task.model, &task.prompt, task.priority, task.owner_token.as_deref())
+                        .await,
+                )
             });
         }
         futs

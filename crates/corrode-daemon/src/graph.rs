@@ -58,6 +58,26 @@ pub struct DocWrite {
     pub chunks: Vec<(String, String, Option<Vec<f32>>)>,
 }
 
+/// Open the embedded store for a repo at `<repo>/.corrode/graph`, per-repo — the
+/// same opener the daemon uses for any session's repo. `None` without
+/// `--features helix`, or if the open fails (logged).
+#[cfg(feature = "helix")]
+pub fn open(repo_root: &std::path::Path) -> Option<std::sync::Arc<dyn GraphStore>> {
+    let path = repo_root.join(".corrode/graph");
+    match embedded::HelixStore::open(&path.to_string_lossy()) {
+        Ok(store) => Some(std::sync::Arc::new(store)),
+        Err(e) => {
+            eprintln!("HelixDB open failed at {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "helix"))]
+pub fn open(_repo_root: &std::path::Path) -> Option<std::sync::Arc<dyn GraphStore>> {
+    None
+}
+
 /// In-process HelixDB. Only compiled with `--features helix`.
 ///
 /// Schema: every graph node gets the single label `"corrode"`; the caller's

@@ -23,6 +23,7 @@ mod planner;
 mod roles;
 mod sandbox;
 mod server;
+mod session;
 mod skills;
 mod swarm;
 mod terminal;
@@ -77,7 +78,8 @@ async fn main() -> anyhow::Result<()> {
     // (if hipfire serves an embedding model). Falls back to the full manifest.
     let embed_model = roles::default_embedding_model(&models).map(str::to_string);
     let skills =
-        skills::SkillContext::build(std::path::Path::new(&repo_root), &client, embed_model).await;
+        skills::SkillContext::build(std::path::Path::new(&repo_root), &client, embed_model.clone())
+            .await;
     eprintln!(
         "skills discovered: {} (ranked retrieval: {})",
         skills.count(),
@@ -94,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         graph,
         vfs,
         skills,
+        embed_model,
         tool_caller,
         std::path::PathBuf::from(&repo_root),
         dialects,

@@ -164,6 +164,10 @@ pub struct ToolBox {
     /// Optional bubblewrap confinement for `run_command`/`run_skill_script`.
     /// Disabled by default (see `with_sandbox`).
     sandbox: crate::sandbox::Sandbox,
+    /// Per-user hipfire bearer for this session's model calls (fairness). `None`
+    /// uses the daemon's shared key. Carried here so the tool loops (which already
+    /// hold the ToolBox) can attribute their `respond` calls without extra params.
+    owner_token: Option<String>,
 }
 
 impl ToolBox {
@@ -177,6 +181,7 @@ impl ToolBox {
             root,
             skill_scripts,
             sandbox: crate::sandbox::Sandbox::disabled(),
+            owner_token: None,
         }
     }
 
@@ -184,6 +189,18 @@ impl ToolBox {
     pub fn with_sandbox(mut self, sandbox: crate::sandbox::Sandbox) -> Self {
         self.sandbox = sandbox;
         self
+    }
+
+    /// Attribute this session's hipfire calls to a per-user token (builder;
+    /// default `None` = the daemon's shared key).
+    pub fn with_owner_token(mut self, owner_token: Option<String>) -> Self {
+        self.owner_token = owner_token;
+        self
+    }
+
+    /// The per-user hipfire bearer for `respond` calls in the tool loops.
+    pub fn owner_token(&self) -> Option<&str> {
+        self.owner_token.as_deref()
     }
 
     /// Per-task value sets for the grammar value constraint (item 4 of

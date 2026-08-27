@@ -122,9 +122,21 @@ the guard.
 
 ---
 
+## 4b. Auth table (`CORRODE_USERS`) — info / warn
+
+Only when set. `CORRODE_USERS` points to a JSON `user -> {token, hipfire_token?}`
+table; its presence turns on auth (connections must `Authenticate` before any
+repo-scoped command).
+- **Detect:** the file exists and parses as the expected shape.
+- **Warn if unparseable:** the daemon logs `CORRODE_USERS parse failed … auth
+  disabled` and runs *anonymous* — a silent downgrade from "locked" to "open",
+  worth flagging loudly.
+- **Info:** per-user fairness only activates for users whose entry has a
+  `hipfire_token`; without one, that user shares the daemon's hipfire principal.
+
 ## Environment knobs `doctor` should echo
 
-`CORRODE_SANDBOX` (off), `CORRODE_SANDBOX_NET` (off), `HIPFIRE_BASE_URL`,
-`CORRODE_MODEL`, `CORRODE_REPO`, `CORRODE_GRAPH_DIR`, `CORRODE_DOC_ROOTS`,
-`CORRODE_DAEMON_ADDR`, `CORRODE_WEB_ADDR`, `CORRODE_DAEMON_URL`. Full list and
-defaults in `CLAUDE.md` § Commands.
+`CORRODE_SANDBOX` (off), `CORRODE_SANDBOX_NET` (off), `CORRODE_USERS` (unset =
+auth off), `HIPFIRE_BASE_URL`, `CORRODE_MODEL`, `CORRODE_REPO`,
+`CORRODE_GRAPH_DIR`, `CORRODE_DOC_ROOTS`, `CORRODE_DAEMON_ADDR`, `CORRODE_WEB_ADDR`,
+`CORRODE_DAEMON_URL`. Full list and defaults in `CLAUDE.md` § Commands.

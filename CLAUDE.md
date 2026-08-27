@@ -77,7 +77,11 @@ clamped to 8), `CORRODE_PLAN_REVIEW` (plan-level review pass after the plan sett
 on unless `0`/`false`), `CORRODE_SANDBOX` (bubblewrap-confine every spawned process
 — `run_command`/`run_skill_script` and the web terminal — off unless `on`/`1`/`true`;
 see `sandbox.rs` + `docs/sessions-and-sandbox.md`), `CORRODE_SANDBOX_NET` (share the
-host network into the sandbox; off by default — needed for tools that fetch). The
+host network into the sandbox; off by default — needed for tools that fetch),
+`CORRODE_USERS` (path to a JSON `user -> {token, hipfire_token?}` table; present =
+auth on, connections must `Authenticate` before repo-scoped commands, and each
+user's `hipfire_token` — if set — attributes their swarm to a distinct hipfire
+principal for per-user fairness; absent = auth off, connections anonymous). The
 hipfire background daemon must be up (`hipfire start`, not just
 `serve` — `serve` is only the HTTP frontend) for the daemon to resolve roles and
 generate.
@@ -90,13 +94,23 @@ the daemon serves `/agent`, bridging each connection's frames to a per-connectio
 channel pair over the shared `Daemon`. `corrode-web` serves the UI and *proxies*
 `/agent` to the daemon (browser → web → daemon), keeping the daemon private; the
 same loop serves both. Frames are the serde-JSON encoding of the enums (externally
-tagged, e.g. `{"Prompt":{"text":"...","priority":0}}`). The `Daemon` owns the
-host-side state handlers reach via `&self`: the `Swarm`, the `RoleModels`
-assignments, an `Option<Box<dyn GraphStore>>` (HelixDB; `None` without
-`--features helix`), an `Arc<dyn Vfs>`, and the `ApprovalGate`. Dispatch: `Prompt`→swarm
-(spawned concurrently — it can be long-lived and block on approval, so the loop keeps
-receiving), `ListDir`→vfs (real), `DocQuery`→graph (real when helix built),
-`TerminalInput`→pty, `ApprovalResponse`→resolves a pending mutating-tool approval.
+tagged, e.g. `{"Prompt":{"text":"...","priority":0}}`).
+
+**Multi-tenancy (`session.rs`, docs/sessions-and-sandbox.md).** The `Daemon` is
+shared, but repo-scoped state is per-tenant. `run` holds two per-connection locals:
+the authenticated `user` (set by `Authenticate`, validated against `CORRODE_USERS`;
+absent table = anonymous) and the bound `Session`. A `Session` is keyed by
+`(user, repo)` and owns the live state — `Terminals` and the `ApprovalGate` (so a
+tenant only resolves its own approvals). It holds `Arc` clones of `RepoResources`
+(graph/vfs/skills), which are keyed by canonical repo path and shared across users
+on a repo — the LMDB store can't open twice. `SelectRepo` (get-or-create the
+session) binds a repo; the first repo-scoped command with no prior select lazily
+binds `CORRODE_REPO`, preserving single-tenant behaviour. The `Swarm`, `RoleModels`,
+`ToolCaller`, `Dialects`, and `Sandbox` stay shared on `Daemon`. Dispatch: `Prompt`→
+swarm (spawned concurrently — long-lived, may block on approval), `SelectRepo`/
+`Authenticate`→bind the connection's session/user, `ListDir`→session vfs,
+`DocQuery`→session graph, `TerminalInput`→session pty (client id is per browser tab),
+`ApprovalResponse`→resolves a pending approval on the connection's session gate.
 
 ## Roles
 

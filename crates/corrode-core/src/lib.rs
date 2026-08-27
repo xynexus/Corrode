@@ -108,6 +108,15 @@ pub struct GraphNodeView {
 /// webui/web-server -> daemon. The single command channel into the agent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentCommand {
+    /// Authenticate this connection. When the daemon has a user table configured
+    /// (`CORRODE_USERS`), this MUST precede any repo-scoped command; the daemon
+    /// replies `AuthOk`/`AuthRequired`. With no user table, auth is off and this is
+    /// optional. The `user` becomes the connection's identity (session + fairness key).
+    Authenticate { user: String, token: String },
+    /// Bind this connection to a repository. Repo-scoped commands (Prompt, terminal,
+    /// doc*) run against the selected repo's session; a re-select switches it. With
+    /// no prior select, the daemon lazily binds the default repo (`CORRODE_REPO`).
+    SelectRepo { path: String },
     /// Free-form instruction; the daemon plans and fans out a swarm.
     Prompt { text: String, priority: Priority },
     /// A keystroke chunk for the wasm virtual terminal's active session.
@@ -131,6 +140,15 @@ pub enum AgentCommand {
 /// daemon -> webui/web-server. Streamed events (websocket in practice).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentEvent {
+    /// Authentication succeeded; `user` is the bound identity.
+    AuthOk { user: String },
+    /// A repo-scoped command arrived before authentication (or with a bad
+    /// token), and the daemon has a user table configured. The client must send
+    /// `Authenticate` and retry.
+    AuthRequired,
+    /// `SelectRepo` succeeded: the connection is now bound to `path` (canonicalized)
+    /// for `user` ("" when auth is off).
+    RepoSelected { path: String, user: String },
     /// A subagent produced output.
     SubagentOutput { id: u64, text: String },
     /// Terminal frame back to the wasm terminal.
@@ -224,6 +242,19 @@ mod tests {
         pin(
             &AgentCommand::ApprovalResponse { id: 7, approved: true },
             r#"{"ApprovalResponse":{"id":7,"approved":true}}"#,
+        );
+        pin(
+            &AgentCommand::SelectRepo { path: "/repo".into() },
+            r#"{"SelectRepo":{"path":"/repo"}}"#,
+        );
+        pin(
+            &AgentCommand::Authenticate { user: "alice".into(), token: "t".into() },
+            r#"{"Authenticate":{"user":"alice","token":"t"}}"#,
+        );
+        pin(&AgentEvent::AuthRequired, r#""AuthRequired""#);
+        pin(
+            &AgentEvent::RepoSelected { path: "/repo".into(), user: "alice".into() },
+            r#"{"RepoSelected":{"path":"/repo","user":"alice"}}"#,
         );
         pin(
             &AgentEvent::ApprovalRequest { id: 7, action: "write src/main.rs".into() },

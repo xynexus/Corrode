@@ -9,123 +9,272 @@
 
 use crate::approval::ApprovalGate;
 use crate::dialect::Dialects;
-use crate::graph::GraphStore;
 use crate::hipfire::Client;
 use crate::plan_graph;
 use crate::planner;
 use crate::roles::{self, Role, RoleModels};
+use crate::session::{RepoResources, Session, SessionKey};
 use crate::skills::SkillContext;
 use crate::swarm::{Swarm, Task};
-use crate::terminal::Terminals;
 use crate::toolcall::ToolCaller;
 use crate::tools::ToolBox;
-use crate::vfs::Vfs;
+use crate::vfs::{PassthroughVfs, Vfs};
 use corrode_core::{AgentCommand, AgentEvent, Priority};
 use futures_util::StreamExt;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// How many relevance-ranked skills to surface in the shared prefix per turn.
 const TOP_K_SKILLS: usize = 8;
 
+/// Canonicalize a path, falling back to the raw path if it doesn't resolve — so a
+/// repo dir that doesn't exist yet still yields a stable session key.
+fn canonical(path: &str) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+}
+
+/// One entry in the `CORRODE_USERS` table: the token that authenticates to the
+/// daemon, plus (optionally) a per-user hipfire bearer for fairness attribution.
+/// JSON: `{"alice": {"token": "…", "hipfire_token": "…"}}` (hipfire_token optional).
+#[derive(serde::Deserialize, Clone)]
+struct UserEntry {
+    token: String,
+    #[serde(default)]
+    hipfire_token: Option<String>,
+}
+
+/// Load the auth table from `CORRODE_USERS` (a JSON file path). Absent or
+/// unreadable => `None` (auth off, connections anonymous).
+fn load_users() -> Option<HashMap<String, UserEntry>> {
+    let path = std::env::var("CORRODE_USERS").ok()?;
+    match std::fs::read_to_string(&path) {
+        Ok(data) => match serde_json::from_str(&data) {
+            Ok(map) => Some(map),
+            Err(e) => {
+                eprintln!("CORRODE_USERS parse failed ({e}); auth disabled");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("CORRODE_USERS read failed at {path} ({e}); auth disabled");
+            None
+        }
+    }
+}
+
 pub struct Daemon {
     swarm: Swarm,
     roles: RoleModels,
-    /// Embedded HelixDB. `None` unless built with `--features helix` and opened.
-    /// `Arc` so a clone can move into `spawn_blocking` (LMDB writes are sync and
-    /// fsync — never run them on a tokio worker inline).
-    graph: Option<Arc<dyn GraphStore>>,
-    /// Repo VFS. `Arc` so the tool-execution loop's `'static` future can own a clone.
-    vfs: Arc<dyn Vfs>,
-    /// Live pty-backed terminal sessions.
-    terminals: Terminals,
-    /// Agent Skills + AGENTS.md + the embedded index (fed into the shared prefix).
-    skills: SkillContext,
     /// Reliable tool-calling for small models (the Needle shim). `None` unless built
     /// with `--features needle` and the assets were found; drives task emission.
     tool_caller: Option<Arc<dyn ToolCaller>>,
-    /// Human-in-the-loop gate for mutating tool calls (write_file / run_command).
-    /// Shared with the command loop, which resolves `ApprovalResponse`s.
-    approvals: Arc<ApprovalGate>,
-    /// Repo root — the working directory for `run_command` in the tool loop.
-    repo_root: PathBuf,
-    /// Monotonic id source for plan (provenance root) nodes, one per Prompt turn.
-    next_plan_id: std::sync::atomic::AtomicU64,
-    /// Skill name -> skill dir, for `run_skill_script` in the tool loop. Derived from
-    /// `skills` at construction; `Arc` so the tool-loop future owns a clone.
-    skill_scripts: Arc<std::collections::HashMap<String, PathBuf>>,
     /// Per-model tool dialects (schema/names/parse), matched to the tool-call model.
     dialects: Arc<Dialects>,
-    /// Optional bubblewrap confinement for every process the daemon spawns
-    /// (`run_command`/`run_skill_script` in the tool loop, and the web terminal).
-    /// Off unless `CORRODE_SANDBOX` is set. ponytail: process-wide for now; becomes
-    /// per-session (bound to the session's repo) when tenancy lands.
+    /// Optional bubblewrap confinement for every process the daemon spawns. Off
+    /// unless `CORRODE_SANDBOX` is set; each session's terminals bind its own repo.
     sandbox: crate::sandbox::Sandbox,
+    /// Monotonic id source for plan (provenance root) nodes, one per Prompt turn.
+    next_plan_id: std::sync::atomic::AtomicU64,
+    /// Per-repo resources (graph/vfs/skills), shared across users working a repo —
+    /// the LMDB store can't be opened twice. Keyed by canonical repo path.
+    repos: Mutex<HashMap<PathBuf, RepoResources>>,
+    /// Per-(user,repo) live sessions (terminals + approval gate). A connection binds
+    /// one of these in `run`; a user's tabs on the same repo share it.
+    sessions: Mutex<HashMap<SessionKey, Arc<Session>>>,
+    /// `user -> {token, hipfire_token}` for auth + fairness. `None` (or empty) =>
+    /// auth off, connections anonymous.
+    users: Option<HashMap<String, UserEntry>>,
+    /// Default repo (`CORRODE_REPO`), for lazy binding when no `SelectRepo` arrives.
+    default_repo: PathBuf,
+    /// Embedding model id for building a repo's skill index (None if none served).
+    embed_model: Option<String>,
 }
 
 impl Daemon {
     pub fn new(
         swarm: Swarm,
         roles: RoleModels,
-        graph: Option<Arc<dyn GraphStore>>,
+        graph: Option<Arc<dyn crate::graph::GraphStore>>,
         vfs: Arc<dyn Vfs>,
         skills: SkillContext,
+        embed_model: Option<String>,
         tool_caller: Option<Arc<dyn ToolCaller>>,
         repo_root: PathBuf,
         dialects: Arc<Dialects>,
     ) -> Self {
-        let skill_scripts = Arc::new(skills.script_dirs());
         let sandbox = crate::sandbox::Sandbox::from_env();
+        let default_repo = canonical(&repo_root.to_string_lossy());
+        // The default repo's resources come pre-built from `main` (or a test); seed
+        // the registry so anonymous/default connections reuse them without reopening.
+        let default_res = RepoResources {
+            repo_root: default_repo.clone(),
+            graph,
+            vfs,
+            skill_scripts: Arc::new(skills.script_dirs()),
+            skills: Arc::new(skills),
+        };
+        let mut repos = HashMap::new();
+        repos.insert(default_repo.clone(), default_res);
         Self {
             swarm,
             roles,
-            graph,
-            vfs,
-            terminals: Terminals::new(repo_root.clone()).with_sandbox(sandbox.clone()),
-            skills,
             tool_caller,
-            approvals: Arc::new(ApprovalGate::default()),
-            repo_root,
-            next_plan_id: std::sync::atomic::AtomicU64::new(0),
-            skill_scripts,
             dialects,
             sandbox,
+            next_plan_id: std::sync::atomic::AtomicU64::new(0),
+            repos: Mutex::new(repos),
+            sessions: Mutex::new(HashMap::new()),
+            users: load_users(),
+            default_repo,
+            embed_model,
         }
     }
 
-    /// Run until the command channel closes. Dropping the sender ends the loop,
-    /// which drops `events` and unblocks the consumer.
+    /// Whether a user table is configured (auth on). Empty table = off.
+    fn auth_on(&self) -> bool {
+        self.users.as_ref().is_some_and(|u| !u.is_empty())
+    }
+
+    /// Validate a user/token. Auth off => always accepts.
+    fn authenticate(&self, user: &str, token: &str) -> bool {
+        match &self.users {
+            Some(map) if !map.is_empty() => map.get(user).is_some_and(|e| e.token == token),
+            _ => true,
+        }
+    }
+
+    /// The per-user hipfire bearer for fairness, if the user table carries one.
+    fn owner_token_for(&self, user: &str) -> Option<String> {
+        self.users.as_ref()?.get(user)?.hipfire_token.clone()
+    }
+
+    /// Get-or-open the shared resources for `repo` (graph/vfs/skills). Async because
+    /// building the skill index embeds descriptions via hipfire; the lock is never
+    /// held across the await.
+    async fn repo_resources(&self, repo: &PathBuf) -> anyhow::Result<RepoResources> {
+        if let Some(r) = self.repos.lock().unwrap().get(repo) {
+            return Ok(r.clone());
+        }
+        let graph = crate::graph::open(repo);
+        let vfs: Arc<dyn Vfs> = Arc::new(PassthroughVfs::new(repo));
+        let skills = SkillContext::build(repo, &self.swarm.client(), self.embed_model.clone()).await;
+        let res = RepoResources {
+            repo_root: repo.clone(),
+            graph,
+            vfs,
+            skill_scripts: Arc::new(skills.script_dirs()),
+            skills: Arc::new(skills),
+        };
+        Ok(self.repos.lock().unwrap().entry(repo.clone()).or_insert(res).clone())
+    }
+
+    /// Get-or-create the `(user, repo)` session for a connection. `path` empty =>
+    /// the default repo. Sessions are shared across a user's tabs on the same repo.
+    async fn bind_session(&self, user: Option<String>, path: &str) -> anyhow::Result<Arc<Session>> {
+        let repo = if path.is_empty() { self.default_repo.clone() } else { canonical(path) };
+        let key = SessionKey { user: user.unwrap_or_default(), repo: repo.clone() };
+        if let Some(s) = self.sessions.lock().unwrap().get(&key) {
+            return Ok(Arc::clone(s));
+        }
+        let res = self.repo_resources(&repo).await?;
+        let owner_token = self.owner_token_for(&key.user);
+        let session = Arc::new(Session::new(key.clone(), res, self.sandbox.clone(), owner_token));
+        Ok(Arc::clone(
+            self.sessions.lock().unwrap().entry(key).or_insert(session),
+        ))
+    }
+
+    /// Run until the command channel closes. State that used to be process-global
+    /// is now per-connection: the bound `session` (a `(user, repo)` tenant) and the
+    /// authenticated `user`. Repo-scoped commands run against the session; a lazy
+    /// default binding (to `CORRODE_REPO`) preserves single-tenant behaviour when no
+    /// `SelectRepo` is sent.
     ///
-    /// `Prompt` handling is dispatched concurrently (it can be long-lived and may block
-    /// on a human approval), so the loop keeps receiving — crucially, the
-    /// `ApprovalResponse` that unblocks a waiting tool call. Other commands (terminal
-    /// I/O, approvals) are handled inline to preserve their ordering.
+    /// `Prompt`/`DocIngest`/`DocQuery` dispatch concurrently (long-lived, may block on
+    /// approval), so the loop keeps receiving — crucially the `ApprovalResponse` that
+    /// unblocks a waiting tool call. Everything else is inline to preserve ordering.
     pub async fn run(
         self: Arc<Self>,
         mut commands: mpsc::Receiver<AgentCommand>,
         events: mpsc::Sender<AgentEvent>,
     ) {
+        let mut user: Option<String> = None;
+        let mut session: Option<Arc<Session>> = None;
         while let Some(cmd) = commands.recv().await {
-            // DocIngest/DocQuery spawn for the same reason Prompt does: convert +
-            // embed can take seconds, and the loop must keep serving terminal I/O
-            // + approvals.
-            if matches!(
-                cmd,
-                AgentCommand::Prompt { .. }
-                    | AgentCommand::DocIngest { .. }
-                    | AgentCommand::DocQuery { .. }
-            ) {
-                let this = Arc::clone(&self);
-                let events = events.clone();
-                tokio::spawn(async move { this.handle(cmd, &events).await });
-            } else {
-                self.handle(cmd, &events).await;
+            match cmd {
+                AgentCommand::Authenticate { user: u, token } => {
+                    if self.authenticate(&u, &token) {
+                        user = Some(u.clone());
+                        session = None; // re-auth drops the old binding
+                        let _ = events.send(AgentEvent::AuthOk { user: u }).await;
+                    } else {
+                        let _ = events.send(AgentEvent::AuthRequired).await;
+                    }
+                }
+                AgentCommand::SelectRepo { path } => {
+                    if self.auth_on() && user.is_none() {
+                        let _ = events.send(AgentEvent::AuthRequired).await;
+                        continue;
+                    }
+                    match self.bind_session(user.clone(), &path).await {
+                        Ok(s) => {
+                            let (p, u) = (s.repo_root.to_string_lossy().into_owned(), s.key.user.clone());
+                            session = Some(s);
+                            let _ = events.send(AgentEvent::RepoSelected { path: p, user: u }).await;
+                        }
+                        Err(e) => {
+                            let _ = events
+                                .send(AgentEvent::Error { message: format!("select repo: {e}") })
+                                .await;
+                        }
+                    }
+                }
+                AgentCommand::ApprovalResponse { id, approved } => {
+                    // Resolve on the connection's own session gate — a tenant can only
+                    // answer its own approvals.
+                    if let Some(s) = &session {
+                        s.approvals.resolve(id, approved);
+                    }
+                }
+                other => {
+                    if self.auth_on() && user.is_none() {
+                        let _ = events.send(AgentEvent::AuthRequired).await;
+                        continue;
+                    }
+                    if session.is_none() {
+                        match self.bind_session(user.clone(), "").await {
+                            Ok(s) => session = Some(s),
+                            Err(e) => {
+                                let _ = events
+                                    .send(AgentEvent::Error {
+                                        message: format!("open default repo: {e}"),
+                                    })
+                                    .await;
+                                continue;
+                            }
+                        }
+                    }
+                    let s = Arc::clone(session.as_ref().unwrap());
+                    if matches!(
+                        other,
+                        AgentCommand::Prompt { .. }
+                            | AgentCommand::DocIngest { .. }
+                            | AgentCommand::DocQuery { .. }
+                    ) {
+                        let this = Arc::clone(&self);
+                        let events = events.clone();
+                        tokio::spawn(async move { this.handle(&s, other, &events).await });
+                    } else {
+                        self.handle(&s, other, &events).await;
+                    }
+                }
             }
         }
     }
 
-    async fn handle(&self, cmd: AgentCommand, events: &mpsc::Sender<AgentEvent>) {
+    async fn handle(&self, session: &Arc<Session>, cmd: AgentCommand, events: &mpsc::Sender<AgentEvent>) {
         match cmd {
             AgentCommand::Prompt { text, priority } => {
                 // The plan id exists before planning so TurnComplete is unconditional:
@@ -135,7 +284,7 @@ impl Daemon {
                     self.next_plan_id
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 );
-                let (subtasks, prefix) = match self.plan(&text, priority).await {
+                let (subtasks, prefix) = match self.plan(session, &text, priority).await {
                     Ok(planned) => planned,
                     Err(e) => {
                         let _ = events
@@ -181,10 +330,11 @@ impl Daemon {
                     let prefix = prefix.clone();
                     let events = events.clone();
                     let tool_caller = self.tool_caller.clone();
-                    let vfs = Arc::clone(&self.vfs);
-                    let approvals = Arc::clone(&self.approvals);
-                    let root = self.repo_root.clone();
-                    let skill_scripts = Arc::clone(&self.skill_scripts);
+                    let vfs = Arc::clone(&session.vfs);
+                    let approvals = Arc::clone(&session.approvals);
+                    let root = session.repo_root.clone();
+                    let skill_scripts = Arc::clone(&session.skill_scripts);
+                    let owner_token = session.owner_token.clone();
                     let sandbox = self.sandbox.clone();
                     let dialects = Arc::clone(&self.dialects);
                     let id = task.id;
@@ -202,7 +352,9 @@ impl Daemon {
                         // attempts first when CORRODE_FANOUT > 1; everything else runs
                         // the capability paths directly (see `run_task`).
                         let mut artifacts = Vec::new();
-                        let toolbox = ToolBox::new(vfs, root, skill_scripts).with_sandbox(sandbox);
+                        let toolbox = ToolBox::new(vfs, root, skill_scripts)
+                            .with_sandbox(sandbox)
+                            .with_owner_token(owner_token);
                         let output = if role == Role::Coder && fanout > 1 {
                             run_fanout(
                                 fanout,
@@ -295,7 +447,7 @@ impl Daemon {
                 // Persist the plan's provenance (plan <- task/contract <- code) to the
                 // graph store, so the code<->task<->plan lineage is queryable — and
                 // ship it to the graph explorer.
-                self.persist_provenance(&graph);
+                self.persist_provenance(session, &graph);
                 let prov = graph.provenance();
                 let nodes = prov
                     .nodes
@@ -324,24 +476,25 @@ impl Daemon {
                 let _ = events.send(AgentEvent::TurnComplete { plan_id }).await;
             }
             AgentCommand::DocQuery { question } => {
-                let ev = self.doc_query(&question).await;
+                let ev = self.doc_query(session, &question).await;
                 let _ = events.send(ev).await;
             }
             AgentCommand::DocIngest { path } => {
-                let ev = self.ingest_doc(path).await;
+                let ev = self.ingest_doc(session, path).await;
                 let _ = events.send(ev).await;
             }
             AgentCommand::ListDir { path } => {
-                let ev = match self.vfs.list(&path).await {
+                let ev = match session.vfs.list(&path).await {
                     Ok(entries) => AgentEvent::DirListing { path, entries },
                     Err(e) => AgentEvent::Error { message: e.to_string() },
                 };
                 let _ = events.send(ev).await;
             }
-            AgentCommand::TerminalInput { session, data } => {
-                // Write keystrokes to the session's real pty; its output streams back
-                // as TerminalOutput from the session's reader thread.
-                if let Err(e) = self.terminals.input(&session, &data, events) {
+            AgentCommand::TerminalInput { session: term, data } => {
+                // Write keystrokes to the (per-tenant) pty; its output streams back as
+                // TerminalOutput from the session's reader thread. `term` is the
+                // client-chosen id, unique per browser tab.
+                if let Err(e) = session.terminals.input(&term, &data, events) {
                     let _ = events
                         .send(AgentEvent::Error {
                             message: format!("terminal input: {e}"),
@@ -350,11 +503,11 @@ impl Daemon {
                 }
             }
             AgentCommand::TerminalResize {
-                session,
+                session: term,
                 cols,
                 rows,
             } => {
-                if let Err(e) = self.terminals.resize(&session, cols, rows, events) {
+                if let Err(e) = session.terminals.resize(&term, cols, rows, events) {
                     let _ = events
                         .send(AgentEvent::Error {
                             message: format!("terminal resize: {e}"),
@@ -362,11 +515,11 @@ impl Daemon {
                         .await;
                 }
             }
-            AgentCommand::ApprovalResponse { id, approved } => {
-                // Unblock the tool call waiting on this decision (no-op if it already
-                // gave up). Handled inline so it lands while a Prompt handler waits.
-                self.approvals.resolve(id, approved);
-            }
+            // Bound in `run` (they need the per-connection session/auth locals), never
+            // dispatched here.
+            AgentCommand::Authenticate { .. }
+            | AgentCommand::SelectRepo { .. }
+            | AgentCommand::ApprovalResponse { .. } => unreachable!("handled in run"),
         }
     }
 
@@ -381,12 +534,13 @@ impl Daemon {
     /// agents emit follow-up work.
     async fn plan(
         &self,
+        session: &Session,
         text: &str,
         priority: Priority,
     ) -> anyhow::Result<(Vec<planner::PlannedSubtask>, String)> {
         // Built once and shared, byte-identical, by the planning call and every
         // subagent, so hipfire batches them prefix-shared and reuses KV.
-        let prefix = self.context_prefix(text).await;
+        let prefix = self.context_prefix(session, text).await;
 
         let orch_model = self
             .roles
@@ -397,6 +551,7 @@ impl Daemon {
             prompt: planner::orchestration_prompt(&prefix, text),
             priority,
             model: orch_model,
+            owner_token: session.owner_token.clone(),
         };
         let plan_text = self
             .swarm
@@ -425,8 +580,8 @@ impl Daemon {
     /// HelixDB write path is still stubbed — so on the first write error we log once and
     /// stop rather than spamming. The in-memory provenance is already correct; this is
     /// the durability seam.
-    fn persist_provenance(&self, graph: &plan_graph::PlanGraph) {
-        let Some(store) = &self.graph else {
+    fn persist_provenance(&self, session: &Session, graph: &plan_graph::PlanGraph) {
+        let Some(store) = &session.graph else {
             return;
         };
         let prov = graph.provenance();
@@ -450,14 +605,14 @@ impl Daemon {
     /// retrieved chunks verbatim.
     /// ponytail: retrieval-only — the synthesis pass (feed chunks + question to a
     /// hipfire chat model) is the next layer.
-    async fn doc_query(&self, question: &str) -> AgentEvent {
-        let Some(g) = &self.graph else {
+    async fn doc_query(&self, session: &Session, question: &str) -> AgentEvent {
+        let Some(g) = &session.graph else {
             return AgentEvent::Error {
                 message: "DocQuery unavailable: build with --features helix and open a graph store"
                     .into(),
             };
         };
-        let query_vec = match self.skills.embed_model() {
+        let query_vec = match session.skills.embed_model() {
             Some(model) => self.swarm.client().embed_query(model, question).await.ok(),
             None => None,
         };
@@ -497,8 +652,8 @@ impl Daemon {
     /// arbitrary file read. Roots come from `CORRODE_DOC_ROOTS` (`:`-separated),
     /// defaulting to the repo root.
     #[cfg(feature = "docling")]
-    async fn ingest_doc(&self, path: String) -> AgentEvent {
-        let canonical = match self.confine_doc_path(&path) {
+    async fn ingest_doc(&self, session: &Session, path: String) -> AgentEvent {
+        let canonical = match self.confine_doc_path(session, &path) {
             Ok(p) => p,
             Err(e) => return AgentEvent::Error { message: format!("doc ingest: {e}") },
         };
@@ -511,7 +666,7 @@ impl Daemon {
             Ok(Err(e)) => return AgentEvent::Error { message: format!("doc ingest: {e}") },
             Err(e) => return AgentEvent::Error { message: format!("doc ingest task: {e}") },
         };
-        let persisted = self.persist_doc(&doc).await;
+        let persisted = self.persist_doc(session, &doc).await;
         AgentEvent::DocIngested {
             path,
             doc_id: doc.doc_id,
@@ -524,11 +679,11 @@ impl Daemon {
     /// must exist) and require it under one of the doc roots. Returns the canonical
     /// path string, which also gives stable doc/chunk ids across path spellings.
     #[cfg(feature = "docling")]
-    fn confine_doc_path(&self, path: &str) -> anyhow::Result<String> {
+    fn confine_doc_path(&self, session: &Session, path: &str) -> anyhow::Result<String> {
         let roots: Vec<PathBuf> = std::env::var("CORRODE_DOC_ROOTS")
             .ok()
             .map(|v| v.split(':').map(PathBuf::from).collect())
-            .unwrap_or_else(|| vec![self.repo_root.clone()]);
+            .unwrap_or_else(|| vec![session.repo_root.clone()]);
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| anyhow::anyhow!("resolve {path}: {e}"))?;
         let allowed = roots.iter().any(|r| {
@@ -546,7 +701,7 @@ impl Daemon {
     }
 
     #[cfg(not(feature = "docling"))]
-    async fn ingest_doc(&self, _path: String) -> AgentEvent {
+    async fn ingest_doc(&self, _session: &Session, _path: String) -> AgentEvent {
         AgentEvent::Error {
             message: "DocIngest unavailable: build with --features docling".into(),
         }
@@ -559,11 +714,11 @@ impl Daemon {
     /// write runs on the blocking pool (sync fsync-per-commit). Returns whether it
     /// landed.
     #[cfg(feature = "docling")]
-    async fn persist_doc(&self, doc: &crate::ingest::IngestedDoc) -> bool {
-        let Some(store) = &self.graph else {
+    async fn persist_doc(&self, session: &Session, doc: &crate::ingest::IngestedDoc) -> bool {
+        let Some(store) = &session.graph else {
             return false;
         };
-        let embeddings = self.embed_chunks(&doc.chunks).await;
+        let embeddings = self.embed_chunks(session, &doc.chunks).await;
         let chunks = doc
             .chunks
             .iter()
@@ -599,13 +754,17 @@ impl Daemon {
     /// token-cap guard; the stored chunk text stays full-length. Returns `None`
     /// only when no embedding model is served at all.
     #[cfg(feature = "docling")]
-    async fn embed_chunks(&self, chunks: &[(String, String)]) -> Option<Vec<Option<Vec<f32>>>> {
+    async fn embed_chunks(
+        &self,
+        session: &Session,
+        chunks: &[(String, String)],
+    ) -> Option<Vec<Option<Vec<f32>>>> {
         // ponytail: chars as a token proxy — ~6000 chars sits safely under the
         // 2048-token embedding cap for prose; a real tokenizer clip can come with
         // the docling `chunking` feature.
         const EMBED_CLIP_CHARS: usize = 6000;
         const BATCH: usize = 64;
-        let model = self.skills.embed_model()?;
+        let model = session.skills.embed_model()?;
         let client = self.swarm.client();
         let texts: Vec<String> = chunks
             .iter()
@@ -636,20 +795,20 @@ impl Daemon {
     /// The graph-backed VFS will supply richer, relevance-ranked context here
     /// (hipfire embeddings/rerank picking which nodes) — but the KV-sharing shape
     /// is already right: identical bytes across the whole swarm, task in the tail.
-    async fn context_prefix(&self, task: &str) -> String {
+    async fn context_prefix(&self, session: &Session, task: &str) -> String {
         let mut s = String::from(
             "You are a subagent in the Corrode coding-agent swarm working on a shared \
 repository.\n",
         );
         // Project rules (AGENTS.md) + skills relevant to this task. Byte-identical
         // across the turn's subagents (same task), so they share the KV prefill.
-        let rules = self.skills.agents_rules();
+        let rules = session.skills.agents_rules();
         if !rules.trim().is_empty() {
             s.push_str("\nProject instructions (AGENTS.md):\n");
             s.push_str(rules.trim_end());
             s.push('\n');
         }
-        let manifest = self
+        let manifest = session
             .skills
             .prefix_section(task, &self.swarm.client(), TOP_K_SKILLS)
             .await;
@@ -658,7 +817,7 @@ repository.\n",
             s.push_str(&manifest);
         }
         s.push_str("\nRepository root:\n");
-        match self.vfs.list("").await {
+        match session.vfs.list("").await {
             Ok(entries) => {
                 for e in entries {
                     s.push_str(&format!("  {} ({} bytes)\n", e.path, e.bytes));
@@ -912,7 +1071,7 @@ async fn run_native_tool_loop(
     for _ in 0..MAX_TOOL_STEPS {
         let prompt = planner::native_tool_prompt(prefix, role, task, &scratchpad);
         let (text, _reasoning) = client
-            .respond_full(model, &prompt, band, Some(&tools), Some(&effort))
+            .respond_full(model, &prompt, band, toolbox.owner_token(), Some(&tools), Some(&effort))
             .await?;
         let _ = events
             .send(AgentEvent::SubagentOutput {
@@ -971,7 +1130,7 @@ async fn run_tool_loop(
     let mut last = String::new();
     for _ in 0..MAX_TOOL_STEPS {
         let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
-        let text = client.respond(model, &prompt, band).await?;
+        let text = client.respond(model, &prompt, band, toolbox.owner_token()).await?;
         let _ = events
             .send(AgentEvent::SubagentOutput {
                 id,
@@ -1051,7 +1210,7 @@ async fn run_task(
         .await
     } else {
         let full = planner::subagent_prompt(prefix, role, task);
-        let out = client.respond(model, &full, band).await;
+        let out = client.respond(model, &full, band, toolbox.owner_token()).await;
         if let Ok(text) = &out {
             let _ = events
                 .send(AgentEvent::SubagentOutput {
@@ -1133,7 +1292,12 @@ async fn run_fanout(
     if proposals.len() >= 2 {
         let judge_prompt = planner::fanout_judge_prompt(prefix, task, &proposals);
         match client
-            .respond(review_model, &judge_prompt, planner::band_for(Role::Review))
+            .respond(
+                review_model,
+                &judge_prompt,
+                planner::band_for(Role::Review),
+                toolbox.owner_token(),
+            )
             .await
         {
             Ok(directive) => {
@@ -1232,7 +1396,8 @@ mod tests {
             None,
             Arc::new(PassthroughVfs::new(std::env::temp_dir())),
             SkillContext::default(),
-            None,
+            None, // embed_model
+            None, // tool_caller
             std::env::temp_dir(),
             Arc::new(Dialects::default()),
         )
@@ -1600,7 +1765,7 @@ mod tests {
         eprintln!("model: {model} (small: {})", roles::is_small_model(&model));
 
         let embed = roles::default_embedding_model(&models).map(str::to_string);
-        let skills = SkillContext::build(&repo, &client, embed).await;
+        let skills = SkillContext::build(&repo, &client, embed.clone()).await;
         let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
             .expect("load Needle")
             .expect("Needle assets present");
@@ -1610,6 +1775,7 @@ mod tests {
             None,
             Arc::new(PassthroughVfs::new(&repo)),
             skills,
+            embed,
             Some(Arc::new(caller)),
             repo.clone(),
             // load() so CORRODE_TOOL_DIALECTS can put a model on its native dialect
@@ -1766,6 +1932,7 @@ mod tests {
                 &model,
                 "Read the file src/lib.rs.",
                 Priority::Default,
+                None, // owner_token
                 Some(&tools),
                 Some("none"),
             )

@@ -133,14 +133,21 @@ impl Client {
     }
 
     /// One completion over `/v1/responses` at the given priority band.
+    ///
+    /// `owner_token`, when set, overrides the default API key as the bearer for
+    /// this one request — hipfire derives its per-owner fairness key from the
+    /// authenticated principal, so a per-user hipfire token is what actually
+    /// separates one tenant's fair share from another's. `None` uses the daemon's
+    /// shared key (all requests attributed to one owner, as before).
     pub async fn respond(
         &self,
         model: &str,
         input: &str,
         priority: Priority,
+        owner_token: Option<&str>,
     ) -> anyhow::Result<String> {
         Ok(self
-            .respond_full(model, input, priority, None, None)
+            .respond_full(model, input, priority, owner_token, None, None)
             .await?
             .0)
     }
@@ -157,6 +164,7 @@ impl Client {
         model: &str,
         input: &str,
         priority: Priority,
+        owner_token: Option<&str>,
         tools: Option<&serde_json::Value>,
         effort: Option<&str>,
     ) -> anyhow::Result<(String, String)> {
@@ -172,8 +180,9 @@ impl Client {
             .http
             .post(format!("{}/v1/responses", self.base_url))
             .json(&req);
-        if let Some(key) = &self.api_key {
-            rb = rb.bearer_auth(key);
+        // Per-user hipfire token (fairness) overrides the shared key for this call.
+        if let Some(token) = owner_token.or(self.api_key.as_deref()) {
+            rb = rb.bearer_auth(token);
         }
         let reply: ResponsesReply = rb.send().await?.error_for_status()?.json().await?;
         let reasoning = reply.reasoning().to_string();

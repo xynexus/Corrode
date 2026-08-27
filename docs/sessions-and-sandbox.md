@@ -4,7 +4,9 @@
 per-session repositories, and confining every shell it spawns (the agent's and
 the human's) inside a bubblewrap namespace.
 
-- **Status:** Phase 1 (sandbox) landed; Phases 2–3 (sessions, auth) pending
+- **Status:** all three phases landed (Phase 1 sandbox; Phase 2 sessions +
+  `SelectRepo` + per-tab terminals; Phase 3 auth + per-user keying + hipfire
+  owner token)
 - **Date:** 2026-08-27
 - **Scope:** tenancy model + process sandbox
 - **Decided:** tenancy key = **per-authenticated-user** (Option B). Ship
@@ -133,26 +135,32 @@ match cmd {
 
 ---
 
-## 4. Fairness to hipfire — one field
+## 4. Fairness to hipfire — via the bearer token, not metadata
 
-The scheduling side of multi-tenancy is already built downstream. hipfire does
-admission control against a VRAM/memory budget with **per-owner fairness keys**
-(`swarm.rs:15`) — so one user flooding the swarm can't starve another, *if* Corrode
-tells hipfire who's who. Today it doesn't: every request carries a priority band
-but no owner. `ResponsesRequest` sends `metadata.hipfire_priority` and nothing else
-(`hipfire.rs:167`).
+The scheduling side of multi-tenancy is already built downstream: hipfire does
+admission control with **per-owner fairness keys**. But the earlier assumption that
+Corrode could set a `hipfire_owner` *metadata* field was wrong — reading the hipfire
+source (`hipfire-server/src/routes/responses.rs`, `chat.rs::scheduler_owner_from_principal`)
+shows the fairness owner is derived **entirely from the authenticated principal**
+(`principal.user_id` + `token_id`), i.e. from the **bearer token**. There is no
+request-metadata field for it; only `hipfire_priority` is read from metadata.
 
-```rust
-// now
-metadata: json!({ "hipfire_priority": priority.as_u8() }),
-// proposed — thread the session key through Task -> Client
-metadata: json!({ "hipfire_priority": priority.as_u8(),
-                  "hipfire_owner": owner.as_str() }),  // per-user fairness
-```
+So per-user fairness needs a **per-user hipfire token**, not a metadata key. What
+landed:
 
-The plumbing: `SessionKey` → the swarm's `Task` → the `Client` call. No new
-subsystem, no scheduler change. **Confirm the exact metadata field name against
-hipfire's admission API before wiring.**
+- `hipfire::Client::respond`/`respond_full` gained an `owner_token: Option<&str>`
+  that overrides the shared API key as the bearer for that one call.
+- The token is carried per-session (`Session.owner_token`), sourced from the
+  `hipfire_token` field of the user's `CORRODE_USERS` entry, and threaded to the
+  generation calls via `swarm::Task.owner_token` (planning) and `ToolBox` (the tool
+  loops, which already hold it — no long-signature churn).
+- With a per-user `hipfire_token`, that user's swarm authenticates to hipfire as a
+  distinct principal → its own fair share. Without one (or with auth off), all
+  requests use the daemon's shared key exactly as before.
+
+Embeddings (`/v1/embeddings`) carry no scheduler metadata and are left on the shared
+key. ponytail: activating per-user fairness requires the operator to provision
+per-user hipfire tokens; until then the threading is a clean no-op.
 
 ---
 
@@ -248,12 +256,16 @@ Ordered by value-per-risk; each is independently deployable.
    gated by `CORRODE_SANDBOX` (default off). No tenancy change, no auth — pure
    hardening of the LAN-exposed surface. Verified end-to-end: the web terminal runs
    confined (repo rw, `.corrode` ro, no network, job control intact).
-2. **Extract `Session`, per-connection.** Move the repo-scoped fields into
-   `Session`, add the registry and `SelectRepo`, fix the hardcoded `"web"`
-   terminal id. Delivers "run as a service, pick the repo at connect" without auth.
-3. **Auth + per-user keying.** Add identity at the web layer, re-key sessions by
-   user, thread the owner key to hipfire (§4). This is the step that makes it
-   genuinely multi-user and fair.
+2. **Extract `Session`, per-connection.** ✅ *Landed.* Repo-scoped state moved into
+   `Session`/`RepoResources`, a registry + `SelectRepo` added, the hardcoded `"web"`
+   terminal id replaced by a per-tab `sessionStorage` id (stable across reloads, so
+   adoption still works). Lazy default binding to `CORRODE_REPO` keeps single-tenant
+   behaviour. Delivers "run as a service, pick the repo at connect".
+3. **Auth + per-user keying.** ✅ *Landed.* Auth is an `Authenticate` first-frame
+   validated by the daemon against `CORRODE_USERS` (corrode-web stays a dumb proxy);
+   sessions are keyed by `(user, repo)`; the per-user hipfire token threads to the
+   generation path (§4). Verified end-to-end: pre-auth commands get `AuthRequired`,
+   a valid token unlocks the session, `SelectRepo` switches repos.
 
 Orthogonal: a `systemd` unit (`After=hipfire`, sandbox env set) turns "runs as a
 service" into config rather than code — worth doing alongside Phase 1.

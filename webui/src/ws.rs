@@ -90,6 +90,18 @@ fn apply_event(
         AgentEvent::TerminalOutput { data, .. } => {
             crate::term::write(&data);
         }
+        // Session/auth notices -> the console. (The repo tree still refreshes via a
+        // ListDir the app fires after selecting a repo.)
+        AgentEvent::AuthOk { user } => {
+            log.update(|l| l.push(LogEntry::Ws(format!("authenticated as {user}"))))
+        }
+        AgentEvent::AuthRequired => log.update(|l| {
+            l.push(LogEntry::Ws("authentication required — sign in first".into()))
+        }),
+        AgentEvent::RepoSelected { path, user } => log.update(|l| {
+            let who = if user.is_empty() { String::new() } else { format!(" ({user})") };
+            l.push(LogEntry::Ws(format!("repo selected: {path}{who}")))
+        }),
         // Explorer listing -> both the DOM tree and the egui graph panel.
         AgentEvent::DirListing { entries: es, .. } => {
             let rows: Vec<(String, bool)> = es.into_iter().map(|e| (e.path, e.is_dir)).collect();

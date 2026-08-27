@@ -34,8 +34,18 @@
       }
       .topbar {
         padding: 8px 14px; background: #0f1114; border-bottom: 1px solid #262a30;
+        display: flex; align-items: center; gap: 10px;
       }
       .brand { color: #e08a4b; font-weight: 700; }
+      /* Auth (sign-in) row in the topbar, and the repo selector in the explorer. */
+      .auth { display: flex; gap: 6px; align-items: center; }
+      .topbar input, .repo-bar input {
+        background: #14161b; color: #d7dbe0; border: 1px solid #363b42;
+        border-radius: 5px; padding: 3px 7px; font-size: 12px;
+      }
+      .auth-user { width: 90px; } .auth-token { width: 90px; }
+      .repo-bar { gap: 6px; }
+      .repo-input { flex: 1; min-width: 0; }
       .cols {
         flex: 1; min-height: 0;
         display: grid; grid-template-columns: 240px 5px 1fr 5px 340px;
@@ -71,7 +81,7 @@
       .graph-canvas { flex: 1; width: 100%; min-height: 0; display: block; }
 
       .status {
-        float: right; color: #8b929c; font-size: 12px;
+        margin-left: auto; color: #8b929c; font-size: 12px;
       }
       .status.busy { color: #e0b04b; }
       .status.busy::before {

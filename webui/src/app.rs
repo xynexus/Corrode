@@ -10,7 +10,23 @@ use wasm_bindgen::JsCast;
 use crate::model;
 use crate::{egui_panel, term, ws};
 
-const SESSION: &str = "web";
+/// A per-browser-tab terminal session id, stable across reloads (so a reload
+/// adopts the running shell) but unique per tab (so two tabs don't share one pty).
+/// Backed by `sessionStorage`, which is exactly per-tab-and-survives-reload; a
+/// random fallback keeps things working if storage is unavailable.
+fn terminal_session_id() -> String {
+    let store = web_sys::window().and_then(|w| w.session_storage().ok().flatten());
+    if let Some(s) = &store {
+        if let Ok(Some(id)) = s.get_item("corrode-term-id") {
+            return id;
+        }
+    }
+    let id = format!("tab-{:x}", (js_sys::Math::random() * 1e12) as u64);
+    if let Some(s) = &store {
+        let _ = s.set_item("corrode-term-id", &id);
+    }
+    id
+}
 
 /// Render one agent message (Markdown, possibly with `$…$` LaTeX) to HTML. KaTeX
 /// renders the math afterward, over the mounted element. Raw HTML is dropped
@@ -117,22 +133,25 @@ pub fn App() -> impl IntoView {
     let term_ref = NodeRef::<html::Div>::new();
     {
         let cmd_tx = cmd_tx.clone();
+        let term_session = terminal_session_id();
         Effect::new(move |_| {
             if let Some(div) = term_ref.get() {
                 let el: web_sys::HtmlElement = div.unchecked_into();
                 let tx_data = cmd_tx.clone();
                 let tx_resize = cmd_tx.clone();
+                let sid_data = term_session.clone();
+                let sid_resize = term_session.clone();
                 term::init(
                     el,
                     move |s: String| {
                         let _ = tx_data.unbounded_send(AgentCommand::TerminalInput {
-                            session: SESSION.into(),
+                            session: sid_data.clone(),
                             data: s.into_bytes(),
                         });
                     },
                     move |cols: u32, rows: u32| {
                         let _ = tx_resize.unbounded_send(AgentCommand::TerminalResize {
-                            session: SESSION.into(),
+                            session: sid_resize.clone(),
                             cols: cols as u16,
                             rows: rows as u16,
                         });
@@ -206,9 +225,55 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    // Repo selection (Phase 2): bind this connection to a repo, then refresh the tree.
+    let repo_path = RwSignal::new(String::new());
+    let select_repo = {
+        let cmd_tx = cmd_tx.clone();
+        move |_| {
+            let path = repo_path.get();
+            if !path.trim().is_empty() {
+                let _ = cmd_tx.unbounded_send(AgentCommand::SelectRepo { path });
+                let _ = cmd_tx.unbounded_send(AgentCommand::ListDir { path: String::new() });
+            }
+        }
+    };
+
+    // Authentication (Phase 3): sign in when the daemon has a user table configured.
+    let auth_user = RwSignal::new(String::new());
+    let auth_token = RwSignal::new(String::new());
+    let sign_in = {
+        let cmd_tx = cmd_tx.clone();
+        move |_| {
+            let user = auth_user.get();
+            if !user.trim().is_empty() {
+                let _ = cmd_tx.unbounded_send(AgentCommand::Authenticate {
+                    user,
+                    token: auth_token.get(),
+                });
+                auth_token.set(String::new());
+            }
+        }
+    };
+
     view! {
         <header class="topbar">
             <span class="brand">"Corrode"</span>" swarm console"
+            <span class="auth">
+                <input
+                    class="auth-user"
+                    placeholder="user"
+                    prop:value=move || auth_user.get()
+                    on:input=move |ev| auth_user.set(event_target_value(&ev))
+                />
+                <input
+                    class="auth-token"
+                    type="password"
+                    placeholder="token"
+                    prop:value=move || auth_token.get()
+                    on:input=move |ev| auth_token.set(event_target_value(&ev))
+                />
+                <button on:click=sign_in>"sign in"</button>
+            </span>
             <span class="status" class:busy=move || busy.get()>
                 {move || if busy.get() { "working…" } else { "idle" }}
             </span>
@@ -225,6 +290,15 @@ pub fn App() -> impl IntoView {
                 <div class="bar">
                     <span>"explorer"</span>
                     <button on:click=list_root>"list root"</button>
+                </div>
+                <div class="bar repo-bar">
+                    <input
+                        class="repo-input"
+                        placeholder="repo path…"
+                        prop:value=move || repo_path.get()
+                        on:input=move |ev| repo_path.set(event_target_value(&ev))
+                    />
+                    <button on:click=select_repo>"select"</button>
                 </div>
                 <ul class="tree">
                     {move || entries.get().into_iter().map(|(path, is_dir)| view! {
