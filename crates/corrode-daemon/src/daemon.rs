@@ -599,12 +599,11 @@ impl Daemon {
         }
     }
 
-    /// GraphRAG doc retrieval: embed the question via hipfire (query-side task
-    /// prompt) and similarity-search the chunk vectors; without an embedding
-    /// model, fall back to the store's BM25 text search. The answer text is the
-    /// retrieved chunks verbatim.
-    /// ponytail: retrieval-only — the synthesis pass (feed chunks + question to a
-    /// hipfire chat model) is the next layer.
+    /// GraphRAG: retrieve, then synthesize. Embed the question (query-side prompt)
+    /// and vector-search the chunks (BM25 fallback with no embedding model), then
+    /// feed the retrieved chunks + question to a hipfire chat model for a grounded
+    /// answer that cites the chunk ids. Synthesis failure (no model, or the call
+    /// errors) degrades to the raw chunks — retrieval still stands.
     async fn doc_query(&self, session: &Session, question: &str) -> AgentEvent {
         let Some(g) = &session.graph else {
             return AgentEvent::Error {
@@ -623,23 +622,42 @@ impl Daemon {
             store.doc_search(&q, query_vec.as_deref(), 8)
         })
         .await;
-        let result = match searched {
-            Ok(r) => r,
+        let hits = match searched {
+            Ok(Ok(hits)) => hits,
+            Ok(Err(e)) => return AgentEvent::Error { message: format!("doc search: {e}") },
             Err(e) => return AgentEvent::Error { message: format!("doc search task: {e}") },
         };
-        match result {
-            Ok(hits) => AgentEvent::DocAnswer {
-                text: hits
-                    .iter()
-                    .map(|(id, text)| format!("> [{id}]\n{text}"))
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-                grounded_on: hits.into_iter().map(|(id, _)| id).collect(),
-            },
-            Err(e) => AgentEvent::Error {
-                message: format!("doc search: {e}"),
-            },
+        let grounded_on: Vec<String> = hits.iter().map(|(id, _)| id.clone()).collect();
+        let raw = || {
+            hits.iter()
+                .map(|(id, text)| format!("> [{id}]\n{text}"))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        // Nothing retrieved: no point synthesizing.
+        if hits.is_empty() {
+            return AgentEvent::DocAnswer {
+                text: "No matching documentation.".into(),
+                grounded_on,
+            };
         }
+        // Synthesis pass: a read/summarize model answers grounded on the chunks.
+        let text = match self.roles.model_for(Role::Research) {
+            Some(model) => {
+                let prompt = planner::doc_synthesis_prompt(question, &hits);
+                match self
+                    .swarm
+                    .client()
+                    .respond(model, &prompt, Priority::Default, session.owner_token.as_deref())
+                    .await
+                {
+                    Ok(answer) if !answer.trim().is_empty() => answer,
+                    _ => raw(), // model absent/failed/empty -> hand back the chunks
+                }
+            }
+            None => raw(),
+        };
+        AgentEvent::DocAnswer { text, grounded_on }
     }
 
     /// Convert + chunk a reference doc via docling, then persist doc/chunk nodes

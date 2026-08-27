@@ -121,6 +121,24 @@ files, and checks. Reply with only the directive.",
     format!("{context_prefix}\n\n{tail}")
 }
 
+/// The GraphRAG synthesis prompt: answer `question` grounded ONLY in the retrieved
+/// `chunks` (`(id, text)`), citing the chunk ids used. Kept strict — no outside
+/// knowledge, and an explicit "not in the docs" escape — so the answer stays
+/// attributable to the store, which is the whole point of retrieval-grounding.
+pub fn doc_synthesis_prompt(question: &str, chunks: &[(String, String)]) -> String {
+    let mut s = String::from(
+        "Answer the question using ONLY the reference excerpts below. Do not use outside \
+knowledge. Cite the excerpt ids you rely on in square brackets, e.g. [chunk:foo#0]. If the \
+excerpts don't contain the answer, say so plainly.\n\n",
+    );
+    s.push_str("Excerpts:\n");
+    for (id, text) in chunks {
+        s.push_str(&format!("[{id}]\n{text}\n\n"));
+    }
+    s.push_str(&format!("Question: {question}\n\nAnswer:"));
+    s
+}
+
 /// The task text for the plan-level review pass: the settled plan's digest, plus an
 /// instruction to verify against the repo and route fixes through the normal
 /// follow-up channel (`NEXT:` line -> emitted fix task).
@@ -189,6 +207,21 @@ pub fn band_for(role: Role) -> Priority {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doc_synthesis_prompt_grounds_and_carries_chunks() {
+        let chunks = vec![
+            ("chunk:cpu.md#0".to_string(), "R15 is the program counter.".to_string()),
+            ("chunk:cpu.md#1".to_string(), "Interrupts vector at 0xFFFF0000.".to_string()),
+        ];
+        let p = doc_synthesis_prompt("where do interrupts vector?", &chunks);
+        // the question, both chunk ids, and both texts must all reach the model,
+        // with an explicit grounding instruction and citation format.
+        assert!(p.contains("where do interrupts vector?"));
+        assert!(p.contains("[chunk:cpu.md#0]") && p.contains("[chunk:cpu.md#1]"));
+        assert!(p.contains("0xFFFF0000") && p.contains("program counter"));
+        assert!(p.contains("ONLY") && p.to_lowercase().contains("cite"));
+    }
 
     #[test]
     fn parse_plan_extracts_from_surrounding_prose_and_defaults_unknown_role() {
