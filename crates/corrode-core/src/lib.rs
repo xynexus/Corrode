@@ -166,7 +166,13 @@ pub enum AgentEvent {
     /// `SelectRepo` succeeded: the connection is now bound to `path` (canonicalized)
     /// for `user` ("" when auth is off).
     RepoSelected { path: String, user: String },
-    /// A subagent produced output.
+    /// An incremental chunk of subagent `id`'s output, streamed as it generates
+    /// (when `CORRODE_STREAM` is on). The client appends deltas to that id's entry;
+    /// the final `SubagentOutput` for the same id carries the authoritative full
+    /// text and reconciles it. Absent entirely in non-streaming mode.
+    SubagentDelta { id: u64, text: String },
+    /// A subagent produced output (the authoritative full text). In streaming mode
+    /// this arrives after the `SubagentDelta`s and finalizes that id's entry.
     SubagentOutput { id: u64, text: String },
     /// Terminal frame back to the wasm terminal.
     TerminalOutput { session: String, data: Vec<u8> },
@@ -304,6 +310,10 @@ mod tests {
         pin(
             &AgentEvent::ApprovalRequest { id: 7, action: "write src/main.rs".into() },
             r#"{"ApprovalRequest":{"id":7,"action":"write src/main.rs"}}"#,
+        );
+        pin(
+            &AgentEvent::SubagentDelta { id: 3, text: "par".into() },
+            r#"{"SubagentDelta":{"id":3,"text":"par"}}"#,
         );
         pin(
             &AgentEvent::SubagentOutput { id: 3, text: "done".into() },

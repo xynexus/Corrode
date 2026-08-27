@@ -18,6 +18,78 @@ pub struct Client {
     base_url: String,
     api_key: Option<String>,
     max_output_tokens: u32,
+    /// Stream `/v1/responses` (SSE) so subagent output reaches the UI as it's
+    /// generated, not in one block at the end. Off by default (`CORRODE_STREAM`).
+    stream: bool,
+}
+
+/// One decoded SSE event from hipfire's `/v1/responses` stream. hipfire tags each
+/// event both with an `event:` name and a `"type"` inside the JSON `data:`; we key
+/// off the JSON type, so the `event:` line is ignored.
+#[derive(Debug, PartialEq)]
+enum SseDelta {
+    /// An incremental chunk of the answer.
+    Text(String),
+    /// An incremental chunk of reasoning (streamed separately from the answer).
+    Reasoning(String),
+    /// The final, authoritative full answer text (`response.output_text.done`).
+    TextDone(String),
+}
+
+/// The usable answer from a `/v1/responses` reply. Some hipfire model builds (the
+/// think-native / think-filtered quants seen in practice) route the whole answer
+/// into `reasoning_content` and leave `output_text` empty; an empty answer is
+/// useless to the swarm, so fall back to the reasoning when the answer channel is
+/// blank. When `output_text` is present it wins untouched.
+fn answer_or_reasoning(output_text: String, reasoning: &str) -> String {
+    if output_text.trim().is_empty() && !reasoning.trim().is_empty() {
+        reasoning.to_string()
+    } else {
+        output_text
+    }
+}
+
+/// Parse ONE complete SSE event block (the text between `\n\n` boundaries) into a
+/// delta, if it carries one. Concatenates multiple `data:` lines per the SSE spec;
+/// non-JSON payloads (e.g. `[DONE]`) and uninteresting events yield `None`.
+///
+/// Classification keys off the `event:` line, NOT the JSON `type`: hipfire builds
+/// every delta's `data` with the same helper, so the JSON `type` is always
+/// `response.output_text.delta` even for a reasoning delta — only the `event:` name
+/// distinguishes them. Falls back to the JSON `type` if there's no `event:` line
+/// (a spec-compliant server that omits it).
+fn parse_sse_event(block: &str) -> Option<SseDelta> {
+    let mut event_name = "";
+    let mut data_parts: Vec<&str> = Vec::new();
+    for line in block.lines() {
+        if let Some(v) = line.strip_prefix("event:") {
+            event_name = v.trim();
+        } else if let Some(v) = line.strip_prefix("data:") {
+            data_parts.push(v.trim());
+        }
+    }
+    let data = data_parts.join("\n");
+    if data.is_empty() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let kind = if event_name.is_empty() {
+        json.get("type").and_then(|t| t.as_str())?
+    } else {
+        event_name
+    };
+    match kind {
+        "response.output_text.delta" => {
+            Some(SseDelta::Text(json.get("delta")?.as_str()?.to_string()))
+        }
+        "response.reasoning.delta" => {
+            Some(SseDelta::Reasoning(json.get("delta")?.as_str()?.to_string()))
+        }
+        "response.output_text.done" => {
+            Some(SseDelta::TextDone(json.get("text")?.as_str()?.to_string()))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Serialize)]
@@ -117,12 +189,23 @@ impl Client {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4096);
+        let stream = matches!(
+            std::env::var("CORRODE_STREAM").ok().as_deref(),
+            Some("1") | Some("true") | Some("on")
+        );
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into(),
             api_key,
             max_output_tokens,
+            stream,
         }
+    }
+
+    /// Whether `/v1/responses` should be streamed (SSE). Callers that want to relay
+    /// deltas to the UI branch on this and use [`Self::respond_streaming`].
+    pub fn streaming(&self) -> bool {
+        self.stream
     }
 
     /// The models hipfire currently serves (`GET /v1/models`), by id. Role
@@ -190,7 +273,95 @@ impl Client {
         }
         let reply: ResponsesReply = rb.send().await?.error_for_status()?.json().await?;
         let reasoning = reply.reasoning().to_string();
-        Ok((reply.output_text, reasoning))
+        Ok((answer_or_reasoning(reply.output_text, &reasoning), reasoning))
+    }
+
+    /// Like [`Self::respond`], but streams: `on_delta` is called with each incremental
+    /// chunk as it arrives — answer AND reasoning deltas both, so the UI shows
+    /// progress even on models that emit only reasoning — and the accumulated
+    /// `(answer, reasoning)` is returned at the end (answer falls back to reasoning
+    /// when the model left `output_text` empty, same as [`Self::respond_full`]). A
+    /// non-empty `response.output_text.done` wins over the concatenated answer
+    /// deltas. `on_delta` is sync and best-effort (a UI relay uses `try_send`); it
+    /// must not block.
+    pub async fn respond_streaming(
+        &self,
+        model: &str,
+        input: &str,
+        priority: Priority,
+        owner_token: Option<&str>,
+        mut on_delta: impl FnMut(&str),
+    ) -> anyhow::Result<(String, String)> {
+        use futures_util::StreamExt;
+
+        let req = ResponsesRequest {
+            model,
+            input,
+            max_output_tokens: self.max_output_tokens,
+            metadata: serde_json::json!({ "hipfire_priority": priority.as_u8(), "stream": true }),
+            tools: None,
+            reasoning_effort: None,
+        };
+        // `stream` is a top-level field on the responses request; serde on
+        // ResponsesRequest doesn't carry it, so send a merged object.
+        let mut body = serde_json::to_value(&req)?;
+        body["stream"] = serde_json::Value::Bool(true);
+
+        let mut rb = self
+            .http
+            .post(format!("{}/v1/responses", self.base_url))
+            .json(&body);
+        if let Some(token) = owner_token.or(self.api_key.as_deref()) {
+            rb = rb.bearer_auth(token);
+        }
+        let resp = rb.send().await?.error_for_status()?;
+
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut buf = String::new();
+        let mut bytes = resp.bytes_stream();
+        while let Some(chunk) = bytes.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk?));
+            // Drain every complete SSE event (terminated by a blank line).
+            while let Some(pos) = buf.find("\n\n") {
+                let block: String = buf.drain(..pos + 2).collect();
+                match parse_sse_event(&block) {
+                    Some(SseDelta::Text(d)) => {
+                        on_delta(&d);
+                        text.push_str(&d);
+                    }
+                    // Relay reasoning to the UI too (so streaming is visible even on
+                    // models that emit everything as reasoning), but keep it in the
+                    // reasoning channel — the final answer reconciles via SubagentOutput.
+                    Some(SseDelta::Reasoning(d)) => {
+                        on_delta(&d);
+                        reasoning.push_str(&d);
+                    }
+                    // Authoritative only when non-empty: some models send an empty
+                    // `done` and carry the real answer in the deltas we accumulated.
+                    Some(SseDelta::TextDone(full)) if !full.is_empty() => text = full,
+                    Some(SseDelta::TextDone(_)) => {}
+                    None => {}
+                }
+            }
+        }
+        // A final event without a trailing blank line.
+        if !buf.trim().is_empty() {
+            match parse_sse_event(&buf) {
+                Some(SseDelta::Text(d)) => {
+                    on_delta(&d);
+                    text.push_str(&d);
+                }
+                Some(SseDelta::Reasoning(d)) => {
+                    on_delta(&d);
+                    reasoning.push_str(&d);
+                }
+                Some(SseDelta::TextDone(full)) if !full.is_empty() => text = full,
+                Some(SseDelta::TextDone(_)) => {}
+                None => {}
+            }
+        }
+        Ok((answer_or_reasoning(text, &reasoning), reasoning))
     }
 
     /// Embed one string (`/v1/embeddings`) — code/doc/skill retrieval is a hipfire
@@ -243,5 +414,61 @@ impl Client {
             );
         }
         Ok(data.into_iter().map(|d| d.embedding).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_output_reasoning_and_done_events_ignores_the_rest() {
+        // Real hipfire format: the JSON `type` is ALWAYS output_text.delta; only the
+        // `event:` line distinguishes an answer delta from a reasoning delta.
+        assert_eq!(
+            parse_sse_event(
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}"
+            ),
+            Some(SseDelta::Text("Hel".into()))
+        );
+        // Same JSON type, but the reasoning event name -> classified as reasoning.
+        assert_eq!(
+            parse_sse_event(
+                "event: response.reasoning.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"think\"}"
+            ),
+            Some(SseDelta::Reasoning("think".into()))
+        );
+        // A `done` may be empty (the answer came via deltas) — parsed as-is; the
+        // accumulator ignores an empty one so it can't clobber the deltas.
+        assert_eq!(
+            parse_sse_event(
+                "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"text\":\"\"}"
+            ),
+            Some(SseDelta::TextDone(String::new()))
+        );
+        // Fallback to JSON `type` when there's no event: line (spec-compliant server).
+        assert_eq!(
+            parse_sse_event("data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}"),
+            Some(SseDelta::Text("x".into()))
+        );
+        // Uninteresting events and non-JSON payloads are skipped.
+        assert_eq!(
+            parse_sse_event(
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}"
+            ),
+            None
+        );
+        assert_eq!(parse_sse_event("data: [DONE]"), None);
+        assert_eq!(parse_sse_event(": keep-alive comment"), None);
+    }
+
+    #[test]
+    fn answer_falls_back_to_reasoning_only_when_output_is_blank() {
+        // Normal case: a real answer is returned as-is.
+        assert_eq!(answer_or_reasoning("the answer".into(), "some thinking"), "the answer");
+        // Think-native model: empty output_text -> recover the answer from reasoning.
+        assert_eq!(answer_or_reasoning("   ".into(), "4"), "4");
+        // Nothing anywhere stays empty (no spurious fallback).
+        assert_eq!(answer_or_reasoning(String::new(), "  "), "");
     }
 }

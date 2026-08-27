@@ -120,9 +120,21 @@ fn apply_event(
             }
             entries.set(rows);
         }
-        AgentEvent::SubagentOutput { id, text } => {
-            log.update(|l| l.push(LogEntry::Agent { id, text }))
-        }
+        // Incremental streamed output: append to this id's entry, or start one.
+        AgentEvent::SubagentDelta { id, text } => log.update(|l| {
+            match l.iter_mut().rev().find(|e| matches!(e, LogEntry::Agent { id: i, .. } if *i == id)) {
+                Some(LogEntry::Agent { text: t, .. }) => t.push_str(&text),
+                _ => l.push(LogEntry::Agent { id, text }),
+            }
+        }),
+        // Authoritative full text: finalize this id's entry (reconciling any streamed
+        // deltas), or start one when nothing streamed (non-streaming mode).
+        AgentEvent::SubagentOutput { id, text } => log.update(|l| {
+            match l.iter_mut().rev().find(|e| matches!(e, LogEntry::Agent { id: i, .. } if *i == id)) {
+                Some(LogEntry::Agent { text: t, .. }) => *t = text,
+                _ => l.push(LogEntry::Agent { id, text }),
+            }
+        }),
         // A mutating tool call blocked on a human; the console renders the queue
         // with approve/deny buttons that reply `ApprovalResponse`.
         AgentEvent::ApprovalRequest { id, action } => {

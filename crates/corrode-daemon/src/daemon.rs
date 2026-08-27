@@ -1291,7 +1291,22 @@ async fn run_task(
         .await
     } else {
         let full = planner::subagent_prompt(prefix, role, task);
-        let out = client.respond(model, &full, band, toolbox.owner_token()).await;
+        let out = if client.streaming() {
+            // Relay each delta to the UI as it arrives (best-effort: try_send drops
+            // under backpressure, the final SubagentOutput below reconciles).
+            let ev = events.clone();
+            let (text, _reasoning) = client
+                .respond_streaming(model, &full, band, toolbox.owner_token(), |delta| {
+                    let _ = ev.try_send(AgentEvent::SubagentDelta {
+                        id,
+                        text: delta.to_string(),
+                    });
+                })
+                .await?;
+            Ok(text)
+        } else {
+            client.respond(model, &full, band, toolbox.owner_token()).await
+        };
         if let Ok(text) = &out {
             let _ = events
                 .send(AgentEvent::SubagentOutput {
