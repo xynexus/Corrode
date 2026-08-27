@@ -119,7 +119,8 @@ fn agent_ws_url() -> String {
 pub fn App() -> impl IntoView {
     let shared = model::shared();
     let log = RwSignal::new(Vec::<ws::LogEntry>::new());
-    let entries = RwSignal::new(Vec::<(String, bool)>::new());
+    // (path, is_dir, graph node_id) — node_id set for files the graph tracks.
+    let entries = RwSignal::new(Vec::<(String, bool, Option<String>)>::new());
     let approvals = RwSignal::new(Vec::<(u64, String)>::new());
     // In-flight turn indicator: set on Prompt, cleared by TurnComplete. ponytail:
     // one flag, not per-plan tracking — a second concurrent prompt's completion
@@ -355,23 +356,32 @@ pub fn App() -> impl IntoView {
                 <ul class="tree">
                     {move || {
                         let tx = tree_tx.clone();
-                        entries.get().into_iter().map(move |(path, is_dir)| {
+                        entries.get().into_iter().map(move |(path, is_dir, node_id)| {
                             let tx = tx.clone();
                             let p = path.clone();
-                            // Dir -> descend (set cwd + re-list); file -> read into the console.
+                            let nid = node_id.clone();
+                            // Dir -> descend (set cwd + re-list). File -> read into the
+                            // console; if the graph tracks it, also pivot the graph view
+                            // to its provenance (ListNeighbors on its code node).
                             let open = move |_| {
                                 if is_dir {
                                     cwd.set(p.clone());
                                     let _ = tx.unbounded_send(AgentCommand::ListDir { path: p.clone() });
                                 } else {
                                     let _ = tx.unbounded_send(AgentCommand::ReadFile { path: p.clone() });
+                                    if let Some(id) = &nid {
+                                        let _ = tx.unbounded_send(AgentCommand::ListNeighbors { node_id: id.clone() });
+                                    }
                                 }
                             };
-                            // Show just the basename — the bar shows the full cwd.
+                            // Show just the basename — the bar shows the full cwd. A ●
+                            // marks a file the provenance graph tracks (click to pivot).
                             let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                            let tracked = !is_dir && node_id.is_some();
                             view! {
-                                <li class:dir=is_dir class:file=!is_dir on:click=open>
+                                <li class:dir=is_dir class:file=!is_dir class:tracked=tracked on:click=open>
                                     {if is_dir { "📁 " } else { "📄 " }}{name}
+                                    {if tracked { " ●" } else { "" }}
                                 </li>
                             }
                         }).collect_view()

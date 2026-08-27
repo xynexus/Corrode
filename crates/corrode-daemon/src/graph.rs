@@ -52,6 +52,13 @@ pub trait GraphStore: Send + Sync {
     /// doc GraphRAG holds (ingest -> list -> ask). Chunks/provenance nodes are
     /// excluded (kind == "doc" only).
     fn list_docs(&self) -> anyhow::Result<Vec<(String, String)>>;
+
+    /// Every provenance `code` node as `(repo_path, node_id)`. A path can map to
+    /// several nodes (one per plan that produced it — ids are `{plan}:code:{path}`);
+    /// the LATEST wins in the returned map order isn't guaranteed, so callers that
+    /// want one id per path should keep the last. Lets the explorer tag which files
+    /// the graph tracks and pivot a file to its provenance.
+    fn code_nodes(&self) -> anyhow::Result<Vec<(String, String)>>;
 }
 
 /// One document's full chunk set, for [`GraphStore::replace_doc`]. Owned strings:
@@ -457,6 +464,21 @@ pub mod embedded {
             docs.sort(); // stable order for the UI (n_from_type order is engine-internal)
             Ok(docs)
         }
+
+        fn code_nodes(&self) -> anyhow::Result<Vec<(String, String)>> {
+            let arena = Bump::new();
+            let txn = self.storage.graph_env.read_txn()?;
+            let all: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
+                .n_from_type(LABEL)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("scan nodes: {e:?}"))?;
+            // label is the repo path; id is `{plan}:code:{path}`.
+            Ok(all
+                .iter()
+                .filter(|n| prop_str(n, "kind") == "code")
+                .map(|n| (prop_str(n, "label"), prop_str(n, "key")))
+                .collect())
+        }
     }
 
     impl HelixStore {
@@ -753,6 +775,32 @@ pub mod embedded {
                     ("doc:mem".to_string(), "Memory guide".to_string()),
                 ],
                 "only doc nodes, sorted, with titles: {docs:?}"
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn code_nodes_returns_path_and_id_excluding_other_kinds() {
+            let dir = scratch_dir("codenodes");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            // provenance shape: plan <- task <- code (id is {plan}:code:{path})
+            store.upsert_node("plan-0", "plan", "plan-0").unwrap();
+            store.upsert_node("plan-0:task:0", "task", "write it").unwrap();
+            store.upsert_node("plan-0:code:src/lib.rs", "code", "src/lib.rs").unwrap();
+            store.upsert_node("plan-0:code:src/main.rs", "code", "src/main.rs").unwrap();
+
+            let mut got = store.code_nodes().unwrap();
+            got.sort();
+            assert_eq!(
+                got,
+                vec![
+                    ("src/lib.rs".to_string(), "plan-0:code:src/lib.rs".to_string()),
+                    ("src/main.rs".to_string(), "plan-0:code:src/main.rs".to_string()),
+                ],
+                "only code nodes, (path, id): {got:?}"
             );
 
             std::fs::remove_dir_all(&dir).ok();

@@ -33,7 +33,7 @@ pub fn spawn_agent(
     url: String,
     shared: Shared,
     log: RwSignal<Vec<LogEntry>>,
-    entries: RwSignal<Vec<(String, bool)>>,
+    entries: RwSignal<Vec<(String, bool, Option<String>)>>,
     approvals: RwSignal<Vec<(u64, String)>>,
     busy: RwSignal<bool>,
 ) -> UnboundedSender<AgentCommand> {
@@ -81,7 +81,7 @@ fn apply_event(
     ev: AgentEvent,
     shared: &Shared,
     log: RwSignal<Vec<LogEntry>>,
-    entries: RwSignal<Vec<(String, bool)>>,
+    entries: RwSignal<Vec<(String, bool, Option<String>)>>,
     approvals: RwSignal<Vec<(u64, String)>>,
     busy: RwSignal<bool>,
 ) {
@@ -110,14 +110,18 @@ fn apply_event(
         }),
         // Explorer listing -> both the DOM tree and the egui graph panel.
         AgentEvent::DirListing { entries: es, .. } => {
-            let rows: Vec<(String, bool)> = es.into_iter().map(|e| (e.path, e.is_dir)).collect();
+            // egui graph panel wants just (path, is_dir); the DOM tree also wants the
+            // graph node_id (to mark tracked files + pivot to provenance on click).
+            let egui_rows: Vec<(String, bool)> = es.iter().map(|e| (e.path.clone(), e.is_dir)).collect();
             {
                 let mut m = shared.borrow_mut();
-                m.entries = rows.clone();
+                m.entries = egui_rows;
                 if let Some(ctx) = &m.egui_ctx {
                     ctx.request_repaint();
                 }
             }
+            let rows: Vec<(String, bool, Option<String>)> =
+                es.into_iter().map(|e| (e.path, e.is_dir, e.node_id)).collect();
             entries.set(rows);
         }
         // Incremental streamed output: append to this id's entry, or start one.

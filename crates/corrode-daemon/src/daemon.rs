@@ -485,7 +485,27 @@ impl Daemon {
             }
             AgentCommand::ListDir { path } => {
                 let ev = match session.vfs.list(&path).await {
-                    Ok(entries) => AgentEvent::DirListing { path, entries },
+                    Ok(mut entries) => {
+                        // Compose graph provenance onto the FS listing: tag each file
+                        // the graph tracks with its code-node id, so the explorer can
+                        // pivot a file to its provenance (ListNeighbors). One scan per
+                        // listing; no store -> node_id stays None (plain passthrough).
+                        if let Some(store) = &session.graph {
+                            let store = store.clone();
+                            if let Ok(Ok(code)) =
+                                tokio::task::spawn_blocking(move || store.code_nodes()).await
+                            {
+                                let by_path: std::collections::HashMap<String, String> =
+                                    code.into_iter().collect(); // last id per path wins
+                                for e in &mut entries {
+                                    if let Some(node_id) = by_path.get(&e.path) {
+                                        e.node_id = Some(node_id.clone());
+                                    }
+                                }
+                            }
+                        }
+                        AgentEvent::DirListing { path, entries }
+                    }
                     Err(e) => AgentEvent::Error { message: e.to_string() },
                 };
                 let _ = events.send(ev).await;
