@@ -45,8 +45,27 @@ pub const EXEC_TOOLS: &[Tool] = &[
         }],
     },
     // Order is load-bearing: role_tools slices contiguous prefixes off this array
-    // (observe | +skills | full), so the read-only pair leads, skills sit before the
+    // (observe | +skills | full), so the read-only tools lead, skills sit before the
     // sharp mutating pair.
+    Tool {
+        name: "search_files",
+        description: "Find lines matching a substring across repository files. Use this \
+to locate code without reading whole files.",
+        params: &[
+            Param {
+                name: "query",
+                ty: "string",
+                description: "The text to search for (plain substring).",
+                required: true,
+            },
+            Param {
+                name: "path",
+                ty: "string",
+                description: "Optional repository-relative directory to scope the search.",
+                required: false,
+            },
+        ],
+    },
     Tool {
         name: "run_skill_script",
         description: "Run a script bundled with an installed skill.",
@@ -99,8 +118,10 @@ pub fn role_tools(role: crate::roles::Role) -> &'static [Tool] {
     use crate::roles::Role;
     match role {
         Role::Coder => EXEC_TOOLS,
-        Role::Review => &EXEC_TOOLS[..3],
-        Role::Research | Role::Architect | Role::Orchestration => &EXEC_TOOLS[..2],
+        Role::Review => &EXEC_TOOLS[..4],
+        // read_file, list_dir, search_files — read-only observation for the roles
+        // that must never mutate.
+        Role::Research | Role::Architect | Role::Orchestration => &EXEC_TOOLS[..3],
     }
 }
 
@@ -135,6 +156,11 @@ pub fn describe(call: &ToolCall) -> String {
         "list_dir" => format!(
             "list_dir {}",
             arg_str(call, "path").unwrap_or("<missing path>")
+        ),
+        "search_files" => format!(
+            "search_files {:?}{}",
+            arg_str(call, "query").unwrap_or("<missing query>"),
+            arg_str(call, "path").map(|p| format!(" in {p}")).unwrap_or_default()
         ),
         "write_file" => format!(
             "write_file {}",
@@ -279,6 +305,10 @@ impl ToolBox {
                 Some(path) => self.list_dir(path).await,
                 None => "error: list_dir needs a `path` argument".to_string(),
             },
+            "search_files" => match arg_str(call, "query") {
+                Some(query) => self.search_files(query, arg_str(call, "path")).await,
+                None => "error: search_files needs a `query` argument".to_string(),
+            },
             "write_file" => match (arg_str(call, "path"), arg_str(call, "contents")) {
                 (Some(path), Some(contents)) => self.write_file(path, contents).await,
                 _ => "error: write_file needs `path` and `contents` arguments".to_string(),
@@ -293,6 +323,75 @@ impl ToolBox {
             },
             other => format!("error: unknown tool `{other}`"),
         }
+    }
+
+    /// Read-only grep: walk the repo (or `scope` subdir) and return `path:line: text`
+    /// for every line containing `query` (plain, case-sensitive substring). Bounded on
+    /// files scanned, matches returned, per-file size, and line length so a research/
+    /// architect agent — which has no `run_command` — can still locate code cheaply.
+    async fn search_files(&self, query: &str, scope: Option<&str>) -> String {
+        const MAX_FILES: usize = 4000;
+        const MAX_MATCHES: usize = 60;
+        const MAX_LINE: usize = 200;
+        const MAX_FILE_BYTES: u64 = 1_000_000; // skip blobs — not source
+        if query.is_empty() {
+            return "error: search_files needs a non-empty query".to_string();
+        }
+        let mut queue = std::collections::VecDeque::from([scope.unwrap_or("").to_string()]);
+        let mut files_scanned = 0usize;
+        let mut matches: Vec<String> = Vec::new();
+        let mut capped = false;
+        'walk: while let Some(dir) = queue.pop_front() {
+            let entries = match self.vfs.list(&dir).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for e in entries {
+                // Prune noise the same way the path walk does.
+                if e.path.starts_with(".git")
+                    || e.path == "target"
+                    || e.path.starts_with("target/")
+                    || e.path.contains("/target/")
+                {
+                    continue;
+                }
+                if e.is_dir {
+                    queue.push_back(e.path);
+                    continue;
+                }
+                if e.bytes > MAX_FILE_BYTES {
+                    continue;
+                }
+                if files_scanned >= MAX_FILES {
+                    capped = true;
+                    break 'walk;
+                }
+                files_scanned += 1;
+                let Ok(bytes) = self.vfs.read(&e.path).await else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&bytes);
+                for (n, line) in text.lines().enumerate() {
+                    if line.contains(query) {
+                        let l = line.trim();
+                        let shown = &l[..floor_char_boundary(l, MAX_LINE)];
+                        matches.push(format!("{}:{}: {shown}", e.path, n + 1));
+                        if matches.len() >= MAX_MATCHES {
+                            capped = true;
+                            break 'walk;
+                        }
+                    }
+                }
+            }
+        }
+        if matches.is_empty() {
+            return format!("no matches for {query:?}");
+        }
+        let mut out = matches.join("\n");
+        if capped {
+            out.push_str("\n… (results capped; refine the query or narrow the path)");
+        }
+        out
     }
 
     async fn write_file(&self, path: &str, contents: &str) -> String {
@@ -645,6 +744,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    async fn search_files_finds_matches_and_reports_misses() {
+        let dir = std::env::temp_dir().join(format!("corrode-search-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn frobnicate() {}\nlet x = 1;\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "// calls frobnicate here\n").unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(HashMap::new()),
+        );
+        let run = |q: &str| {
+            let tb = toolbox.clone();
+            let q = q.to_string();
+            async move {
+                tb.execute(&ToolCall {
+                    name: "search_files".into(),
+                    arguments: json!({ "query": q }),
+                })
+                .await
+            }
+        };
+        let hit = run("frobnicate").await;
+        assert!(
+            hit.contains("src/a.rs:1:") && hit.contains("src/b.rs:1:"),
+            "both files should match: {hit}"
+        );
+        assert!(!hit.contains("a.rs:2:"), "non-matching line excluded: {hit}");
+        let miss = run("nonexistent_zzz").await;
+        assert!(miss.contains("no matches"), "got: {miss}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // The role subsets are the enforcement: observing roles get zero mutating tools
     // (they can never block on approval), review verifies through skills but has no
     // raw shell, and only the coder holds the full set. Guards the slice indices
@@ -659,7 +791,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(names(Role::Coder).len(), EXEC_TOOLS.len());
-        assert_eq!(names(Role::Review), vec!["read_file", "list_dir", "run_skill_script"]);
+        assert_eq!(
+            names(Role::Review),
+            vec!["read_file", "list_dir", "search_files", "run_skill_script"]
+        );
+        // Read-only roles get the observation trio (incl. search) and nothing mutating.
+        assert_eq!(names(Role::Research), vec!["read_file", "list_dir", "search_files"]);
         for role in [Role::Research, Role::Architect, Role::Orchestration] {
             assert!(
                 role_tools(role).iter().all(|t| {
