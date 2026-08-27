@@ -168,8 +168,12 @@ task is `part_of` the plan; an emitted task is a *contract* and also links
 that task (paths collected from `write_file` calls in the tool loop). `graph.provenance()`
 exports this as nodes+edges, and `Daemon::persist_provenance` writes it to the graph
 store via the `GraphStore::upsert_node` / `add_edge` seam so the code↔task↔plan lineage
-is queryable. ponytail: the HelixDB write path is still stubbed (bails) — the in-memory
-provenance is correct and tested; persistence logs "unavailable" until those writes land.
+is queryable. The HelixDB write path is live under `--features helix`:
+`upsert_node`/`add_edge`/`replace_doc` run real LMDB write txns (idempotent — a
+duplicate `(from,rel,to)` is refused and swallowed), covered by
+`graph.rs`'s `provenance_round_trip_upserts_edges_and_neighbors` and reopen tests.
+The base build has no store (`session.graph` is `None`), so provenance stays
+in-memory (still correct and tested) and `persist_provenance` is a no-op there.
 
 Every prompt in a turn — the orchestration call and each subagent
 (`subagent_prompt`) — begins with a byte-identical **context prefix**
