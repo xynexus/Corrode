@@ -298,12 +298,12 @@ impl Client {
             model,
             input,
             max_output_tokens: self.max_output_tokens,
-            metadata: serde_json::json!({ "hipfire_priority": priority.as_u8(), "stream": true }),
+            metadata: serde_json::json!({ "hipfire_priority": priority.as_u8() }),
             tools: None,
             reasoning_effort: None,
         };
-        // `stream` is a top-level field on the responses request; serde on
-        // ResponsesRequest doesn't carry it, so send a merged object.
+        // `stream` is a top-level field on the responses request; ResponsesRequest
+        // doesn't carry it, so merge it into the serialized object.
         let mut body = serde_json::to_value(&req)?;
         body["stream"] = serde_json::Value::Bool(true);
 
@@ -318,47 +318,42 @@ impl Client {
 
         let mut text = String::new();
         let mut reasoning = String::new();
-        let mut buf = String::new();
-        let mut bytes = resp.bytes_stream();
-        while let Some(chunk) = bytes.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk?));
-            // Drain every complete SSE event (terminated by a blank line).
-            while let Some(pos) = buf.find("\n\n") {
-                let block: String = buf.drain(..pos + 2).collect();
-                match parse_sse_event(&block) {
-                    Some(SseDelta::Text(d)) => {
-                        on_delta(&d);
-                        text.push_str(&d);
-                    }
-                    // Relay reasoning to the UI too (so streaming is visible even on
-                    // models that emit everything as reasoning), but keep it in the
-                    // reasoning channel — the final answer reconciles via SubagentOutput.
-                    Some(SseDelta::Reasoning(d)) => {
-                        on_delta(&d);
-                        reasoning.push_str(&d);
-                    }
-                    // Authoritative only when non-empty: some models send an empty
-                    // `done` and carry the real answer in the deltas we accumulated.
-                    Some(SseDelta::TextDone(full)) if !full.is_empty() => text = full,
-                    Some(SseDelta::TextDone(_)) => {}
-                    None => {}
-                }
-            }
-        }
-        // A final event without a trailing blank line.
-        if !buf.trim().is_empty() {
-            match parse_sse_event(&buf) {
+        let mut apply = |ev: Option<SseDelta>, text: &mut String, reasoning: &mut String| {
+            match ev {
                 Some(SseDelta::Text(d)) => {
                     on_delta(&d);
                     text.push_str(&d);
                 }
+                // Relay reasoning to the UI too (so streaming is visible even on models
+                // that emit everything as reasoning), but keep it in the reasoning
+                // channel — the final answer reconciles via SubagentOutput.
                 Some(SseDelta::Reasoning(d)) => {
                     on_delta(&d);
                     reasoning.push_str(&d);
                 }
-                Some(SseDelta::TextDone(full)) if !full.is_empty() => text = full,
-                Some(SseDelta::TextDone(_)) => {}
-                None => {}
+                // Authoritative only when non-empty: some models send an empty `done`
+                // and carry the real answer in the deltas we accumulated.
+                Some(SseDelta::TextDone(full)) if !full.is_empty() => *text = full,
+                Some(SseDelta::TextDone(_)) | None => {}
+            }
+        };
+        // Buffer BYTES, not a lossy string: a chunk can split a multi-byte UTF-8 char
+        // at its boundary, and decoding each chunk in isolation would corrupt it to
+        // U+FFFD. SSE events end at ASCII "\n\n", so decode only complete blocks.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut bytes = resp.bytes_stream();
+        while let Some(chunk) = bytes.next().await {
+            buf.extend_from_slice(&chunk?);
+            while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+                let block: Vec<u8> = buf.drain(..pos + 2).collect();
+                apply(parse_sse_event(&String::from_utf8_lossy(&block)), &mut text, &mut reasoning);
+            }
+        }
+        // A final event without a trailing blank line.
+        if !buf.is_empty() {
+            let block = String::from_utf8_lossy(&buf);
+            if !block.trim().is_empty() {
+                apply(parse_sse_event(&block), &mut text, &mut reasoning);
             }
         }
         Ok((answer_or_reasoning(text, &reasoning), reasoning))
