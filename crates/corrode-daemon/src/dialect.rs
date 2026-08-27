@@ -61,6 +61,11 @@ pub enum ParseFormat {
     /// case `docs/todo/finetune-needle-toolset.md` calls the finetune's primary target
     /// (the base weights emit bare keys like `{"skill":"…","script"}` for it).
     MiniCpmXml,
+    /// Zyphra/zaya native XML: `<zyphra_tool_call><function=f><parameter=p>v</parameter>
+    /// </function></zyphra_tool_call>`, values on their own lines (trimmed). Measured
+    /// live: zaya1-8b picks the right tool with correct args in this shape once tools
+    /// are declared — reliable native tool-calling WITHOUT the Needle shim.
+    ZyphraXml,
 }
 
 /// A model's tool dialect: how to render tool schemas, how to parse its calls, and the
@@ -152,7 +157,7 @@ impl ToolDialect {
     /// and the reply is parsed directly — no Needle in the loop. False for dialects
     /// whose calls are constructed for the model (the Needle-flat / json-array default).
     pub fn emits_own_calls(&self) -> bool {
-        matches!(self.parse, ParseFormat::MiniCpmXml)
+        matches!(self.parse, ParseFormat::MiniCpmXml | ParseFormat::ZyphraXml)
     }
 
     /// Tools rendered for the `tools` field of a chat/responses request.
@@ -181,6 +186,7 @@ impl ToolDialect {
             ParseFormat::JsonArray => serde_json::from_str(trimmed)
                 .map_err(|e| anyhow::anyhow!("parsing tool calls from {trimmed:?}: {e}"))?,
             ParseFormat::MiniCpmXml => parse_minicpm_xml(raw),
+            ParseFormat::ZyphraXml => parse_zyphra_xml(raw),
         };
         Ok(calls
             .into_iter()
@@ -204,10 +210,18 @@ impl Default for Dialects {
     /// the Needle shim out of the box. Everything else falls to the Needle default.
     fn default() -> Self {
         Self {
-            rules: vec![(
-                "*minicpm*".to_string(),
-                ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::MiniCpmXml, HashMap::new()),
-            )],
+            rules: vec![
+                (
+                    "*minicpm*".to_string(),
+                    ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::MiniCpmXml, HashMap::new()),
+                ),
+                // zaya (Zyphra) emits its own tool calls in <zyphra_tool_call> XML —
+                // reliable native tool-calling, no Needle. Measured live 2026-08-27.
+                (
+                    "*zaya*".to_string(),
+                    ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::ZyphraXml, HashMap::new()),
+                ),
+            ],
             default: ToolDialect::default(),
         }
     }
@@ -291,6 +305,7 @@ impl ProfileConfig {
         let parse = match self.parse.as_str() {
             "json-array" => ParseFormat::JsonArray,
             "minicpm-xml" => ParseFormat::MiniCpmXml,
+            "zyphra-xml" => ParseFormat::ZyphraXml,
             other => anyhow::bail!("unknown parse format `{other}`"),
         };
         Ok(ToolDialect::new(schema, parse, self.names))
@@ -369,6 +384,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_zyphra_xml_reads_the_live_zaya_shape() {
+        // Verbatim from zaya1-8b (values on their own lines, wrapped in the call tag).
+        let raw = "<zyphra_tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/greeting.txt\n</parameter>\n<parameter=contents>\nhello\n</parameter>\n</function>\n</zyphra_tool_call>";
+        let d = ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::ZyphraXml, HashMap::new());
+        let calls = d.parse(raw).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments["path"], "/tmp/greeting.txt");
+        assert_eq!(calls[0].arguments["contents"], "hello");
+    }
+
+    #[test]
     fn parse_maps_exposed_names_back_to_canonical() {
         let names = HashMap::from([("run_command".to_string(), "bash".to_string())]);
         let d = ToolDialect::new(SchemaFormat::NeedleFlat, ParseFormat::JsonArray, names);
@@ -383,20 +410,20 @@ mod tests {
     }
 
     #[test]
-    fn builtin_default_routes_minicpm_natively_needle_flat_otherwise() {
+    fn builtin_default_routes_minicpm_and_zaya_natively_needle_flat_otherwise() {
         let d = Dialects::default();
-        // MiniCPM ids (any case, any position) take the native path: nested schema,
-        // XML parse, the model emits its own calls.
-        let m = d.resolve("MiniCPM5-1B");
-        assert_eq!(m.schema, SchemaFormat::OpenAiNested);
-        assert!(m.emits_own_calls());
+        // MiniCPM and zaya ids (any case, any position) take a native path: nested
+        // schema, XML parse, the model emits its own calls.
+        for id in ["MiniCPM5-1B", "zaya1-8b-native.oq4++"] {
+            let n = d.resolve(id);
+            assert_eq!(n.schema, SchemaFormat::OpenAiNested, "{id}");
+            assert!(n.emits_own_calls(), "{id}");
+        }
         // Everything else — including the Needle caller's own id — stays on today's
         // Needle-flat / json-array default.
-        for id in ["needle", "zaya1-8b"] {
-            let n = d.resolve(id);
-            assert_eq!(n.schema, SchemaFormat::NeedleFlat);
-            assert!(!n.emits_own_calls());
-        }
+        let n = d.resolve("needle");
+        assert_eq!(n.schema, SchemaFormat::NeedleFlat);
+        assert!(!n.emits_own_calls());
     }
 
     #[test]
@@ -470,6 +497,57 @@ fn parse_minicpm_xml(raw: &str) -> Vec<ToolCall> {
                 None => (value_start, ""),
             };
             args.insert(p_name, serde_json::Value::String(unwrap_cdata(value)));
+            param_rest = next;
+        }
+
+        if !name.is_empty() {
+            calls.push(ToolCall {
+                name,
+                arguments: serde_json::Value::Object(args),
+            });
+        }
+        rest = tail;
+    }
+    calls
+}
+
+/// Parse Zyphra/zaya native XML into [`ToolCall`]s:
+/// `<function=name><parameter=p>value</parameter>…</function>` (usually wrapped in
+/// `<zyphra_tool_call>…</zyphra_tool_call>`, which we don't require). The model puts
+/// each value on its own lines, so values are trimmed of surrounding whitespace.
+/// ponytail: no CDATA in this format, so a value that itself contains `</parameter>`
+/// would truncate — not seen in practice; revisit if a finetune emits literal tags.
+fn parse_zyphra_xml(raw: &str) -> Vec<ToolCall> {
+    const FN_OPEN: &str = "<function=";
+    const PARAM_OPEN: &str = "<parameter=";
+    let mut calls = Vec::new();
+    let mut rest = raw;
+    while let Some(at) = rest.find(FN_OPEN) {
+        let after = &rest[at + FN_OPEN.len()..];
+        let Some(name_end) = after.find('>') else {
+            break;
+        };
+        let name = after[..name_end].trim().to_string();
+        let body_start = &after[name_end + 1..];
+        let (body, tail) = match body_start.find("</function>") {
+            Some(end) => (&body_start[..end], &body_start[end + "</function>".len()..]),
+            None => (body_start, ""),
+        };
+
+        let mut args = serde_json::Map::new();
+        let mut param_rest = body;
+        while let Some(p_at) = param_rest.find(PARAM_OPEN) {
+            let p_after = &param_rest[p_at + PARAM_OPEN.len()..];
+            let Some(p_name_end) = p_after.find('>') else {
+                break;
+            };
+            let p_name = p_after[..p_name_end].trim().to_string();
+            let value_start = &p_after[p_name_end + 1..];
+            let (value, next) = match value_start.find("</parameter>") {
+                Some(end) => (&value_start[..end], &value_start[end + "</parameter>".len()..]),
+                None => (value_start, ""),
+            };
+            args.insert(p_name, serde_json::Value::String(value.trim().to_string()));
             param_rest = next;
         }
 

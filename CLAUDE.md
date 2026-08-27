@@ -215,13 +215,18 @@ Tools are canonical, model-agnostic data: `EXEC_TOOLS` (`tools.rs`) and `ROLE_TO
 (`plan_graph.rs`) are `&[Tool]`, not hardcoded JSON. A **`ToolDialect`** renders that
 into the schema a given tool-call model expects (`SchemaFormat`: `needle-flat` /
 `openai-nested`), maps canonical tool names ↔ the names the model exposes, and parses
-the model's reply (`ParseFormat`: `json-array`). `ToolCaller` now yields the *raw* reply
-(`generate`) + a `model_id`; the daemon resolves the dialect for that id, renders, calls,
-parses. Dialects are matched by a glob JSON file (`CORRODE_TOOL_DIALECTS`,
+the model's reply (`ParseFormat`: `json-array` / `minicpm-xml` / `zyphra-xml`). A
+dialect whose `ParseFormat` is one of the XML forms `emits_own_calls()` — the daemon
+declares the tools and the model emits + we parse its OWN calls (no Needle in the
+loop, via `run_native_tool_loop`). `ToolCaller` yields the *raw* reply (`generate`) +
+a `model_id`; the daemon resolves the dialect for that id, renders, calls, parses.
+Dialects are matched by a glob JSON file (`CORRODE_TOOL_DIALECTS`,
 `{ "model-glob": {schema,parse,names}, "default": {…} }`); absent -> the built-in
-default = Needle-flat / json-array / no renames (today's behavior). This is how
-different tool-call models (Needle finetunes, others) get different names/formats
-without touching the call sites.
+defaults: `*minicpm*` and `*zaya*` route natively (openai-nested + their XML — zaya
+emits `<zyphra_tool_call><function=f><parameter=p>v</parameter></function>`, verified
+live to pick the right tool + args), everything else is Needle-flat / json-array. This
+is how different tool-call models (native emitters, Needle finetunes) get different
+names/formats without touching the call sites.
 
 ## Tool-calling (Needle shim)
 
