@@ -150,6 +150,19 @@ fn apply_event(
                 ctx.request_repaint();
             }
         }
+        AgentEvent::DocList { docs } => log.update(|l| {
+            let line = if docs.is_empty() {
+                "no documents ingested yet".to_string()
+            } else {
+                let list = docs
+                    .iter()
+                    .map(|d| format!("{} ({})", d.title, d.id))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!("{} doc(s): {list}", docs.len())
+            };
+            l.push(LogEntry::Ws(line));
+        }),
         AgentEvent::DocIngested { path, doc_id, chunks, persisted } => {
             let note = if persisted { "stored" } else { "parsed (store unavailable)" };
             log.update(|l| {

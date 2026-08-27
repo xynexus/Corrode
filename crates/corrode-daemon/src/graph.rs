@@ -47,6 +47,11 @@ pub trait GraphStore: Send + Sync {
     /// chunk previously linked to this doc that isn't in `chunks` — so re-ingesting
     /// a shrunk/shifted doc never leaves stale chunks serving deleted content.
     fn replace_doc(&self, doc: &DocWrite) -> anyhow::Result<()>;
+
+    /// Every ingested document as `(doc_id, title)`, so the UI can show what the
+    /// doc GraphRAG holds (ingest -> list -> ask). Chunks/provenance nodes are
+    /// excluded (kind == "doc" only).
+    fn list_docs(&self) -> anyhow::Result<Vec<(String, String)>>;
 }
 
 /// One document's full chunk set, for [`GraphStore::replace_doc`]. Owned strings:
@@ -105,6 +110,7 @@ pub mod embedded {
     use helix_db::helix_engine::traversal_core::ops::source::add_n::AddNAdapter;
     use helix_db::helix_engine::traversal_core::ops::source::n_from_id::NFromIdAdapter;
     use helix_db::helix_engine::traversal_core::ops::source::n_from_index::NFromIndexAdapter;
+    use helix_db::helix_engine::traversal_core::ops::source::n_from_type::NFromTypeAdapter;
     use helix_db::helix_engine::traversal_core::ops::util::upsert::UpsertAdapter;
     use helix_db::helix_engine::traversal_core::ops::vectors::insert::InsertVAdapter;
     use helix_db::helix_engine::traversal_core::ops::vectors::search::SearchVAdapter;
@@ -435,6 +441,22 @@ pub mod embedded {
             txn.commit()?;
             Ok(())
         }
+
+        fn list_docs(&self) -> anyhow::Result<Vec<(String, String)>> {
+            let arena = Bump::new();
+            let txn = self.storage.graph_env.read_txn()?;
+            let all: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
+                .n_from_type(LABEL)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("scan nodes: {e:?}"))?;
+            let mut docs: Vec<(String, String)> = all
+                .iter()
+                .filter(|n| prop_str(n, "kind") == "doc")
+                .map(|n| (prop_str(n, "key"), prop_str(n, "label")))
+                .collect();
+            docs.sort(); // stable order for the UI (n_from_type order is engine-internal)
+            Ok(docs)
+        }
     }
 
     impl HelixStore {
@@ -696,6 +718,42 @@ pub mod embedded {
             let hits = store.doc_search("", Some(&[0.0, 0.0, 0.0, 1.0]), 1).unwrap();
             assert_eq!(hits[0].0, "chunk:1#1");
             assert!(hits[0].1.contains("REVISED"), "new text rides the hit: {hits:?}");
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn list_docs_returns_doc_nodes_not_chunks_or_provenance() {
+            let dir = scratch_dir("listdocs");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            store
+                .replace_doc(&DocWrite {
+                    doc_id: "doc:cpu".into(),
+                    title: "CPU reference".into(),
+                    chunks: vec![("doc:cpu#0".into(), "cache lines".into(), None)],
+                })
+                .unwrap();
+            store
+                .replace_doc(&DocWrite {
+                    doc_id: "doc:mem".into(),
+                    title: "Memory guide".into(),
+                    chunks: vec![("doc:mem#0".into(), "TLB shootdown".into(), None)],
+                })
+                .unwrap();
+            // A provenance node must NOT show up in the doc list.
+            store.upsert_node("plan-0", "plan", "a plan").unwrap();
+
+            let docs = store.list_docs().unwrap();
+            assert_eq!(
+                docs,
+                vec![
+                    ("doc:cpu".to_string(), "CPU reference".to_string()),
+                    ("doc:mem".to_string(), "Memory guide".to_string()),
+                ],
+                "only doc nodes, sorted, with titles: {docs:?}"
+            );
 
             std::fs::remove_dir_all(&dir).ok();
         }

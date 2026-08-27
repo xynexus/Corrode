@@ -96,6 +96,13 @@ pub struct FileNodeView {
     pub mode: Option<ProjectionMode>,
 }
 
+/// One ingested document in the doc GraphRAG (reply row of `ListDocs`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DocEntry {
+    pub id: String,
+    pub title: String,
+}
+
 /// A HelixDB graph node projected for the explorer (graph view side of the UI).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GraphNodeView {
@@ -139,6 +146,9 @@ pub enum AgentCommand {
     /// store (reply is `Neighbors`). Lets the UI browse provenance across turns,
     /// past the single turn a `PlanGraph` event carries. Read-only.
     ListNeighbors { node_id: String },
+    /// Doc GraphRAG: list every ingested document (reply is `DocList`), so the UI
+    /// can show what's queryable before asking. Read-only.
+    ListDocs,
     /// A human's decision on a pending `ApprovalRequest` (mutating tool call). The
     /// `id` echoes the request; `approved=false` (or a dropped channel) denies it.
     ApprovalResponse { id: u64, approved: bool },
@@ -176,6 +186,9 @@ pub enum AgentEvent {
     /// explorer merges it directly. Includes the queried node. Empty `nodes` when
     /// the id is unknown or no store is configured.
     Neighbors { node_id: String, nodes: Vec<GraphNodeView> },
+    /// Doc GraphRAG: every ingested document (reply to `ListDocs`). Empty when no
+    /// store is configured or nothing has been ingested.
+    DocList { docs: Vec<DocEntry> },
     /// A subagent wants to run a mutating tool (write a file, run a command) and needs
     /// a human's go-ahead. Reply with `AgentCommand::ApprovalResponse` carrying this
     /// `id`. `action` is a human-readable description of exactly what will happen.
@@ -274,6 +287,7 @@ mod tests {
             &AgentCommand::ListNeighbors { node_id: "plan-0".into() },
             r#"{"ListNeighbors":{"node_id":"plan-0"}}"#,
         );
+        pin(&AgentCommand::ListDocs, r#""ListDocs""#);
         pin(
             &AgentEvent::FileContent {
                 path: "src/main.rs".into(),
@@ -330,6 +344,12 @@ mod tests {
                 }],
             },
             r#"{"Neighbors":{"node_id":"plan-0","nodes":[{"id":"plan-0:task:0","label":"write add()","kind":"task","edges_out":["plan-0"]}]}}"#,
+        );
+        pin(
+            &AgentEvent::DocList {
+                docs: vec![DocEntry { id: "doc:cpu".into(), title: "CPU reference".into() }],
+            },
+            r#"{"DocList":{"docs":[{"id":"doc:cpu","title":"CPU reference"}]}}"#,
         );
     }
 }

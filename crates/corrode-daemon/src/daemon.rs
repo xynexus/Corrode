@@ -533,6 +533,26 @@ impl Daemon {
                 };
                 let _ = events.send(ev).await;
             }
+            AgentCommand::ListDocs => {
+                // Read-only. No store -> empty list (nothing ingested/queryable).
+                let ev = match &session.graph {
+                    Some(store) => {
+                        let store = store.clone();
+                        match tokio::task::spawn_blocking(move || store.list_docs()).await {
+                            Ok(Ok(rows)) => AgentEvent::DocList {
+                                docs: rows
+                                    .into_iter()
+                                    .map(|(id, title)| corrode_core::DocEntry { id, title })
+                                    .collect(),
+                            },
+                            Ok(Err(e)) => AgentEvent::Error { message: format!("list docs: {e}") },
+                            Err(e) => AgentEvent::Error { message: format!("list docs: {e}") },
+                        }
+                    }
+                    None => AgentEvent::DocList { docs: Vec::new() },
+                };
+                let _ = events.send(ev).await;
+            }
             AgentCommand::TerminalInput { session: term, data } => {
                 // Write keystrokes to the (per-tenant) pty; its output streams back as
                 // TerminalOutput from the session's reader thread. `term` is the

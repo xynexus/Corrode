@@ -275,6 +275,12 @@ pub fn App() -> impl IntoView {
             }
         }
     };
+    let list_docs = {
+        let cmd_tx = cmd_tx.clone();
+        move |_| {
+            let _ = cmd_tx.unbounded_send(AgentCommand::ListDocs);
+        }
+    };
 
     // Authentication (Phase 3): sign in when the daemon has a user table configured.
     let auth_user = RwSignal::new(String::new());
@@ -454,6 +460,7 @@ pub fn App() -> impl IntoView {
                     />
                     <button on:click=ask_docs title="GraphRAG query over ingested docs">"ask"</button>
                     <button on:click=ingest_doc title="ingest the file at this path">"ingest"</button>
+                    <button on:click=list_docs title="list ingested documents">"docs"</button>
                 </div>
                 <div class="prompt">
                     <input
