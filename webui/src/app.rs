@@ -164,6 +164,24 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    // Pane geometry — dragged via the splitter divs (pointer capture + buttons
+    // check, so no drag flag; a divider keeps receiving moves outside its box).
+    let explorer_w = RwSignal::new(240.0f64);
+    let agent_w = RwSignal::new(340.0f64);
+    let term_frac = RwSignal::new(0.6f64);
+    // xterm's fit addon listens on window resize; fire it once a drag ends.
+    let refit = || {
+        if let Some(w) = web_sys::window() {
+            if let Ok(e) = web_sys::Event::new("resize") {
+                let _ = w.dispatch_event(&e);
+            }
+        }
+    };
+    let grab = |ev: &web_sys::PointerEvent| {
+        let el = event_target::<web_sys::HtmlElement>(ev);
+        let _ = el.set_pointer_capture(ev.pointer_id());
+    };
+
     let prompt = RwSignal::new(String::new());
     let send_prompt = {
         let cmd_tx = cmd_tx.clone();
@@ -195,7 +213,14 @@ pub fn App() -> impl IntoView {
                 {move || if busy.get() { "working…" } else { "idle" }}
             </span>
         </header>
-        <div class="cols">
+        <div
+            class="cols"
+            style=move || format!(
+                "grid-template-columns:{}px 5px 1fr 5px {}px",
+                explorer_w.get(),
+                agent_w.get()
+            )
+        >
             <section class="explorer">
                 <div class="bar">
                     <span>"explorer"</span>
@@ -208,10 +233,55 @@ pub fn App() -> impl IntoView {
                 </ul>
             </section>
 
+            <div
+                class="divider-v"
+                on:pointerdown=move |ev| grab(&ev)
+                on:pointermove=move |ev| {
+                    if ev.buttons() & 1 == 1 {
+                        explorer_w.set((ev.client_x() as f64).clamp(140.0, 480.0));
+                    }
+                }
+                on:pointerup=move |_| refit()
+            ></div>
+
             <section class="center">
-                <div node_ref=term_ref class="terminal"></div>
+                <div
+                    node_ref=term_ref
+                    class="terminal"
+                    style=move || format!("flex:0 0 {}%", term_frac.get() * 100.0)
+                ></div>
+                <div
+                    class="divider-h"
+                    on:pointerdown=move |ev| grab(&ev)
+                    on:pointermove=move |ev| {
+                        if ev.buttons() & 1 == 1 {
+                            let el = event_target::<web_sys::HtmlElement>(&ev);
+                            if let Some(parent) = el.parent_element() {
+                                let r = parent.get_bounding_client_rect();
+                                let frac = (ev.client_y() as f64 - r.top()) / r.height();
+                                term_frac.set(frac.clamp(0.15, 0.85));
+                            }
+                        }
+                    }
+                    on:pointerup=move |_| refit()
+                ></div>
                 <canvas node_ref=canvas_ref class="graph-canvas"></canvas>
             </section>
+
+            <div
+                class="divider-v"
+                on:pointerdown=move |ev| grab(&ev)
+                on:pointermove=move |ev| {
+                    if ev.buttons() & 1 == 1 {
+                        let win = web_sys::window()
+                            .and_then(|w| w.inner_width().ok())
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(1200.0);
+                        agent_w.set((win - ev.client_x() as f64).clamp(240.0, 640.0));
+                    }
+                }
+                on:pointerup=move |_| refit()
+            ></div>
 
             <section class="agent">
                 <div node_ref=console_ref class="log"></div>

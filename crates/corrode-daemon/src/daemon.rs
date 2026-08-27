@@ -285,8 +285,31 @@ impl Daemon {
                 }
 
                 // Persist the plan's provenance (plan <- task/contract <- code) to the
-                // graph store, so the code<->task<->plan lineage is queryable.
+                // graph store, so the code<->task<->plan lineage is queryable — and
+                // ship it to the graph explorer.
                 self.persist_provenance(&graph);
+                let prov = graph.provenance();
+                let nodes = prov
+                    .nodes
+                    .iter()
+                    .map(|n| corrode_core::GraphNodeView {
+                        id: n.id.clone(),
+                        label: n.label.clone(),
+                        kind: n.kind.as_str().to_string(),
+                        edges_out: prov
+                            .edges
+                            .iter()
+                            .filter(|e| e.from == n.id)
+                            .map(|e| e.to.clone())
+                            .collect(),
+                    })
+                    .collect();
+                let _ = events
+                    .send(AgentEvent::PlanGraph {
+                        plan_id: plan_id.clone(),
+                        nodes,
+                    })
+                    .await;
 
                 // The turn's end is explicit: clients (and the e2e) wait on this
                 // event, not on the stream going quiet.

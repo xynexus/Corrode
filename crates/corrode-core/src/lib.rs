@@ -151,6 +151,13 @@ pub enum AgentEvent {
     /// description, `observation` what came back (capped; the model still gets the
     /// full text). Suppressed repeats and denied calls stream here too.
     ToolResult { id: u64, call: String, observation: String },
+    /// The turn's provenance graph (plan -> task/contract -> code), one node per
+    /// entity with its outgoing edge targets in `edges_out` — what the graph
+    /// explorer draws. Sent just before `TurnComplete`.
+    /// ponytail: edge relation labels (part_of/emitted_from/produced_by) are
+    /// dropped — the kind pair implies them; carry them when the explorer needs
+    /// labeled edges.
+    PlanGraph { plan_id: String, nodes: Vec<GraphNodeView> },
     /// The Prompt turn settled: every task ran and provenance persisted. Clients
     /// wait on this, not on the stream going quiet.
     TurnComplete { plan_id: String },
@@ -237,6 +244,18 @@ mod tests {
         pin(
             &AgentEvent::TurnComplete { plan_id: "plan-0".into() },
             r#"{"TurnComplete":{"plan_id":"plan-0"}}"#,
+        );
+        pin(
+            &AgentEvent::PlanGraph {
+                plan_id: "plan-0".into(),
+                nodes: vec![GraphNodeView {
+                    id: "plan-0:task:0".into(),
+                    label: "write add()".into(),
+                    kind: "task".into(),
+                    edges_out: vec!["plan-0".into()],
+                }],
+            },
+            r#"{"PlanGraph":{"plan_id":"plan-0","nodes":[{"id":"plan-0:task:0","label":"write add()","kind":"task","edges_out":["plan-0"]}]}}"#,
         );
     }
 }

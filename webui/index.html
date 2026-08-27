@@ -38,8 +38,13 @@
       .brand { color: #e08a4b; font-weight: 700; }
       .cols {
         flex: 1; min-height: 0;
-        display: grid; grid-template-columns: 240px 1fr 340px;
+        display: grid; grid-template-columns: 240px 5px 1fr 5px 340px;
       }
+      .divider-v { cursor: col-resize; background: #1c1f24; touch-action: none; }
+      .divider-h {
+        cursor: row-resize; background: #1c1f24; flex: 0 0 5px; touch-action: none;
+      }
+      .divider-v:hover, .divider-h:hover { background: #3d454f; }
       section { min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
       .explorer { border-right: 1px solid #262a30; }
       .agent { border-left: 1px solid #262a30; }
@@ -60,11 +65,10 @@
       /* Center column: xterm terminal (top) + egui graph canvas (bottom). */
       .center { background: #0c0d10; }
       .terminal {
-        flex: 3; min-height: 0; padding: 6px 8px; overflow: hidden;
-        border-bottom: 1px solid #262a30;
+        min-height: 0; padding: 6px 8px; overflow: hidden;
       }
       .terminal .xterm, .terminal .xterm-viewport { height: 100% !important; }
-      .graph-canvas { flex: 2; width: 100%; min-height: 0; display: block; }
+      .graph-canvas { flex: 1; width: 100%; min-height: 0; display: block; }
 
       .status {
         float: right; color: #8b929c; font-size: 12px;

@@ -12,6 +12,9 @@ use std::rc::Rc;
 pub struct UiModel {
     /// Graph explorer nodes, `(path, is_dir)`, from `DirListing`.
     pub entries: Vec<(String, bool)>,
+    /// The latest turn's provenance graph (plan -> task/contract -> code), from
+    /// `PlanGraph` — when non-empty the canvas draws this instead of the listing.
+    pub plan_nodes: Vec<corrode_core::GraphNodeView>,
     /// egui repaint handle, set once the canvas app starts, so an async push from
     /// the websocket can wake the render loop (egui only repaints on demand).
     pub egui_ctx: Option<egui::Context>,

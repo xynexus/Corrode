@@ -116,6 +116,14 @@ fn apply_event(
         AgentEvent::ToolResult { call, observation, .. } => {
             log.update(|l| l.push(LogEntry::Tool { call, observation }))
         }
+        // The turn's provenance graph -> the egui canvas.
+        AgentEvent::PlanGraph { nodes, .. } => {
+            let mut m = shared.borrow_mut();
+            m.plan_nodes = nodes;
+            if let Some(ctx) = &m.egui_ctx {
+                ctx.request_repaint();
+            }
+        }
         AgentEvent::DocIngested { path, doc_id, chunks, persisted } => {
             let note = if persisted { "stored" } else { "parsed (store unavailable)" };
             log.update(|l| {
