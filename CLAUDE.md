@@ -18,9 +18,18 @@ a browser front-end:
 - **webui/** — the wasm front-end: virtual terminal, filesystem/repo/graph
   explorer, agent interface. Not yet scaffolded (framework undecided).
 
-Status: scaffold. The workspace compiles; the daemon runs one smoke swarm. The
-daemon loop, the VFS impl, HelixDB queries, the web bridge, and the webui are not
-written yet. Grep `ponytail:` for every deliberate seam and its upgrade trigger.
+Status: past scaffold — a working end-to-end system. The command loop, reactive
+swarm scheduler, tool-execution loop (with a human approval gate), passthrough
+VFS, HelixDB write+search path (provenance persistence + doc GraphRAG with
+grounded synthesis), the web bridge, and the wasm webui (terminal, navigable
+explorer with click-to-read, graph canvas, prompt + doc ask/ingest + auth) are
+all written and tested. Also built: bubblewrap process sandbox (`--features`-free,
+`CORRODE_SANDBOX`), multi-tenant sessions (per-(user,repo), `SelectRepo` + auth +
+per-user hipfire fairness token), a read-only `search_files` tool, and a
+`doctor` subcommand. What's still stubbed or deferred is marked in code — grep
+`ponytail:` for every deliberate seam and its upgrade trigger. Note: the live
+swarm-vs-model behaviour depends on the served model (the `#[ignore]` e2e wants a
+fast small model up on hipfire); the logic is unit-tested independent of that.
 
 ## Layout
 
