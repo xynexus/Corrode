@@ -57,6 +57,11 @@ pub struct Daemon {
     skill_scripts: Arc<std::collections::HashMap<String, PathBuf>>,
     /// Per-model tool dialects (schema/names/parse), matched to the tool-call model.
     dialects: Arc<Dialects>,
+    /// Optional bubblewrap confinement for every process the daemon spawns
+    /// (`run_command`/`run_skill_script` in the tool loop, and the web terminal).
+    /// Off unless `CORRODE_SANDBOX` is set. ponytail: process-wide for now; becomes
+    /// per-session (bound to the session's repo) when tenancy lands.
+    sandbox: crate::sandbox::Sandbox,
 }
 
 impl Daemon {
@@ -71,12 +76,13 @@ impl Daemon {
         dialects: Arc<Dialects>,
     ) -> Self {
         let skill_scripts = Arc::new(skills.script_dirs());
+        let sandbox = crate::sandbox::Sandbox::from_env();
         Self {
             swarm,
             roles,
             graph,
             vfs,
-            terminals: Terminals::new(repo_root.clone()),
+            terminals: Terminals::new(repo_root.clone()).with_sandbox(sandbox.clone()),
             skills,
             tool_caller,
             approvals: Arc::new(ApprovalGate::default()),
@@ -84,6 +90,7 @@ impl Daemon {
             next_plan_id: std::sync::atomic::AtomicU64::new(0),
             skill_scripts,
             dialects,
+            sandbox,
         }
     }
 
@@ -178,6 +185,7 @@ impl Daemon {
                     let approvals = Arc::clone(&self.approvals);
                     let root = self.repo_root.clone();
                     let skill_scripts = Arc::clone(&self.skill_scripts);
+                    let sandbox = self.sandbox.clone();
                     let dialects = Arc::clone(&self.dialects);
                     let id = task.id;
                     let role = task.role;
@@ -194,7 +202,7 @@ impl Daemon {
                         // attempts first when CORRODE_FANOUT > 1; everything else runs
                         // the capability paths directly (see `run_task`).
                         let mut artifacts = Vec::new();
-                        let toolbox = ToolBox::new(vfs, root, skill_scripts);
+                        let toolbox = ToolBox::new(vfs, root, skill_scripts).with_sandbox(sandbox);
                         let output = if role == Role::Coder && fanout > 1 {
                             run_fanout(
                                 fanout,

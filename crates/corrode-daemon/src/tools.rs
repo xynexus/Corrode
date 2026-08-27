@@ -161,6 +161,9 @@ pub struct ToolBox {
     root: PathBuf,
     /// Skill name -> skill directory, for resolving `run_skill_script` (stage 3).
     skill_scripts: Arc<HashMap<String, PathBuf>>,
+    /// Optional bubblewrap confinement for `run_command`/`run_skill_script`.
+    /// Disabled by default (see `with_sandbox`).
+    sandbox: crate::sandbox::Sandbox,
 }
 
 impl ToolBox {
@@ -173,7 +176,14 @@ impl ToolBox {
             vfs,
             root,
             skill_scripts,
+            sandbox: crate::sandbox::Sandbox::disabled(),
         }
+    }
+
+    /// Confine spawned processes with this sandbox (builder; default is disabled).
+    pub fn with_sandbox(mut self, sandbox: crate::sandbox::Sandbox) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Per-task value sets for the grammar value constraint (item 4 of
@@ -276,9 +286,10 @@ impl ToolBox {
     }
 
     async fn run_command(&self, command: &str) -> String {
-        let output = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
+        // sandbox.wrap is a no-op when disabled: plain `sh -c <command>`.
+        let (prog, args) = self.sandbox.wrap(&self.root, &["sh", "-c", command]);
+        let output = tokio::process::Command::new(prog)
+            .args(args)
             .current_dir(&self.root)
             .output()
             .await;
@@ -330,15 +341,14 @@ impl ToolBox {
             },
         };
 
-        let mut cmd = match interpreter_for(&path) {
-            Some(interp) => {
-                let mut c = tokio::process::Command::new(interp);
-                c.arg(&path);
-                c
-            }
-            None => tokio::process::Command::new(&path),
+        let path_str = path.to_string_lossy();
+        let argv: Vec<&str> = match interpreter_for(&path) {
+            Some(interp) => vec![interp, &path_str],
+            None => vec![&path_str],
         };
-        cmd.current_dir(&self.root);
+        let (prog, args) = self.sandbox.wrap(&self.root, &argv);
+        let mut cmd = tokio::process::Command::new(prog);
+        cmd.args(args).current_dir(&self.root);
         match cmd.output().await {
             Ok(out) => format_command_output(out),
             Err(e) => format!("error: could not run skill script `{target}`: {e}"),

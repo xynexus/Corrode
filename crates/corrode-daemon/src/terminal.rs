@@ -37,6 +37,8 @@ pub struct Terminals {
     sessions: SessionMap,
     /// Where spawned shells start: the daemon's repo root (`CORRODE_REPO`).
     cwd: std::path::PathBuf,
+    /// Optional bubblewrap confinement for the interactive shell (default off).
+    sandbox: crate::sandbox::Sandbox,
 }
 
 impl Terminals {
@@ -44,7 +46,14 @@ impl Terminals {
         Self {
             sessions: SessionMap::default(),
             cwd,
+            sandbox: crate::sandbox::Sandbox::disabled(),
         }
+    }
+
+    /// Confine spawned shells with this sandbox (builder; default is disabled).
+    pub fn with_sandbox(mut self, sandbox: crate::sandbox::Sandbox) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Spawn a pty+shell for `id` if absent; either way, point the session's
@@ -65,8 +74,14 @@ impl Terminals {
         // parse (it printed as noise and garbled input). Env is inherited from the
         // daemon, so PATH/venv survive. TERM advertises a type xterm understands.
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let mut cmd = CommandBuilder::new(shell);
-        cmd.arg("-i");
+        // sandbox.wrap is a no-op when disabled: plain `<shell> -i`. When on, it
+        // becomes `bwrap … -- <shell> -i`; env (incl. TERM below) passes through to
+        // the child since we don't --clearenv, and --chdir sets the inner cwd.
+        let (prog, args) = self.sandbox.wrap(&self.cwd, &[shell.as_str(), "-i"]);
+        let mut cmd = CommandBuilder::new(prog);
+        for arg in &args {
+            cmd.arg(arg);
+        }
         cmd.env("TERM", "xterm-256color");
         cmd.cwd(&self.cwd);
         let child = pair.slave.spawn_command(cmd)?;

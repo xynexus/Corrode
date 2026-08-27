@@ -21,6 +21,7 @@ mod ingest;
 mod plan_graph;
 mod planner;
 mod roles;
+mod sandbox;
 mod server;
 mod skills;
 mod swarm;

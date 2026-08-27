@@ -74,7 +74,11 @@ default 0.35), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -> tool-profi
 default 1024), `CORRODE_FANOUT` (coder-task ensemble size — K read-only proposal
 attempts judged by the review model before one writable execution; default 1 = off,
 clamped to 8), `CORRODE_PLAN_REVIEW` (plan-level review pass after the plan settles;
-on unless `0`/`false`). The hipfire background daemon must be up (`hipfire start`, not just
+on unless `0`/`false`), `CORRODE_SANDBOX` (bubblewrap-confine every spawned process
+— `run_command`/`run_skill_script` and the web terminal — off unless `on`/`1`/`true`;
+see `sandbox.rs` + `docs/sessions-and-sandbox.md`), `CORRODE_SANDBOX_NET` (share the
+host network into the sandbox; off by default — needed for tools that fetch). The
+hipfire background daemon must be up (`hipfire start`, not just
 `serve` — `serve` is only the HTTP frontend) for the daemon to resolve roles and
 generate.
 
