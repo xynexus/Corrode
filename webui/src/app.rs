@@ -280,6 +280,9 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    // cmd sender for the explorer tree's per-file click (read the file into the console).
+    let tree_tx = cmd_tx.clone();
+
     view! {
         <header class="topbar">
             <span class="brand">"Corrode"</span>" swarm console"
@@ -326,9 +329,23 @@ pub fn App() -> impl IntoView {
                     <button on:click=select_repo>"select"</button>
                 </div>
                 <ul class="tree">
-                    {move || entries.get().into_iter().map(|(path, is_dir)| view! {
-                        <li class:dir=is_dir>{if is_dir { "📁 " } else { "📄 " }}{path}</li>
-                    }).collect_view()}
+                    {move || {
+                        let tx = tree_tx.clone();
+                        entries.get().into_iter().map(move |(path, is_dir)| {
+                            let tx = tx.clone();
+                            let p = path.clone();
+                            let open = move |_| {
+                                if !is_dir {
+                                    let _ = tx.unbounded_send(AgentCommand::ReadFile { path: p.clone() });
+                                }
+                            };
+                            view! {
+                                <li class:dir=is_dir class:file=!is_dir on:click=open>
+                                    {if is_dir { "📁 " } else { "📄 " }}{path}
+                                </li>
+                            }
+                        }).collect_view()
+                    }}
                 </ul>
             </section>
 

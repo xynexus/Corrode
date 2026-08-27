@@ -102,6 +102,12 @@ fn apply_event(
             let who = if user.is_empty() { String::new() } else { format!(" ({user})") };
             l.push(LogEntry::Ws(format!("repo selected: {path}{who}")))
         }),
+        // File view (explorer click) -> a collapsible code block in the console,
+        // reusing the tool-result rendering.
+        AgentEvent::FileContent { path, content, truncated } => log.update(|l| {
+            let call = if truncated { format!("{path} (truncated)") } else { path };
+            l.push(LogEntry::Tool { call, observation: content })
+        }),
         // Explorer listing -> both the DOM tree and the egui graph panel.
         AgentEvent::DirListing { entries: es, .. } => {
             let rows: Vec<(String, bool)> = es.into_iter().map(|e| (e.path, e.is_dir)).collect();

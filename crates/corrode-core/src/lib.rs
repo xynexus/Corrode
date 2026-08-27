@@ -132,6 +132,9 @@ pub enum AgentCommand {
     DocIngest { path: String },
     /// Explorer: list the VFS entries under a directory path.
     ListDir { path: String },
+    /// Explorer: read one file's contents through the VFS (read-only; the reply is
+    /// a `FileContent`). Text is decoded lossily and capped for display.
+    ReadFile { path: String },
     /// A human's decision on a pending `ApprovalRequest` (mutating tool call). The
     /// `id` echoes the request; `approved=false` (or a dropped channel) denies it.
     ApprovalResponse { id: u64, approved: bool },
@@ -161,6 +164,9 @@ pub enum AgentEvent {
     DocIngested { path: String, doc_id: String, chunks: usize, persisted: bool },
     /// Explorer: entries under a listed directory.
     DirListing { path: String, entries: Vec<FileNodeView> },
+    /// Explorer: one file's contents (reply to `ReadFile`), decoded lossily.
+    /// `truncated` marks that the file exceeded the display cap.
+    FileContent { path: String, content: String, truncated: bool },
     /// A subagent wants to run a mutating tool (write a file, run a command) and needs
     /// a human's go-ahead. Reply with `AgentCommand::ApprovalResponse` carrying this
     /// `id`. `action` is a human-readable description of exactly what will happen.
@@ -250,6 +256,18 @@ mod tests {
         pin(
             &AgentCommand::Authenticate { user: "alice".into(), token: "t".into() },
             r#"{"Authenticate":{"user":"alice","token":"t"}}"#,
+        );
+        pin(
+            &AgentCommand::ReadFile { path: "src/main.rs".into() },
+            r#"{"ReadFile":{"path":"src/main.rs"}}"#,
+        );
+        pin(
+            &AgentEvent::FileContent {
+                path: "src/main.rs".into(),
+                content: "fn main() {}".into(),
+                truncated: false,
+            },
+            r#"{"FileContent":{"path":"src/main.rs","content":"fn main() {}","truncated":false}}"#,
         );
         pin(&AgentEvent::AuthRequired, r#""AuthRequired""#);
         pin(

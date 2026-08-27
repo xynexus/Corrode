@@ -490,6 +490,27 @@ impl Daemon {
                 };
                 let _ = events.send(ev).await;
             }
+            AgentCommand::ReadFile { path } => {
+                // Read-only: no approval gate. Cap the returned text so a huge file
+                // can't blow the ws frame budget; the model/tools path reads full
+                // files itself, this is just the explorer viewer.
+                const READ_CAP: usize = 256 * 1024;
+                let ev = match session.vfs.read(&path).await {
+                    Ok(bytes) => {
+                        let full = String::from_utf8_lossy(&bytes).into_owned();
+                        let truncated = full.len() > READ_CAP;
+                        let content = if truncated {
+                            let end = crate::tools::floor_char_boundary(&full, READ_CAP);
+                            full[..end].to_string()
+                        } else {
+                            full
+                        };
+                        AgentEvent::FileContent { path, content, truncated }
+                    }
+                    Err(e) => AgentEvent::Error { message: format!("read {path}: {e}") },
+                };
+                let _ = events.send(ev).await;
+            }
             AgentCommand::TerminalInput { session: term, data } => {
                 // Write keystrokes to the (per-tenant) pty; its output streams back as
                 // TerminalOutput from the session's reader thread. `term` is the
