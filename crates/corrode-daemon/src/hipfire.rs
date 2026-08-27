@@ -107,12 +107,16 @@ struct ModelEntry {
 
 impl Client {
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
-        // ponytail: one cap for every call. Split per-role (a planner wants more
+        // A ceiling, not a target: models stop at EOS, so a higher cap costs nothing
+        // for short outputs (a TOOL: line) and only spares long ones (a multi-task
+        // plan, a synthesized doc answer) from truncation — 1024 tokens (~750 words)
+        // was clipping real plans/answers mid-output.
+        // ponytail: still one cap for every call. Split per-role (a planner wants more
         // than a research skim) once we tune it.
         let max_output_tokens = std::env::var("CORRODE_MAX_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1024);
+            .unwrap_or(4096);
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into(),
