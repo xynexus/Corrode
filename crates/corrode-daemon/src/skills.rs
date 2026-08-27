@@ -345,21 +345,45 @@ fn search_dirs(repo_root: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
-/// Minimal `SKILL.md` frontmatter parse: pull single-line `name` + `description`
-/// from the leading `--- ... ---` block. Missing `description` -> None.
-// ponytail: line-based, so YAML block scalars / multi-line descriptions aren't
-// handled; swap for a real YAML parse if skills in the wild need it.
+/// Minimal `SKILL.md` frontmatter parse: pull `name` + `description` from the
+/// leading `--- ... ---` block. Handles single-line values and YAML block scalars
+/// (`description: |` / `>` followed by an indented block) — the block is folded to
+/// a single space-joined string, which is all the description is used for
+/// (embedding + ranking). Missing `description` -> None.
+// ponytail: top-level keys are assumed at column 0 (the SKILL.md convention); a
+// nested/indented frontmatter would confuse the block-scalar terminator. Not a
+// real YAML parser — enough for name+description.
 fn parse_frontmatter(md: &str) -> Option<(String, String)> {
     let rest = md.strip_prefix("---")?;
     let end = rest.find("\n---")?;
     let mut name = String::new();
     let mut description = None;
-    for line in rest[..end].lines() {
-        let line = line.trim();
+    let mut lines = rest[..end].lines().peekable();
+    while let Some(raw) = lines.next() {
+        let line = raw.trim();
         if let Some(v) = line.strip_prefix("name:") {
             name = unquote(v);
         } else if let Some(v) = line.strip_prefix("description:") {
-            description = Some(unquote(v));
+            let v = v.trim();
+            description = Some(if v.starts_with('|') || v.starts_with('>') {
+                // YAML block scalar: gather the following more-indented lines until
+                // the next top-level key (indent 0), folding all to spaces.
+                let mut block = Vec::new();
+                while let Some(peek) = lines.peek() {
+                    if peek.trim().is_empty() {
+                        lines.next();
+                        continue;
+                    }
+                    let indent = peek.len() - peek.trim_start().len();
+                    if indent == 0 {
+                        break; // dedent to a sibling key ends the block
+                    }
+                    block.push(lines.next().unwrap().trim().to_string());
+                }
+                block.join(" ")
+            } else {
+                unquote(v)
+            });
         }
     }
     description.map(|d| (name, d))
@@ -423,6 +447,35 @@ mod tests {
         assert!(reg.agents_rules().contains("Run tests before committing"));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn parse_frontmatter_handles_single_line_and_block_scalars() {
+        // single-line, quoted
+        let (n, d) = parse_frontmatter(
+            "---\nname: a\ndescription: \"one line\"\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!((n.as_str(), d.as_str()), ("a", "one line"));
+
+        // block scalar: the indented block is folded to a space-joined string,
+        // and the following top-level key ends it (not swallowed into the value).
+        let (n, d) = parse_frontmatter(
+            "---\nname: b\ndescription: |\n  first part.\n  second part.\nother: x\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!(n, "b");
+        assert_eq!(d, "first part. second part.");
+
+        // folded scalar with a trailing key after a blank line
+        let (_, d) = parse_frontmatter(
+            "---\ndescription: >\n  wrap me\n  please\n\nname: c\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!(d, "wrap me please");
+
+        // no description -> None
+        assert!(parse_frontmatter("---\nname: d\n---\nbody").is_none());
     }
 
     #[test]
