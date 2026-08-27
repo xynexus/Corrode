@@ -71,6 +71,12 @@ impl Vfs for PassthroughVfs {
                 let entry = entry?;
                 let meta = entry.metadata()?;
                 let name = entry.file_name().to_string_lossy().into_owned();
+                // Skip VCS/build noise at every level — matches the path-enum walk and
+                // search_files prune, keeping both the explorer and agents' list_dir on
+                // source (agents were observed inventing `.git/revisions` paths).
+                if name == ".git" || name == "target" {
+                    continue;
+                }
                 let rel = if dir.is_empty() || dir == "/" {
                     name
                 } else {
@@ -151,6 +157,19 @@ mod tests {
         assert!(vfs.read("../etc/passwd").await.is_err());
         assert!(vfs.stat("../etc/passwd").await.is_err());
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn list_prunes_vcs_and_build_noise() {
+        let root = std::env::temp_dir().join(format!("corrode-vfs-prune-{}", std::process::id()));
+        let vfs = PassthroughVfs::new(&root);
+        vfs.write("src/main.rs", b"fn main() {}").await.unwrap();
+        vfs.write(".git/HEAD", b"ref: x").await.unwrap();
+        vfs.write("target/debug/x", b"blob").await.unwrap();
+        let names: Vec<String> = vfs.list("").await.unwrap().into_iter().map(|e| e.path).collect();
+        assert!(names.contains(&"src".to_string()), "source kept: {names:?}");
+        assert!(!names.iter().any(|n| n == ".git" || n == "target"), "noise pruned: {names:?}");
         std::fs::remove_dir_all(&root).ok();
     }
 }
