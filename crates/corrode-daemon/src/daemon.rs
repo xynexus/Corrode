@@ -1442,6 +1442,27 @@ mod tests {
         )
     }
 
+    // Multi-tenancy keying: a (user, repo) session is created once and reused across
+    // that user's connections; different users on the same repo get separate sessions
+    // (separate terminals + approval gate). Uses the default repo (path "") so it hits
+    // the pre-seeded resources — no network, no skill rebuild. Auth is off by default
+    // (no CORRODE_USERS), so authenticate accepts anyone.
+    #[tokio::test]
+    async fn sessions_are_keyed_by_user_and_repo_and_reused() {
+        let d = test_daemon();
+        assert!(!d.auth_on(), "no CORRODE_USERS -> auth off");
+        assert!(d.authenticate("anyone", "whatever"), "auth off accepts any token");
+
+        let a1 = d.bind_session(Some("alice".into()), "").await.unwrap();
+        let a2 = d.bind_session(Some("alice".into()), "").await.unwrap();
+        let bob = d.bind_session(Some("bob".into()), "").await.unwrap();
+        assert!(Arc::ptr_eq(&a1, &a2), "same (user,repo) reuses one session");
+        assert!(!Arc::ptr_eq(&a1, &bob), "different users get different sessions");
+        assert_eq!(a1.key.user, "alice");
+        // The gate is per-session, so alice's and bob's are distinct instances.
+        assert!(!Arc::ptr_eq(&a1.approvals, &bob.approvals));
+    }
+
     /// The `fixtures/demo-repo` submodule (`xynexus/corrode-demo`) — the deterministic
     /// repo the e2e tests run against: real files (`src/lib.rs`), real rules
     /// (`AGENTS.md`), a real skill (`.agents/skills/run-tests`). `None` when it isn't
