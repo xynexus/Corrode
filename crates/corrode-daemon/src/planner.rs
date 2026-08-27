@@ -165,23 +165,53 @@ pub struct PlannedSubtask {
     pub prompt: String,
 }
 
+/// The balanced JSON array beginning at byte offset `start` (which must be a `[`),
+/// matching brackets while respecting string literals and escapes — so a `]` inside
+/// a string doesn't close the array early. Only structural chars (`[` `]` `"` `\`)
+/// are inspected, all ASCII, so byte indexing stays on UTF-8 boundaries.
+fn balanced_array_at(text: &str, start: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for i in start..bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_str = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&text[start..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 /// Extract the subtask list from the orchestration model's reply. Tolerant of
-/// surrounding prose: parses the whole text as JSON, else the first `[`..last `]`
-/// slice. Unknown role names fall back to Coder. Returns empty if nothing parses.
-///
-/// ponytail: the bracket-slice fallback is naive (it ignores brackets inside JSON
-/// string values). Fine for well-behaved plans; tighten if models start embedding
-/// arrays in task text.
+/// surrounding prose: parses the whole text as JSON, else tries each `[`-anchored
+/// balanced array in order (respecting string literals) and takes the first that
+/// parses as a subtask list — so stray brackets in prose (`[note]`) or inside task
+/// strings (`a[0]`) don't defeat it. Unknown roles fall back to Coder.
 pub fn parse_plan(text: &str) -> Vec<PlannedSubtask> {
     let raw: Vec<RawSubtask> = serde_json::from_str(text)
         .ok()
         .or_else(|| {
-            let start = text.find('[')?;
-            let end = text.rfind(']')?;
-            if end <= start {
-                return None;
-            }
-            serde_json::from_str(&text[start..=end]).ok()
+            text.match_indices('[')
+                .filter_map(|(i, _)| balanced_array_at(text, i))
+                .find_map(|slice| serde_json::from_str::<Vec<RawSubtask>>(slice).ok())
         })
         .unwrap_or_default();
 
@@ -221,6 +251,21 @@ mod tests {
         assert!(p.contains("[chunk:cpu.md#0]") && p.contains("[chunk:cpu.md#1]"));
         assert!(p.contains("0xFFFF0000") && p.contains("program counter"));
         assert!(p.contains("ONLY") && p.to_lowercase().contains("cite"));
+    }
+
+    #[test]
+    fn parse_plan_survives_stray_brackets_in_prose_and_task_strings() {
+        // Prose brackets before AND after the array, plus a `]` inside a task string:
+        // the old first-[/last-] slice would grab "[note]…[done]" and fail to parse.
+        let out = "See [note]: here is the plan\n\
+            [{\"role\":\"coder\",\"task\":\"handle the a[0] index case\"},\
+             {\"role\":\"review\",\"task\":\"check it\"}]\n\
+            (also see item [3] later) [done]";
+        let plan = parse_plan(out);
+        assert_eq!(plan.len(), 2, "got: {plan:?}");
+        assert_eq!(plan[0].role, Role::Coder);
+        assert_eq!(plan[0].prompt, "handle the a[0] index case");
+        assert_eq!(plan[1].role, Role::Review);
     }
 
     #[test]
