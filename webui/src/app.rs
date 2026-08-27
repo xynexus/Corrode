@@ -238,6 +238,31 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    // Docs (GraphRAG): one input, two actions — ask a question of the ingested docs
+    // (DocQuery -> a synthesized, grounded answer in the console) or ingest a file
+    // by path (DocIngest). Answers/notices render in the same console as the swarm.
+    let doc_input = RwSignal::new(String::new());
+    let ask_docs = {
+        let cmd_tx = cmd_tx.clone();
+        move |_| {
+            let question = doc_input.get();
+            if !question.trim().is_empty() {
+                let _ = cmd_tx.unbounded_send(AgentCommand::DocQuery { question });
+                doc_input.set(String::new());
+            }
+        }
+    };
+    let ingest_doc = {
+        let cmd_tx = cmd_tx.clone();
+        move |_| {
+            let path = doc_input.get();
+            if !path.trim().is_empty() {
+                let _ = cmd_tx.unbounded_send(AgentCommand::DocIngest { path });
+                doc_input.set(String::new());
+            }
+        }
+    };
+
     // Authentication (Phase 3): sign in when the daemon has a user table configured.
     let auth_user = RwSignal::new(String::new());
     let auth_token = RwSignal::new(String::new());
@@ -380,6 +405,15 @@ pub fn App() -> impl IntoView {
                         }
                     }).collect_view()}
                 </ul>
+                <div class="prompt docs">
+                    <input
+                        prop:value=move || doc_input.get()
+                        on:input=move |e| doc_input.set(event_target_value(&e))
+                        placeholder="ask the docs, or a file path to ingest…"
+                    />
+                    <button on:click=ask_docs title="GraphRAG query over ingested docs">"ask"</button>
+                    <button on:click=ingest_doc title="ingest the file at this path">"ingest"</button>
+                </div>
                 <div class="prompt">
                     <input
                         prop:value=move || prompt.get()
