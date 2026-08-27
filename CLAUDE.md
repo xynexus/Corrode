@@ -118,9 +118,13 @@ session) binds a repo; the first repo-scoped command with no prior select lazily
 binds `CORRODE_REPO`, preserving single-tenant behaviour. The `Swarm`, `RoleModels`,
 `ToolCaller`, `Dialects`, and `Sandbox` stay shared on `Daemon`. Dispatch: `Prompt`→
 swarm (spawned concurrently — long-lived, may block on approval), `SelectRepo`/
-`Authenticate`→bind the connection's session/user, `ListDir`→session vfs,
-`DocQuery`→session graph, `TerminalInput`→session pty (client id is per browser tab),
-`ApprovalResponse`→resolves a pending approval on the connection's session gate.
+`Authenticate`→bind the connection's session/user, `ListDir`/`ReadFile`→session vfs
+(explorer), `DocQuery`/`DocIngest`/`ListDocs`→session graph (doc GraphRAG: ask /
+ingest / list ingested docs), `ListNeighbors`→session graph (expand a provenance
+node's one-hop neighborhood for the interactive graph explorer),
+`TerminalInput`→session pty (client id is per browser tab), `ApprovalResponse`→
+resolves a pending approval on the connection's session gate. The read-only graph/
+vfs commands no-op cleanly to an empty reply when no store is configured.
 
 ## Roles
 
