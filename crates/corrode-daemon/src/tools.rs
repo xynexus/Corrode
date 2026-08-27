@@ -133,8 +133,9 @@ const MAX_PATH_VALUES: usize = 64;
 /// Cap on how many bytes of a file a `read_file` observation carries back into the
 /// model's context — enough to be useful without blowing the window.
 const MAX_READ_BYTES: usize = 4096;
-/// Cap on captured command / script output.
-const MAX_CMD_BYTES: usize = 4096;
+/// Cap on captured command / script output. Retained as head+tail so a build/test
+/// failure (error at the end) survives alongside the command's start.
+const MAX_CMD_BYTES: usize = 8192;
 
 /// Whether a tool call mutates or executes and so must clear the human approval gate
 /// before it runs. Read-only tools (read_file, list_dir) return false.
@@ -570,8 +571,20 @@ fn format_command_output(out: std::process::Output) -> String {
         text.push_str(&String::from_utf8_lossy(&out.stderr));
     }
     if text.len() > MAX_CMD_BYTES {
-        text.truncate(floor_char_boundary(&text, MAX_CMD_BYTES));
-        text.push_str("\n… (truncated)");
+        // Keep the head AND the tail: for `cargo build`/`test`, what ran is at the
+        // top but the error/summary is at the bottom — head-only truncation hid it.
+        let half = MAX_CMD_BYTES / 2;
+        let head_end = floor_char_boundary(&text, half);
+        let mut tail_start = text.len() - half;
+        while !text.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+        let elided = tail_start - head_end;
+        text = format!(
+            "{}\n… ({elided} bytes elided) …\n{}",
+            &text[..head_end],
+            &text[tail_start..]
+        );
     }
     format!("exit {}:\n{}", out.status.code().unwrap_or(-1), text.trim())
 }
@@ -734,12 +747,18 @@ mod tests {
             .await;
         assert!(read.contains("truncated"), "got: {read}");
 
+        // Command output over the cap keeps head AND tail (a unique marker at each
+        // end must survive), elides the middle, and never splits a multibyte char.
+        let big = format!("HEADMARK{}TAILMARK", "€".repeat(MAX_CMD_BYTES));
         let out = std::process::Output {
             status: std::process::ExitStatus::from_raw(0),
-            stdout: "€".repeat(MAX_CMD_BYTES / 3 + 2).into_bytes(),
+            stdout: big.into_bytes(),
             stderr: Vec::new(),
         };
-        assert!(format_command_output(out).contains("truncated"));
+        let formatted = format_command_output(out);
+        assert!(formatted.contains("elided"), "got: {}", &formatted[..80.min(formatted.len())]);
+        assert!(formatted.contains("HEADMARK"), "head lost");
+        assert!(formatted.contains("TAILMARK"), "tail lost");
 
         std::fs::remove_dir_all(&dir).ok();
     }
