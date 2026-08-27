@@ -36,6 +36,13 @@ enum SseDelta {
     TextDone(String),
 }
 
+/// Whether a response status is transient overload worth retrying (hipfire sheds
+/// with 5xx under memory pressure; 429 is explicit rate-limit). A 4xx is our bug —
+/// don't retry it.
+fn is_transient(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 /// The usable answer from a `/v1/responses` reply. Some hipfire model builds (the
 /// think-native / think-filtered quants seen in practice) route the whole answer
 /// into `reasoning_content` and leave `output_text` empty; an empty answer is
@@ -263,17 +270,51 @@ impl Client {
             tools,
             reasoning_effort: effort,
         };
-        let mut rb = self
-            .http
-            .post(format!("{}/v1/responses", self.base_url))
-            .json(&req);
-        // Per-user hipfire token (fairness) overrides the shared key for this call.
-        if let Some(token) = owner_token.or(self.api_key.as_deref()) {
-            rb = rb.bearer_auth(token);
-        }
-        let reply: ResponsesReply = rb.send().await?.error_for_status()?.json().await?;
+        let body = serde_json::to_value(&req)?;
+        let reply = self.post_responses(&body, owner_token).await?;
         let reasoning = reply.reasoning().to_string();
         Ok((answer_or_reasoning(reply.output_text, &reasoning), reasoning))
+    }
+
+    /// POST a `/v1/responses` body, retrying on transient server-side shedding.
+    ///
+    /// hipfire sheds under memory pressure by returning 5xx (or 429), not by queuing,
+    /// and the reactive scheduler fires many tasks at once — so a burst can shed even
+    /// though each call fits when run sequentially (observed on a 30 GiB box: a lone
+    /// call succeeds while the swarm's concurrent burst 500s). Back off and retry,
+    /// letting earlier calls finish and free memory, rather than failing the task.
+    /// 4xx (except 429) and other errors are returned immediately — only transient
+    /// overload gets the backoff.
+    async fn post_responses(
+        &self,
+        body: &serde_json::Value,
+        owner_token: Option<&str>,
+    ) -> anyhow::Result<ResponsesReply> {
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut backoff = std::time::Duration::from_millis(400);
+        let mut last: Option<anyhow::Error> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut rb = self
+                .http
+                .post(format!("{}/v1/responses", self.base_url))
+                .json(body);
+            if let Some(token) = owner_token.or(self.api_key.as_deref()) {
+                rb = rb.bearer_auth(token);
+            }
+            match rb.send().await {
+                Ok(resp) if is_transient(resp.status()) => {
+                    last = Some(anyhow::anyhow!("hipfire sched-shed {}", resp.status()));
+                }
+                Ok(resp) => return Ok(resp.error_for_status()?.json().await?),
+                Err(e) if e.is_timeout() || e.is_connect() => last = Some(e.into()),
+                Err(e) => return Err(e.into()), // non-transient -> don't retry
+            }
+            if attempt + 1 < MAX_ATTEMPTS {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("hipfire: retries exhausted")))
     }
 
     /// Like [`Self::respond`], but streams: `on_delta` is called with each incremental
@@ -455,6 +496,17 @@ mod tests {
         );
         assert_eq!(parse_sse_event("data: [DONE]"), None);
         assert_eq!(parse_sse_event(": keep-alive comment"), None);
+    }
+
+    #[test]
+    fn transient_statuses_retry_client_errors_dont() {
+        use reqwest::StatusCode;
+        assert!(is_transient(StatusCode::INTERNAL_SERVER_ERROR)); // 500 — hipfire shed
+        assert!(is_transient(StatusCode::SERVICE_UNAVAILABLE)); // 503
+        assert!(is_transient(StatusCode::TOO_MANY_REQUESTS)); // 429
+        assert!(!is_transient(StatusCode::BAD_REQUEST)); // 400 — our bug
+        assert!(!is_transient(StatusCode::UNAUTHORIZED)); // 401
+        assert!(!is_transient(StatusCode::OK));
     }
 
     #[test]
