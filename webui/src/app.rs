@@ -13,15 +13,42 @@ use crate::{egui_panel, term, ws};
 const SESSION: &str = "web";
 
 /// Render one agent message (Markdown, possibly with `$…$` LaTeX) to HTML. KaTeX
-/// renders the math afterward, over the mounted element. Raw HTML in the Markdown
-/// is dropped — this feeds inner_html, so pass-through would be script injection.
+/// renders the math afterward, over the mounted element. Raw HTML is dropped
+/// (this feeds inner_html, so pass-through would be script injection), and link/
+/// image URLs with a non-http(s) scheme are neutralized — DocAnswer now carries
+/// verbatim ingested-document text, so `[x](javascript:…)` is attacker-reachable.
 fn md_to_html(md: &str) -> String {
-    use pulldown_cmark::{html, Event, Parser};
+    use pulldown_cmark::{html, Event, Parser, Tag};
     let mut out = String::new();
-    let no_html =
-        Parser::new(md).filter(|e| !matches!(e, Event::Html(_) | Event::InlineHtml(_)));
-    html::push_html(&mut out, no_html);
+    let events = Parser::new(md)
+        .filter(|e| !matches!(e, Event::Html(_) | Event::InlineHtml(_)))
+        .map(|e| match e {
+            Event::Start(Tag::Link { link_type, dest_url, title, id }) => {
+                Event::Start(Tag::Link { link_type, dest_url: safe_url(dest_url), title, id })
+            }
+            Event::Start(Tag::Image { link_type, dest_url, title, id }) => {
+                Event::Start(Tag::Image { link_type, dest_url: safe_url(dest_url), title, id })
+            }
+            other => other,
+        });
+    html::push_html(&mut out, events);
     out
+}
+
+/// Allow only http/https/mailto or scheme-less (relative/anchor) URLs; replace
+/// anything else (javascript:, data:, vbscript:, …) with a harmless anchor.
+fn safe_url(url: pulldown_cmark::CowStr) -> pulldown_cmark::CowStr {
+    let scheme_end = url.bytes().take_while(|&b| b != b':' && b != b'/' && b != b'#').count();
+    let has_scheme = url.as_bytes().get(scheme_end) == Some(&b':');
+    if !has_scheme {
+        return url; // relative path or #anchor
+    }
+    let scheme = url[..scheme_end].to_ascii_lowercase();
+    if matches!(scheme.as_str(), "http" | "https" | "mailto") {
+        url
+    } else {
+        "#".into()
+    }
 }
 
 /// HTML-escape untrusted text bound for `inner_html` (tool observations echo repo

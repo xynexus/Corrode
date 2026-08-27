@@ -33,7 +33,9 @@ pub struct Daemon {
     swarm: Swarm,
     roles: RoleModels,
     /// Embedded HelixDB. `None` unless built with `--features helix` and opened.
-    graph: Option<Box<dyn GraphStore>>,
+    /// `Arc` so a clone can move into `spawn_blocking` (LMDB writes are sync and
+    /// fsync — never run them on a tokio worker inline).
+    graph: Option<Arc<dyn GraphStore>>,
     /// Repo VFS. `Arc` so the tool-execution loop's `'static` future can own a clone.
     vfs: Arc<dyn Vfs>,
     /// Live pty-backed terminal sessions.
@@ -61,7 +63,7 @@ impl Daemon {
     pub fn new(
         swarm: Swarm,
         roles: RoleModels,
-        graph: Option<Box<dyn GraphStore>>,
+        graph: Option<Arc<dyn GraphStore>>,
         vfs: Arc<dyn Vfs>,
         skills: SkillContext,
         tool_caller: Option<Arc<dyn ToolCaller>>,
@@ -98,7 +100,15 @@ impl Daemon {
         events: mpsc::Sender<AgentEvent>,
     ) {
         while let Some(cmd) = commands.recv().await {
-            if matches!(cmd, AgentCommand::Prompt { .. }) {
+            // DocIngest/DocQuery spawn for the same reason Prompt does: convert +
+            // embed can take seconds, and the loop must keep serving terminal I/O
+            // + approvals.
+            if matches!(
+                cmd,
+                AgentCommand::Prompt { .. }
+                    | AgentCommand::DocIngest { .. }
+                    | AgentCommand::DocQuery { .. }
+            ) {
                 let this = Arc::clone(&self);
                 let events = events.clone();
                 tokio::spawn(async move { this.handle(cmd, &events).await });
@@ -283,20 +293,11 @@ impl Daemon {
                 let _ = events.send(AgentEvent::TurnComplete { plan_id }).await;
             }
             AgentCommand::DocQuery { question } => {
-                let ev = match &self.graph {
-                    Some(g) => match g.doc_search(&question, 8) {
-                        // ponytail: grounding ids only for now; the GraphRAG answer
-                        // (retrieve -> synthesize via hipfire) fills `text` next.
-                        Ok(ids) => AgentEvent::DocAnswer {
-                            text: String::new(),
-                            grounded_on: ids,
-                        },
-                        Err(e) => AgentEvent::Error { message: e.to_string() },
-                    },
-                    None => AgentEvent::Error {
-                        message: "DocQuery unavailable: build with --features helix and open a graph store".into(),
-                    },
-                };
+                let ev = self.doc_query(&question).await;
+                let _ = events.send(ev).await;
+            }
+            AgentCommand::DocIngest { path } => {
+                let ev = self.ingest_doc(path).await;
                 let _ = events.send(ev).await;
             }
             AgentCommand::ListDir { path } => {
@@ -410,6 +411,192 @@ impl Daemon {
                 return;
             }
         }
+    }
+
+    /// GraphRAG doc retrieval: embed the question via hipfire (query-side task
+    /// prompt) and similarity-search the chunk vectors; without an embedding
+    /// model, fall back to the store's BM25 text search. The answer text is the
+    /// retrieved chunks verbatim.
+    /// ponytail: retrieval-only — the synthesis pass (feed chunks + question to a
+    /// hipfire chat model) is the next layer.
+    async fn doc_query(&self, question: &str) -> AgentEvent {
+        let Some(g) = &self.graph else {
+            return AgentEvent::Error {
+                message: "DocQuery unavailable: build with --features helix and open a graph store"
+                    .into(),
+            };
+        };
+        let query_vec = match self.skills.embed_model() {
+            Some(model) => self.swarm.client().embed_query(model, question).await.ok(),
+            None => None,
+        };
+        // LMDB read txn + HNSW search are sync — off the tokio worker.
+        let store = Arc::clone(g);
+        let q = question.to_string();
+        let searched = tokio::task::spawn_blocking(move || {
+            store.doc_search(&q, query_vec.as_deref(), 8)
+        })
+        .await;
+        let result = match searched {
+            Ok(r) => r,
+            Err(e) => return AgentEvent::Error { message: format!("doc search task: {e}") },
+        };
+        match result {
+            Ok(hits) => AgentEvent::DocAnswer {
+                text: hits
+                    .iter()
+                    .map(|(id, text)| format!("> [{id}]\n{text}"))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                grounded_on: hits.into_iter().map(|(id, _)| id).collect(),
+            },
+            Err(e) => AgentEvent::Error {
+                message: format!("doc search: {e}"),
+            },
+        }
+    }
+
+    /// Convert + chunk a reference doc via docling, then persist doc/chunk nodes
+    /// (and their embeddings) into the graph store for `DocQuery`. Conversion is
+    /// sync CPU work, so it runs on the blocking pool.
+    ///
+    /// The path is confined to the configured doc roots first: `DocIngest` reads a
+    /// host file and `DocQuery` can read the content back, and the ws is reachable
+    /// from the (LAN-exposed, unauthenticated) webui — so an unconfined ingest is
+    /// arbitrary file read. Roots come from `CORRODE_DOC_ROOTS` (`:`-separated),
+    /// defaulting to the repo root.
+    #[cfg(feature = "docling")]
+    async fn ingest_doc(&self, path: String) -> AgentEvent {
+        let canonical = match self.confine_doc_path(&path) {
+            Ok(p) => p,
+            Err(e) => return AgentEvent::Error { message: format!("doc ingest: {e}") },
+        };
+        let converted = tokio::task::spawn_blocking(move || {
+            crate::ingest::ingest(&canonical).map(|d| (canonical, d))
+        })
+        .await;
+        let (path, doc) = match converted {
+            Ok(Ok(ok)) => ok,
+            Ok(Err(e)) => return AgentEvent::Error { message: format!("doc ingest: {e}") },
+            Err(e) => return AgentEvent::Error { message: format!("doc ingest task: {e}") },
+        };
+        let persisted = self.persist_doc(&doc).await;
+        AgentEvent::DocIngested {
+            path,
+            doc_id: doc.doc_id,
+            chunks: doc.chunks.len(),
+            persisted,
+        }
+    }
+
+    /// Canonicalize `path` (also collapsing `..` and resolving symlinks — the file
+    /// must exist) and require it under one of the doc roots. Returns the canonical
+    /// path string, which also gives stable doc/chunk ids across path spellings.
+    #[cfg(feature = "docling")]
+    fn confine_doc_path(&self, path: &str) -> anyhow::Result<String> {
+        let roots: Vec<PathBuf> = std::env::var("CORRODE_DOC_ROOTS")
+            .ok()
+            .map(|v| v.split(':').map(PathBuf::from).collect())
+            .unwrap_or_else(|| vec![self.repo_root.clone()]);
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| anyhow::anyhow!("resolve {path}: {e}"))?;
+        let allowed = roots.iter().any(|r| {
+            std::fs::canonicalize(r)
+                .map(|cr| canonical.starts_with(cr))
+                .unwrap_or(false)
+        });
+        if !allowed {
+            anyhow::bail!(
+                "{} is outside the allowed doc roots (set CORRODE_DOC_ROOTS)",
+                canonical.display()
+            );
+        }
+        Ok(canonical.to_string_lossy().into_owned())
+    }
+
+    #[cfg(not(feature = "docling"))]
+    async fn ingest_doc(&self, _path: String) -> AgentEvent {
+        AgentEvent::Error {
+            message: "DocIngest unavailable: build with --features docling".into(),
+        }
+    }
+
+    /// Write one converted doc into the graph store as one atomic `replace_doc`:
+    /// the `doc` node, every chunk node (+ its hipfire embedding, batch-computed)
+    /// and `has_chunk` edge, and pruning of chunks the doc no longer has. A chunk
+    /// whose embedding failed is stored text-only (still BM25-searchable). The LMDB
+    /// write runs on the blocking pool (sync fsync-per-commit). Returns whether it
+    /// landed.
+    #[cfg(feature = "docling")]
+    async fn persist_doc(&self, doc: &crate::ingest::IngestedDoc) -> bool {
+        let Some(store) = &self.graph else {
+            return false;
+        };
+        let embeddings = self.embed_chunks(&doc.chunks).await;
+        let chunks = doc
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, (id, text))| {
+                let emb = embeddings.as_ref().and_then(|v| v[i].clone());
+                (id.clone(), text.clone(), emb)
+            })
+            .collect();
+        let write = crate::graph::DocWrite {
+            doc_id: doc.doc_id.clone(),
+            title: doc.title.clone(),
+            chunks,
+        };
+        let store = Arc::clone(store);
+        match tokio::task::spawn_blocking(move || store.replace_doc(&write)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                eprintln!("doc persistence unavailable ({e}); skipping");
+                false
+            }
+            Err(e) => {
+                eprintln!("doc persistence task failed ({e}); skipping");
+                false
+            }
+        }
+    }
+
+    /// Batch-embed chunk texts (document side), aligned 1:1 with `chunks`. A batch
+    /// that fails (e.g. one entry over hipfire's 2048-token cap 400s the whole
+    /// batch) yields `None` for just that batch's chunks — they degrade to
+    /// text-only rather than sinking the rest of the doc. Entries are clipped as a
+    /// token-cap guard; the stored chunk text stays full-length. Returns `None`
+    /// only when no embedding model is served at all.
+    #[cfg(feature = "docling")]
+    async fn embed_chunks(&self, chunks: &[(String, String)]) -> Option<Vec<Option<Vec<f32>>>> {
+        // ponytail: chars as a token proxy — ~6000 chars sits safely under the
+        // 2048-token embedding cap for prose; a real tokenizer clip can come with
+        // the docling `chunking` feature.
+        const EMBED_CLIP_CHARS: usize = 6000;
+        const BATCH: usize = 64;
+        let model = self.skills.embed_model()?;
+        let client = self.swarm.client();
+        let texts: Vec<String> = chunks
+            .iter()
+            .map(|(_, t)| {
+                let mut end = t.len().min(EMBED_CLIP_CHARS);
+                while !t.is_char_boundary(end) {
+                    end -= 1;
+                }
+                t[..end].to_string()
+            })
+            .collect();
+        let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(BATCH) {
+            match client.embed_batch(model, batch, false).await {
+                Ok(vecs) => out.extend(vecs.into_iter().map(Some)),
+                Err(e) => {
+                    eprintln!("chunk embedding batch failed ({e}); those chunks stored text-only");
+                    out.extend(std::iter::repeat_with(|| None).take(batch.len()));
+                }
+            }
+        }
+        Some(out)
     }
 
     /// The shared context prefix prepended to every prompt in a Prompt turn.

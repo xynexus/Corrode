@@ -1,2 +1,4 @@
 /target
 third_party/**/target
+# local HelixDB store (CORRODE_GRAPH_DIR default)
+/.corrode/

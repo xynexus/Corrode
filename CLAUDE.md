@@ -45,6 +45,7 @@ cargo test -p corrode-daemon <name>          # single test
 cargo run -p corrode-daemon                  # serve the daemon ws at ws://127.0.0.1:7878/agent
 cargo build -p corrode-daemon --features helix   # HEAVY: compiles vendored HelixDB (mimalloc/LMDB/HelixQL). Enables the real in-process store.
 cargo build -p corrode-daemon --features needle  # compiles the Needle tool-call shim (CPU/candle). Enables reliable tool-calling for small models.
+cargo build -p corrode-daemon --features docling # docling.rs doc ingestion (pure-Rust converters + PDF text layer; no pdfium/ONNX). Enables DocIngest.
 cargo run  -p corrode-web                    # serve UI on http://127.0.0.1:8787, proxy /agent -> daemon
 ```
 
@@ -55,7 +56,8 @@ swarm over the bridge.
 Env: `HIPFIRE_BASE_URL` (default `http://127.0.0.1:11435`), `HIPFIRE_API_KEY`,
 `CORRODE_MODEL` (offline fallback model for all roles), `CORRODE_ROLES` (path to a
 JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`),
-`CORRODE_GRAPH_DIR` (HelixDB path under `--features helix`),
+`CORRODE_GRAPH_DIR` (HelixDB path under `--features helix`; default
+`<CORRODE_REPO>/.corrode/graph` — the store travels with the repo it describes),
 `CORRODE_NEEDLE_ASSETS` (Needle asset dir under `--features needle`; defaults to the
 vendored `crates/needle-toolcall-shim/assets/needle`, resolved at build time, so it
 works out of the box; absent -> tool-caller disabled, swarm falls back to
@@ -258,15 +260,34 @@ embed is `graph::embedded::HelixStore::open(path)`, which calls:
 HelixGraphStorage::new(path, Config::default(), VersionInfo::default())
 ```
 
-from `helix_db::helix_engine::storage_core`. HelixDB is one store for graph
-traversal + vector search + GraphRAG: the graph side is the VFS's source of
-truth; the vector side backs `AgentCommand::DocQuery` (documentation GraphRAG).
+from `helix_db::helix_engine::storage_core` (plus a `"key"` Unique secondary
+index declared at open — helix mints its own u128 node ids, so Corrode's string
+ids live in that index). HelixDB is one store for graph traversal + vector
+search + GraphRAG: the graph side is the VFS's source of truth; the vector side
+backs `AgentCommand::DocQuery` (documentation GraphRAG).
+
+**Doc ingestion (`--features docling`, `ingest.rs`).** `AgentCommand::DocIngest
+{path}` converts a reference doc (PDF text layer, DOCX/HTML/MD/…) with vendored
+docling.rs (`third_party/docling.rs`, MIT, `pdf-text` only — no pdfium/ONNX;
+model-backed layout/OCR is planned via hipfire-served models, not ort), chunks it
+with the tokenizer-free `HierarchicalChunker`, embeds chunks via hipfire
+`/v1/embeddings` (batch, `input_type` document/query asymmetry respected), and
+writes the doc node + all its chunk nodes + `has_chunk` edges + HNSW vectors in
+one atomic `GraphStore::replace_doc` txn (which also prunes chunks a re-ingested
+doc no longer has). `DocQuery` embeds the question (query side) and
+similarity-searches, unioned with BM25; with no embedding model served it falls
+back to BM25-only (indexed automatically on every node write). Retrieval-only for now — the
+synthesize-with-a-chat-model pass is the next layer. `docling-rag` is
+deliberately unused: HelixDB owns chunks/vectors/search.
 
 When writing HelixQL/Rust-DSL queries against it, the vendored **helix skills**
 are symlinked into `.claude/skills/` (helix-query-rust, helix-query-optimize,
 helix-query-json-dynamic, helix-cli, helix-memory-system). Use them.
 
-**`--features helix` needs system OpenSSL + pkg-config** at build time. Upstream
+**`--features helix` needs system OpenSSL + pkg-config** at build time (both
+installed here; `apt install libssl-dev pkg-config`). On a host that has
+`libssl-dev` but not pkg-config, bypass discovery with
+`OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr/include`. Upstream
 helix-db (via its always-on `helix-metrics` crate) uses `native-tls`, so the
 build links openssl regardless of features. This matches HelixDB's own build
 requirements and works out of the box on hosts with `libssl-dev`/`pkg-config`

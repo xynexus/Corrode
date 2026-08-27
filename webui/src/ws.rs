@@ -116,6 +116,12 @@ fn apply_event(
         AgentEvent::ToolResult { call, observation, .. } => {
             log.update(|l| l.push(LogEntry::Tool { call, observation }))
         }
+        AgentEvent::DocIngested { path, doc_id, chunks, persisted } => {
+            let note = if persisted { "stored" } else { "parsed (store unavailable)" };
+            log.update(|l| {
+                l.push(LogEntry::Ws(format!("ingested {path} -> {doc_id}: {chunks} chunks {note}")))
+            });
+        }
         AgentEvent::TurnComplete { plan_id } => {
             busy.set(false);
             log.update(|l| l.push(LogEntry::Turn { plan_id }));

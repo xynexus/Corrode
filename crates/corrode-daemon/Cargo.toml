@@ -31,6 +31,16 @@ portable-pty = "0.9"
 path = "../../third_party/helix-db/helix-db"
 optional = true
 
+# helix companions (versions unify with helix-db's own): bumpalo for the arena
+# every helix traversal borrows from; heed3 to name LMDB txn types in signatures.
+[dependencies.bumpalo]
+version = "3"
+optional = true
+
+[dependencies.heed3]
+version = "0.22"
+optional = true
+
 # FUSE mount of the Vfs, so git and subagent shells see the graph<->git projection
 # as a real filesystem. Pure-protocol crate (no libfuse-dev); needs fusermount3 at
 # runtime. `unprivileged` lets the daemon mount without root (via fusermount3).
@@ -60,11 +70,24 @@ optional = true
 path = "../needle-toolcall-shim"
 optional = true
 
+# Document ingestion for the doc GraphRAG (`AgentCommand::DocIngest`): docling.rs,
+# vendored via the git submodule at third_party/docling.rs (MIT). Deliberately
+# `default-features = false` + `pdf-text`: the pure-Rust converters (DOCX/HTML/MD/
+# XLSX/PPTX + PDF text layer) with NO pdfium/ONNX — model-backed layout/OCR is
+# planned to route through hipfire-served models, not ort. `docling-rag` is
+# intentionally unused (HelixDB owns chunks/vectors/search here).
+[dependencies.docling]
+path = "../../third_party/docling.rs/crates/docling"
+default-features = false
+features = ["pdf-text"]
+optional = true
+
 [features]
 default = []
-helix = ["dep:helix-db"]
+helix = ["dep:helix-db", "dep:bumpalo", "dep:heed3"]
 fuse = ["dep:fuse3", "dep:bytes", "dep:libc"]
 needle = ["dep:needle-toolcall-shim"]
+docling = ["dep:docling"]
 
 [[bin]]
 name = "corrode-daemon"

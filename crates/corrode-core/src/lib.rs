@@ -117,6 +117,10 @@ pub enum AgentCommand {
     TerminalResize { session: String, cols: u16, rows: u16 },
     /// GraphRAG documentation query over HelixDB's vector+graph store.
     DocQuery { question: String },
+    /// Ingest a reference document (PDF/DOCX/HTML/MD/…) into the doc GraphRAG:
+    /// docling converts + chunks it, the chunks are embedded and stored. `path`
+    /// is daemon-host-local (typically under the repo or an absolute docs dir).
+    DocIngest { path: String },
     /// Explorer: list the VFS entries under a directory path.
     ListDir { path: String },
     /// A human's decision on a pending `ApprovalRequest` (mutating tool call). The
@@ -133,6 +137,10 @@ pub enum AgentEvent {
     TerminalOutput { session: String, data: Vec<u8> },
     /// GraphRAG answer with the node ids it grounded on.
     DocAnswer { text: String, grounded_on: Vec<String> },
+    /// A `DocIngest` finished: the doc node's id and how many chunks were stored
+    /// (`persisted=false` when the graph store was absent/stubbed — parsed but
+    /// not yet queryable).
+    DocIngested { path: String, doc_id: String, chunks: usize, persisted: bool },
     /// Explorer: entries under a listed directory.
     DirListing { path: String, entries: Vec<FileNodeView> },
     /// A subagent wants to run a mutating tool (write a file, run a command) and needs

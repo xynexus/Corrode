@@ -16,6 +16,8 @@ mod dialect;
 mod fuse;
 mod graph;
 mod hipfire;
+#[cfg(feature = "docling")]
+mod ingest;
 mod plan_graph;
 mod planner;
 mod roles;
@@ -81,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
         skills.ranked()
     );
 
-    let graph = open_graph();
+    let graph = open_graph(&repo_root);
     let tool_caller = open_tool_caller();
     let vfs = std::sync::Arc::new(PassthroughVfs::new(&repo_root));
     let dialects = std::sync::Arc::new(dialect::Dialects::load());
@@ -115,12 +117,20 @@ async fn main() -> anyhow::Result<()> {
     server::serve(daemon, &addr).await
 }
 
-/// Open the embedded HelixDB store when built with `--features helix`.
+/// Open the embedded HelixDB store when built with `--features helix`. The store
+/// lives WITH the repo it describes — `<CORRODE_REPO>/.corrode/graph` (an LMDB
+/// directory) — so each project carries its own graph; `CORRODE_GRAPH_DIR`
+/// overrides for a store kept elsewhere.
 #[cfg(feature = "helix")]
-fn open_graph() -> Option<Box<dyn graph::GraphStore>> {
-    let path = std::env::var("CORRODE_GRAPH_DIR").unwrap_or_else(|_| ".corrode/graph".to_string());
+fn open_graph(repo_root: &str) -> Option<std::sync::Arc<dyn graph::GraphStore>> {
+    let path = std::env::var("CORRODE_GRAPH_DIR").unwrap_or_else(|_| {
+        std::path::Path::new(repo_root)
+            .join(".corrode/graph")
+            .to_string_lossy()
+            .into_owned()
+    });
     match graph::embedded::HelixStore::open(&path) {
-        Ok(store) => Some(Box::new(store)),
+        Ok(store) => Some(std::sync::Arc::new(store)),
         Err(e) => {
             eprintln!("HelixDB open failed at {path}: {e}");
             None
@@ -129,7 +139,7 @@ fn open_graph() -> Option<Box<dyn graph::GraphStore>> {
 }
 
 #[cfg(not(feature = "helix"))]
-fn open_graph() -> Option<Box<dyn graph::GraphStore>> {
+fn open_graph(_repo_root: &str) -> Option<std::sync::Arc<dyn graph::GraphStore>> {
     None
 }
 

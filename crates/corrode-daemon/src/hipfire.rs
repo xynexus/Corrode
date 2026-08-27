@@ -73,7 +73,11 @@ impl ResponsesReply {
 #[derive(Serialize)]
 struct EmbeddingsRequest<'a> {
     model: &'a str,
-    input: &'a str,
+    input: &'a [String],
+    /// "query" for retrieval queries, "document" for corpus text — EmbeddingGemma
+    /// prepends a different task prompt per type, so mixing them skews cosine.
+    /// The server default is "document"; send it explicitly either way.
+    input_type: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +88,8 @@ struct EmbeddingsReply {
 
 #[derive(Deserialize)]
 struct EmbeddingData {
+    #[serde(default)]
+    index: usize,
     #[serde(default)]
     embedding: Vec<f32>,
 }
@@ -174,14 +180,38 @@ impl Client {
         Ok((reply.output_text, reasoning))
     }
 
-    /// Embed `input` with an embedding model (`/v1/embeddings`) — code/doc/skill
-    /// retrieval is a hipfire call, not a local index. Powers skill selection and,
-    /// later, GraphRAG over HelixDB.
-    // ponytail: no loop caller yet — wired when skill/doc retrieval lands. The
-    // embedding model id (e.g. an EmbeddingGemma variant) is resolved like any role.
-    #[allow(dead_code)]
+    /// Embed one string (`/v1/embeddings`) — code/doc/skill retrieval is a hipfire
+    /// call, not a local index. Wraps [`Self::embed_batch`]; `input_type` stays
+    /// "document" so existing corpus-side callers (skill descriptions) are unchanged.
     pub async fn embed(&self, model: &str, input: &str) -> anyhow::Result<Vec<f32>> {
-        let req = EmbeddingsRequest { model, input };
+        self.embed_one(model, input, false).await
+    }
+
+    /// Embed one retrieval *query* — EmbeddingGemma's query/document task prompts
+    /// are asymmetric, so search text must not be embedded as a document.
+    pub async fn embed_query(&self, model: &str, input: &str) -> anyhow::Result<Vec<f32>> {
+        self.embed_one(model, input, true).await
+    }
+
+    async fn embed_one(&self, model: &str, input: &str, query: bool) -> anyhow::Result<Vec<f32>> {
+        let texts = [input.to_string()];
+        Ok(self.embed_batch(model, &texts, query).await?.remove(0))
+    }
+
+    /// Batch-embed via `POST /v1/embeddings`: one request, N vectors, input order.
+    /// Empty inputs are rejected server-side (400s the whole batch) — filter first.
+    /// Entries over ~2048 tokens 400 too, so chunk before embedding.
+    pub async fn embed_batch(
+        &self,
+        model: &str,
+        texts: &[String],
+        query: bool,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let req = EmbeddingsRequest {
+            model,
+            input: texts,
+            input_type: if query { "query" } else { "document" },
+        };
         let mut rb = self
             .http
             .post(format!("{}/v1/embeddings", self.base_url))
@@ -190,12 +220,15 @@ impl Client {
             rb = rb.bearer_auth(key);
         }
         let reply: EmbeddingsReply = rb.send().await?.error_for_status()?.json().await?;
-        reply
-            .data
-            .into_iter()
-            .next()
-            .map(|d| d.embedding)
-            .filter(|e| !e.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("embeddings: empty response for model {model}"))
+        let mut data = reply.data;
+        data.sort_by_key(|d| d.index); // index is authoritative, not response order
+        if data.len() != texts.len() || data.iter().any(|d| d.embedding.is_empty()) {
+            anyhow::bail!(
+                "embeddings: {} vectors for {} inputs (model {model})",
+                data.len(),
+                texts.len()
+            );
+        }
+        Ok(data.into_iter().map(|d| d.embedding).collect())
     }
 }

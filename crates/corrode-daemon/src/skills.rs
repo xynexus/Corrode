@@ -223,6 +223,12 @@ impl SkillContext {
         self.registry.len()
     }
 
+    /// The embedding model resolved at startup (None when hipfire serves none) —
+    /// shared with doc ingestion/GraphRAG so there's one embedding space per run.
+    pub fn embed_model(&self) -> Option<&str> {
+        self.embed_model.as_deref()
+    }
+
     /// Map of skill name -> its directory, so the tool loop can resolve and run a
     /// skill's bundled `scripts/` (progressive-disclosure stage 3, execution).
     pub fn script_dirs(&self) -> HashMap<String, PathBuf> {
@@ -249,7 +255,8 @@ impl SkillContext {
     pub async fn prefix_section(&self, task: &str, client: &Client, k: usize) -> String {
         if !self.index.is_empty() {
             if let Some(model) = &self.embed_model {
-                if let Ok(q) = client.embed(model, task).await {
+                // The task is the search side: embed as a query, not a document.
+                if let Ok(q) = client.embed_query(model, task).await {
                     return self.render(&q, k);
                 }
             }
