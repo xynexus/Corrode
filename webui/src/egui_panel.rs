@@ -11,15 +11,18 @@
 
 use std::collections::HashMap;
 
+use corrode_core::AgentCommand;
 use eframe::CreationContext;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use futures::channel::mpsc::UnboundedSender;
 use web_sys::HtmlCanvasElement;
 
 use crate::model::Shared;
 
 /// Start the egui app on `canvas`. Runs asynchronously (eframe's start is async);
 /// stores the egui `Context` into the shared model so async pushes can repaint.
-pub fn start(canvas: HtmlCanvasElement, shared: Shared) {
+/// `cmd_tx` lets a node click ask the daemon to expand that node (`ListNeighbors`).
+pub fn start(canvas: HtmlCanvasElement, shared: Shared, cmd_tx: UnboundedSender<AgentCommand>) {
     let runner = eframe::WebRunner::new();
     wasm_bindgen_futures::spawn_local(async move {
         let result = runner
@@ -30,6 +33,7 @@ pub fn start(canvas: HtmlCanvasElement, shared: Shared) {
                     shared.borrow_mut().egui_ctx = Some(cc.egui_ctx.clone());
                     Ok(Box::new(GraphApp {
                         shared,
+                        cmd_tx,
                         sim: HashMap::new(),
                     }) as Box<dyn eframe::App>)
                 }),
@@ -50,6 +54,7 @@ struct Body {
 
 struct GraphApp {
     shared: Shared,
+    cmd_tx: UnboundedSender<AgentCommand>,
     sim: HashMap<String, Body>,
 }
 
@@ -163,13 +168,21 @@ impl GraphApp {
             }
         }
         // Nodes: draw, drag (a dragged node is pinned to the pointer, velocity
-        // reset so it doesn't fling on release), hover for the full label.
+        // reset so it doesn't fling on release), click to expand its persisted
+        // neighborhood, hover for the full label.
         for (i, n) in nodes.iter().enumerate() {
             let hit = Rect::from_center_size(pos[i], Vec2::splat(18.0));
-            let resp = ui.interact(hit, ui.id().with(("node", i)), Sense::drag());
+            let resp = ui.interact(hit, ui.id().with(("node", i)), Sense::click_and_drag());
             if resp.dragged() {
                 pos[i] += resp.drag_delta();
                 vel[i] = Vec2::ZERO;
+            }
+            if resp.clicked() {
+                // Ask the daemon for this node's neighbors; the reply merges into
+                // plan_nodes (see ws::Neighbors), growing the graph in place.
+                let _ = self.cmd_tx.unbounded_send(AgentCommand::ListNeighbors {
+                    node_id: n.id.clone(),
+                });
             }
             let r = if resp.hovered() { 9.0 } else { 7.0 };
             painter.circle_filled(pos[i], r, kind_color(&n.kind));
@@ -181,7 +194,7 @@ impl GraphApp {
                 FontId::proportional(10.0),
                 Color32::from_gray(205),
             );
-            resp.on_hover_text(format!("[{}] {}", n.kind, n.label));
+            resp.on_hover_text(format!("[{}] {}\n(click to expand)", n.kind, n.label));
         }
 
         for (n, body) in nodes.iter().zip(pos.iter().zip(vel.iter())) {

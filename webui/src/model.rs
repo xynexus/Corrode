@@ -20,6 +20,25 @@ pub struct UiModel {
     pub egui_ctx: Option<egui::Context>,
 }
 
+impl UiModel {
+    /// Merge a one-hop `Neighbors` subgraph into the drawn graph: union nodes by id
+    /// and union their outgoing edges, so clicking a node *expands* the canvas
+    /// (revealing provenance from earlier turns) instead of replacing it.
+    pub fn merge_nodes(&mut self, incoming: Vec<corrode_core::GraphNodeView>) {
+        for n in incoming {
+            if let Some(existing) = self.plan_nodes.iter_mut().find(|e| e.id == n.id) {
+                for t in n.edges_out {
+                    if !existing.edges_out.contains(&t) {
+                        existing.edges_out.push(t);
+                    }
+                }
+            } else {
+                self.plan_nodes.push(n);
+            }
+        }
+    }
+}
+
 pub type Shared = Rc<RefCell<UiModel>>;
 
 pub fn shared() -> Shared {

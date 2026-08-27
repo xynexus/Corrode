@@ -142,6 +142,14 @@ fn apply_event(
                 ctx.request_repaint();
             }
         }
+        // Click-to-expand: fold a node's persisted neighborhood into the canvas.
+        AgentEvent::Neighbors { nodes, .. } => {
+            let mut m = shared.borrow_mut();
+            m.merge_nodes(nodes);
+            if let Some(ctx) = &m.egui_ctx {
+                ctx.request_repaint();
+            }
+        }
         AgentEvent::DocIngested { path, doc_id, chunks, persisted } => {
             let note = if persisted { "stored" } else { "parsed (store unavailable)" };
             log.update(|l| {

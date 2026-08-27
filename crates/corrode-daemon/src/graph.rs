@@ -18,10 +18,10 @@ use corrode_core::GraphNodeView;
 /// and its tests don't drag the (heavy, feature-gated) HelixDB compile in, and so
 /// the daemon can hold it as `Option<Arc<dyn GraphStore>>` (None until opened).
 pub trait GraphStore: Send + Sync {
-    /// Nodes directly reachable from `id` — one hop of the explorer's graph view.
-    // ponytail: no caller in the base build yet; wired with a ListNeighbors command
-    // when the webui graph explorer lands.
-    #[allow(dead_code)]
+    /// The one-hop neighborhood around `id` — the queried node plus every adjacent
+    /// node in either direction — for the explorer's interactive graph browse
+    /// (`AgentCommand::ListNeighbors`). Same node+`edges_out` shape as a `PlanGraph`
+    /// event so the front-end merges it directly.
     fn neighbors(&self, id: &str) -> anyhow::Result<Vec<GraphNodeView>>;
 
     /// Doc retrieval for GraphRAG: HNSW similarity when `query_vec` is given
@@ -98,6 +98,7 @@ pub mod embedded {
     use helix_db::helix_engine::traversal_core::config::Config;
     use helix_db::helix_engine::traversal_core::ops::bm25::search_bm25::SearchBM25Adapter;
     use helix_db::helix_engine::traversal_core::ops::g::G;
+    use helix_db::helix_engine::traversal_core::ops::in_::in_::InAdapter;
     use helix_db::helix_engine::traversal_core::ops::out::out::OutAdapter;
     use helix_db::helix_engine::traversal_core::ops::out::out_e::OutEdgesAdapter;
     use helix_db::helix_engine::traversal_core::ops::source::add_e::AddEAdapter;
@@ -232,23 +233,67 @@ pub mod embedded {
             let Some(node_id) = self.find_id(&txn, &arena, id) else {
                 return Ok(Vec::new());
             };
-            let mut out = Vec::new();
+            // One hop in BOTH directions, returned in the same shape as a `PlanGraph`
+            // event (nodes carrying `edges_out`) so the webui merges it with zero new
+            // logic. The queried node carries its outgoing targets; an *incoming*
+            // neighbor (n -rel-> id) carries `edges_out=[id]` so that edge is drawn;
+            // an outgoing neighbor's edge is already given by the queried node.
+            // Both directions matter: expanding a `plan` must reveal the tasks that
+            // point AT it (`part_of` is task->plan), not only what it points to.
+            let mut nodes: std::collections::HashMap<String, GraphNodeView> =
+                std::collections::HashMap::new();
+            let mut out_targets: Vec<String> = Vec::new();
             for rel in NEIGHBOR_RELS {
-                let hops: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
+                let outs: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
                     .n_from_id(&node_id)
                     .out_node(rel)
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| anyhow::anyhow!("neighbors {id} via {rel}: {e:?}"))?;
-                for n in hops {
-                    out.push(GraphNodeView {
-                        id: prop_str(&n, "key"),
+                    .map_err(|e| anyhow::anyhow!("neighbors {id} out via {rel}: {e:?}"))?;
+                for n in outs {
+                    let key = prop_str(&n, "key");
+                    out_targets.push(key.clone());
+                    nodes.entry(key.clone()).or_insert_with(|| GraphNodeView {
+                        id: key,
                         label: prop_str(&n, "label"),
                         kind: prop_str(&n, "kind"),
-                        edges_out: Vec::new(), // one hop; the view's edges come later
+                        edges_out: Vec::new(),
                     });
                 }
+                let ins: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
+                    .n_from_id(&node_id)
+                    .in_node(rel)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| anyhow::anyhow!("neighbors {id} in via {rel}: {e:?}"))?;
+                for n in ins {
+                    let key = prop_str(&n, "key");
+                    let entry = nodes.entry(key.clone()).or_insert_with(|| GraphNodeView {
+                        id: key,
+                        label: prop_str(&n, "label"),
+                        kind: prop_str(&n, "kind"),
+                        edges_out: Vec::new(),
+                    });
+                    if !entry.edges_out.iter().any(|t| t == id) {
+                        entry.edges_out.push(id.to_string());
+                    }
+                }
             }
-            Ok(out)
+            // The queried node itself, carrying every outgoing edge to a neighbor.
+            let self_hit: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
+                .n_from_id(&node_id)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("neighbors {id} self: {e:?}"))?;
+            if let Some(s) = self_hit.first() {
+                nodes.insert(
+                    id.to_string(),
+                    GraphNodeView {
+                        id: id.to_string(),
+                        label: prop_str(s, "label"),
+                        kind: prop_str(s, "kind"),
+                        edges_out: out_targets,
+                    },
+                );
+            }
+            Ok(nodes.into_values().collect())
         }
 
         fn doc_search(
@@ -535,11 +580,24 @@ pub mod embedded {
             store.upsert_node("task-1", "task", "write the parser v2").unwrap();
             store.add_edge("task-1", "part_of", "plan-0").unwrap();
 
+            // From the task: the subgraph is the task itself (carrying its outgoing
+            // edge to the plan) plus the plan, no duplicates from the re-upsert.
             let n = store.neighbors("task-1").unwrap();
-            assert_eq!(n.len(), 1, "one plan neighbor, no duplicates: {n:?}");
-            assert_eq!(n[0].id, "plan-0");
-            assert_eq!(n[0].kind, "plan");
-            // The re-upsert updated the label in place.
+            assert_eq!(n.len(), 2, "self + one plan neighbor: {n:?}");
+            let task = n.iter().find(|v| v.id == "task-1").expect("self node present");
+            assert_eq!(task.edges_out, vec!["plan-0".to_string()], "task -> plan edge");
+            let plan = n.iter().find(|v| v.id == "plan-0").expect("plan neighbor present");
+            assert_eq!(plan.kind, "plan");
+
+            // From the plan: the incoming task is reachable too (part_of is task->plan),
+            // and it carries the edge back to the plan so the explorer can draw it.
+            let m = store.neighbors("plan-0").unwrap();
+            assert_eq!(m.len(), 2, "self + the task pointing at it: {m:?}");
+            let inbound = m.iter().find(|v| v.id == "task-1").expect("incoming task present");
+            assert_eq!(inbound.edges_out, vec!["plan-0".to_string()], "task -> plan edge drawn");
+
+            // Unknown node -> empty, never an error.
+            assert!(store.neighbors("ghost").unwrap().is_empty());
             let missing = store.add_edge("task-1", "part_of", "ghost");
             assert!(missing.is_err(), "edges to unknown nodes must fail");
 
@@ -607,7 +665,9 @@ pub mod embedded {
                     ],
                 ))
                 .unwrap();
-            assert_eq!(store.neighbors("doc:1").unwrap().len(), 3);
+            // neighbors() includes the queried node itself; count only the chunks.
+            let chunks = |id| store.neighbors(id).unwrap().into_iter().filter(|x| x.id != "doc:1").count();
+            assert_eq!(chunks("doc:1"), 3);
 
             // Re-ingest the SHRUNK doc: only 2 chunks, #1 re-embedded elsewhere.
             store
@@ -622,7 +682,7 @@ pub mod embedded {
 
             // The dropped chunk is gone from the graph and from vector search.
             let n = store.neighbors("doc:1").unwrap();
-            assert_eq!(n.len(), 2, "pruned to 2 chunks: {n:?}");
+            assert_eq!(chunks("doc:1"), 2, "pruned to 2 chunks: {n:?}");
             assert!(!n.iter().any(|x| x.id == "chunk:1#2"), "stale chunk pruned: {n:?}");
 
             // charlie's old embedding must no longer match (its vector was dropped).

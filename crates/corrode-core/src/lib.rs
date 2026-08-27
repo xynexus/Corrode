@@ -135,6 +135,10 @@ pub enum AgentCommand {
     /// Explorer: read one file's contents through the VFS (read-only; the reply is
     /// a `FileContent`). Text is decoded lossily and capped for display.
     ReadFile { path: String },
+    /// Graph explorer: expand one node's one-hop neighborhood from the persisted
+    /// store (reply is `Neighbors`). Lets the UI browse provenance across turns,
+    /// past the single turn a `PlanGraph` event carries. Read-only.
+    ListNeighbors { node_id: String },
     /// A human's decision on a pending `ApprovalRequest` (mutating tool call). The
     /// `id` echoes the request; `approved=false` (or a dropped channel) denies it.
     ApprovalResponse { id: u64, approved: bool },
@@ -167,6 +171,11 @@ pub enum AgentEvent {
     /// Explorer: one file's contents (reply to `ReadFile`), decoded lossily.
     /// `truncated` marks that the file exceeded the display cap.
     FileContent { path: String, content: String, truncated: bool },
+    /// Graph explorer: the one-hop subgraph around `node_id` (reply to
+    /// `ListNeighbors`), in the same node+`edges_out` shape as `PlanGraph` so the
+    /// explorer merges it directly. Includes the queried node. Empty `nodes` when
+    /// the id is unknown or no store is configured.
+    Neighbors { node_id: String, nodes: Vec<GraphNodeView> },
     /// A subagent wants to run a mutating tool (write a file, run a command) and needs
     /// a human's go-ahead. Reply with `AgentCommand::ApprovalResponse` carrying this
     /// `id`. `action` is a human-readable description of exactly what will happen.
@@ -262,6 +271,10 @@ mod tests {
             r#"{"ReadFile":{"path":"src/main.rs"}}"#,
         );
         pin(
+            &AgentCommand::ListNeighbors { node_id: "plan-0".into() },
+            r#"{"ListNeighbors":{"node_id":"plan-0"}}"#,
+        );
+        pin(
             &AgentEvent::FileContent {
                 path: "src/main.rs".into(),
                 content: "fn main() {}".into(),
@@ -305,6 +318,18 @@ mod tests {
                 }],
             },
             r#"{"PlanGraph":{"plan_id":"plan-0","nodes":[{"id":"plan-0:task:0","label":"write add()","kind":"task","edges_out":["plan-0"]}]}}"#,
+        );
+        pin(
+            &AgentEvent::Neighbors {
+                node_id: "plan-0".into(),
+                nodes: vec![GraphNodeView {
+                    id: "plan-0:task:0".into(),
+                    label: "write add()".into(),
+                    kind: "task".into(),
+                    edges_out: vec!["plan-0".into()],
+                }],
+            },
+            r#"{"Neighbors":{"node_id":"plan-0","nodes":[{"id":"plan-0:task:0","label":"write add()","kind":"task","edges_out":["plan-0"]}]}}"#,
         );
     }
 }

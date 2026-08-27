@@ -163,9 +163,10 @@ pub fn App() -> impl IntoView {
 
     // egui/WebGL graph canvas.
     let canvas_ref = NodeRef::<html::Canvas>::new();
+    let canvas_tx = cmd_tx.clone();
     Effect::new(move |_| {
         if let Some(canvas) = canvas_ref.get() {
-            egui_panel::start(canvas, shared.clone());
+            egui_panel::start(canvas, shared.clone(), canvas_tx.clone());
         }
     });
 

@@ -511,6 +511,28 @@ impl Daemon {
                 };
                 let _ = events.send(ev).await;
             }
+            AgentCommand::ListNeighbors { node_id } => {
+                // Read-only graph expansion. No store (base build / open failed) ->
+                // empty neighborhood, not an error, so the explorer just shows no
+                // expansion. neighbors() is a blocking LMDB read -> spawn_blocking.
+                let ev = match &session.graph {
+                    Some(store) => {
+                        let store = store.clone();
+                        let id = node_id.clone();
+                        match tokio::task::spawn_blocking(move || store.neighbors(&id)).await {
+                            Ok(Ok(nodes)) => AgentEvent::Neighbors { node_id, nodes },
+                            Ok(Err(e)) => AgentEvent::Error {
+                                message: format!("neighbors {node_id}: {e}"),
+                            },
+                            Err(e) => AgentEvent::Error {
+                                message: format!("neighbors {node_id}: {e}"),
+                            },
+                        }
+                    }
+                    None => AgentEvent::Neighbors { node_id, nodes: Vec::new() },
+                };
+                let _ = events.send(ev).await;
+            }
             AgentCommand::TerminalInput { session: term, data } => {
                 // Write keystrokes to the (per-tenant) pty; its output streams back as
                 // TerminalOutput from the session's reader thread. `term` is the
