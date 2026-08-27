@@ -43,6 +43,7 @@ cargo build                                  # base workspace (no HelixDB compil
 cargo test                                   # unit tests
 cargo test -p corrode-daemon <name>          # single test
 cargo run -p corrode-daemon                  # serve the daemon ws at ws://127.0.0.1:7878/agent
+cargo run -p corrode-daemon -- doctor        # host readiness checks (hipfire, sandbox, auth, repo, submodules); exit 1 on any fatal
 cargo build -p corrode-daemon --features helix   # HEAVY: compiles vendored HelixDB (mimalloc/LMDB/HelixQL). Enables the real in-process store.
 cargo build -p corrode-daemon --features needle  # compiles the Needle tool-call shim (CPU/candle). Enables reliable tool-calling for small models.
 cargo build -p corrode-daemon --features docling # docling.rs doc ingestion (pure-Rust converters + PDF text layer; no pdfium/ONNX). Enables DocIngest.

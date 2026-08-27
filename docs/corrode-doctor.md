@@ -1,6 +1,10 @@
 # `corrode doctor` — host readiness checks
 
-A spec for a future `corrode doctor` subcommand: it inspects the host and reports
+**Implemented** as `corrode-daemon doctor` (see `doctor.rs`): runs the runtime
+checks below and exits non-zero on any fatal. This doc is the spec + the fuller
+catalog (build-time checks a future version can add).
+
+The subcommand inspects the host and reports
 what's missing for building and running Corrode, each check with a detection
 command and a remediation. Ordered by concern. A check is **fatal** (Corrode
 won't run / won't build in that mode), **degraded** (works but a capability is

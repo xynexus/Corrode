@@ -12,6 +12,7 @@
 mod approval;
 mod daemon;
 mod dialect;
+mod doctor;
 #[cfg(feature = "fuse")]
 mod fuse;
 mod graph;
@@ -39,6 +40,12 @@ use vfs::PassthroughVfs;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `corrode-daemon doctor` — host readiness checks, then exit (no server).
+    if std::env::args().nth(1).as_deref() == Some("doctor") {
+        let ok = doctor::run().await;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     let base_url =
         std::env::var("HIPFIRE_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
     let api_key = std::env::var("HIPFIRE_API_KEY").ok();
