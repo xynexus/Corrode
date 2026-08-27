@@ -6,8 +6,10 @@
 //!
 //! portable-pty is blocking, so a per-session **reader thread** pumps pty output
 //! into the async event channel via `blocking_send` (safe: it's a plain OS thread,
-//! not a tokio worker). The thread owns the child, so the shell is killed when the
-//! client disconnects (the send fails) or the shell exits (EOF).
+//! not a tokio worker). Sessions are shared, tmux-style: every `ensure` touch
+//! re-points the session's output at the touching connection, so a page reload
+//! (new ws, same session id) adopts the running shell instead of orphaning it.
+//! Output with no listener is dropped; the shell dies only on EOF (exit).
 
 use corrode_core::AgentEvent;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -19,6 +21,12 @@ use tokio::sync::mpsc::Sender;
 struct Session {
     master: Box<dyn MasterPty + Send>, // for resize
     writer: Box<dyn Write + Send>,     // for input
+    /// Where this session's output currently goes: the last connection to touch
+    /// it. Re-pointed on every `ensure`, so a reloaded page adopts the shell.
+    events: Sender<AgentEvent>,
+    /// Current pty geometry, so a same-size resize (a reloaded page re-attaching)
+    /// can be turned into a redraw nudge instead of a silent no-op.
+    size: PtySize,
 }
 
 type SessionMap = Arc<Mutex<HashMap<String, Session>>>;
@@ -39,11 +47,17 @@ impl Terminals {
         }
     }
 
-    /// Spawn a pty+shell for `id` if absent, streaming its output to `events`.
-    fn ensure(&self, id: &str, events: &Sender<AgentEvent>, size: PtySize) -> anyhow::Result<()> {
+    /// Spawn a pty+shell for `id` if absent; either way, point the session's
+    /// output at `events` (the calling connection adopts the session). Returns
+    /// true when an existing session changed hands to a *different* connection.
+    fn ensure(&self, id: &str, events: &Sender<AgentEvent>, size: PtySize) -> anyhow::Result<bool> {
         let mut map = self.sessions.lock().unwrap();
-        if map.contains_key(id) {
-            return Ok(());
+        if let Some(s) = map.get_mut(id) {
+            // ponytail: latest toucher wins — two live tabs on one session id
+            // flap output between them; per-tab session ids if that ever matters.
+            let adopted = !s.events.same_channel(events);
+            s.events = events.clone();
+            return Ok(adopted);
         }
         let pair = native_pty_system().openpty(size)?;
         // Interactive, NON-login shell: sources ~/.bashrc but not /etc/profile.d,
@@ -60,7 +74,6 @@ impl Terminals {
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
 
-        let events = events.clone();
         let session_id = id.to_string(); // moved into the reader thread
         let sessions = self.sessions.clone();
         std::thread::spawn(move || {
@@ -70,24 +83,34 @@ impl Terminals {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break, // EOF or error
                     Ok(n) => {
+                        // Send to the session's *current* owner (clone under the
+                        // lock, send outside it — blocking_send can park). A dead
+                        // owner just drops the chunk; the shell lives on and the
+                        // next client to touch the session adopts it.
+                        let tx = sessions
+                            .lock()
+                            .unwrap()
+                            .get(&session_id)
+                            .map(|s: &Session| s.events.clone());
+                        let Some(tx) = tx else { break };
                         let ev = AgentEvent::TerminalOutput {
                             session: session_id.clone(),
                             data: buf[..n].to_vec(),
                         };
-                        if events.blocking_send(ev).is_err() {
-                            break; // client gone
-                        }
+                        let _ = tx.blocking_send(ev);
                     }
                 }
             }
             let _ = child.kill();
-            // Evict the now-dead session so a reload/reconnect spawns a fresh pty
-            // (the disconnect happens well before the reconnect, so no id race).
+            let _ = child.wait(); // reap — kill alone leaves a zombie
             sessions.lock().unwrap().remove(&session_id);
         });
 
-        map.insert(id.to_string(), Session { master: pair.master, writer });
-        Ok(())
+        map.insert(
+            id.to_string(),
+            Session { master: pair.master, writer, events: events.clone(), size },
+        );
+        Ok(false)
     }
 
     /// Write keystrokes to the session's pty (opening it at a default size if new).
@@ -115,10 +138,19 @@ impl Terminals {
             pixel_width: 0,
             pixel_height: 0,
         };
-        self.ensure(id, events, size)?;
-        let map = self.sessions.lock().unwrap();
-        if let Some(s) = map.get(id) {
+        let adopted = self.ensure(id, events, size)?;
+        let mut map = self.sessions.lock().unwrap();
+        if let Some(s) = map.get_mut(id) {
             s.master.resize(size)?;
+            // A reload re-attaches at the same size, so no SIGWINCH fires and the
+            // shell never repaints — the new tab would sit blank. Ctrl-L asks
+            // readline (or a TUI) to redraw the screen. ponytail: mid-`cat` the
+            // byte lands in stdin; harmless enough for a dev terminal.
+            if adopted && s.size == size {
+                s.writer.write_all(b"\x0c")?;
+                s.writer.flush()?;
+            }
+            s.size = size;
         }
         Ok(())
     }
@@ -166,6 +198,45 @@ mod tests {
         assert!(
             found,
             "shell should echo the marker from the given cwd; got: {}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    // A second connection (page reload) touching the same session id adopts the
+    // running shell: output flows to the new channel, the shell isn't respawned.
+    #[tokio::test]
+    async fn reconnect_adopts_the_running_session() {
+        let (tx1, mut rx1) = tokio::sync::mpsc::channel(64);
+        let terms = Terminals::new(env!("CARGO_MANIFEST_DIR").into());
+        terms.resize("r", 80, 24, &tx1).unwrap();
+        // wait for the first prompt so the shell is up
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx1.recv())
+            .await
+            .expect("shell should print a prompt")
+            .expect("channel open");
+
+        drop(rx1); // "tab closed"
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(64);
+        terms.input("r", b"echo adopted-ok\n", &tx2).unwrap(); // new tab touches it
+
+        let mut seen = Vec::new();
+        let found = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(ev) = rx2.recv().await {
+                if let AgentEvent::TerminalOutput { data, .. } = ev {
+                    seen.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&seen).contains("adopted-ok") {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            found,
+            "new channel should receive the adopted shell's output; got: {}",
             String::from_utf8_lossy(&seen)
         );
     }
