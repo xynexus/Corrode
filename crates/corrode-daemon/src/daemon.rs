@@ -318,8 +318,16 @@ impl Daemon {
                 // re-executing, and each launching task's tail carries a digest of
                 // what the swarm already did.
                 let turn_seen = Arc::new(std::sync::Mutex::new(SeenCalls::default()));
+                // Cap concurrent generations: a wide plan otherwise fires every ready
+                // task's request at once, and a memory-tight or fragile backend can
+                // CRASH (not just shed) under that burst — observed with a DeltaNet
+                // model on a 30 GiB APU. Default is effectively unlimited (hipfire's
+                // admission control stays the real bound); set CORRODE_MAX_CONCURRENCY=N
+                // to serialize on a constrained host.
+                let gen_sem = Arc::new(tokio::sync::Semaphore::new(max_concurrency()));
                 let execute = |task: plan_graph::PlanTask| {
                     let client = self.swarm.client();
+                    let gen_sem = Arc::clone(&gen_sem);
                     let model = self
                         .roles
                         .model_for(task.role)
@@ -347,6 +355,9 @@ impl Daemon {
                         None => task.prompt.clone(),
                     };
                     async move {
+                        // Hold a generation permit for the whole task (released on drop
+                        // when the task finishes), bounding how many hit the backend at once.
+                        let _gen_permit = gen_sem.acquire_owned().await.ok();
                         // `artifacts` collects the files a tool-loop task wrote (its code
                         // nodes in provenance). Coder tasks fan out K read-only proposal
                         // attempts first when CORRODE_FANOUT > 1; everything else runs
@@ -962,6 +973,18 @@ fn fanout_k() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .map(|k| k.clamp(1, 8))
         .unwrap_or(1)
+}
+
+/// `CORRODE_MAX_CONCURRENCY`: cap on subagent generations in flight at once. Default
+/// 1024 (effectively unlimited — the swarm is bounded by MAX_PLAN_TASKS and hipfire's
+/// own admission control). Set to a small N to serialize on a backend that crashes
+/// under a concurrent burst. A parsed 0 is treated as 1 (never a zero-permit deadlock).
+fn max_concurrency() -> usize {
+    std::env::var("CORRODE_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(1024)
 }
 
 /// `CORRODE_PLAN_REVIEW`: the plan-level review pass, on unless set to `0`/`false`.
