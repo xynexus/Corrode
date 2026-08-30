@@ -318,6 +318,10 @@ impl Daemon {
                 // re-executing, and each launching task's tail carries a digest of
                 // what the swarm already did.
                 let turn_seen = Arc::new(std::sync::Mutex::new(SeenCalls::default()));
+                // The turn declares its ceiling before it starts. hipfire's bands
+                // schedule the GPU; nothing else bounds how much work the swarm
+                // decides to create for itself.
+                let deadline = turn_budget().map(|d| std::time::Instant::now() + d);
                 // Cap concurrent generations: a wide plan otherwise fires every ready
                 // task's request at once, and a memory-tight or fragile backend can
                 // CRASH (not just shed) under that burst — observed with a DeltaNet
@@ -384,6 +388,7 @@ impl Daemon {
                                 id,
                                 &mut artifacts,
                                 &seen,
+                                deadline,
                             )
                             .await
                         } else {
@@ -403,6 +408,7 @@ impl Daemon {
                                 &mut artifacts,
                                 false,
                                 &seen,
+                                deadline,
                             )
                             .await
                         };
@@ -425,10 +431,6 @@ impl Daemon {
                         }
                     }
                 };
-                // The turn declares its ceiling before it starts. hipfire's bands
-                // schedule the GPU; nothing else bounds how much work the swarm
-                // decides to create for itself.
-                let deadline = turn_budget().map(|d| std::time::Instant::now() + d);
                 let mut budget = plan_graph::run_reactive_until(&mut graph, &execute, deadline).await;
 
                 // One plan-level review pass over the settled work: the review role
@@ -1211,6 +1213,7 @@ async fn run_native_tool_loop(
     written: &mut Vec<String>,
     read_only: bool,
     seen: &std::sync::Mutex<SeenCalls>,
+    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<String> {
     // Per-task values overlay: params with a closed, known set (read/list paths,
     // skill targets) carry a JSON-Schema `enum`, which hipfire's grammar turns into
@@ -1228,6 +1231,18 @@ async fn run_native_tool_loop(
     let mut scratchpad = String::new();
     let mut last = String::new();
     for _ in 0..MAX_TOOL_STEPS {
+        // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
+        // tool call that is half-applied is worse than a turn that runs long, and
+        // there is no way to un-run one. Reported, not silent: a truncated answer
+        // that looks complete is how a budget turns into a wrong result.
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            let _ = events
+                .send(AgentEvent::Error {
+                    message: format!("task {id}: stopped at a tool-step boundary (turn budget)"),
+                })
+                .await;
+            return Ok(format!("{last}\n[stopped: turn budget reached]"));
+        }
         let prompt = planner::native_tool_prompt(prefix, role, task, &scratchpad);
         let (text, _reasoning) = client
             .respond_full(model, &prompt, band, toolbox.owner_token(), Some(&tools), Some(&effort))
@@ -1280,6 +1295,7 @@ async fn run_tool_loop(
     written: &mut Vec<String>,
     read_only: bool,
     seen: &std::sync::Mutex<SeenCalls>,
+    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<String> {
     // Render the exec toolset in the tool-call model's dialect once; parse each reply
     // with the same dialect (which maps its tool names back to canonical).
@@ -1288,6 +1304,18 @@ async fn run_tool_loop(
     let mut scratchpad = String::new();
     let mut last = String::new();
     for _ in 0..MAX_TOOL_STEPS {
+        // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
+        // tool call that is half-applied is worse than a turn that runs long, and
+        // there is no way to un-run one. Reported, not silent: a truncated answer
+        // that looks complete is how a budget turns into a wrong result.
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            let _ = events
+                .send(AgentEvent::Error {
+                    message: format!("task {id}: stopped at a tool-step boundary (turn budget)"),
+                })
+                .await;
+            return Ok(format!("{last}\n[stopped: turn budget reached]"));
+        }
         let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
         let text = client.respond(model, &prompt, band, toolbox.owner_token()).await?;
         let _ = events
@@ -1353,18 +1381,19 @@ async fn run_task(
     written: &mut Vec<String>,
     read_only: bool,
     seen: &std::sync::Mutex<SeenCalls>,
+    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<String> {
     let role_dialect = dialects.resolve(model);
     if role_dialect.emits_own_calls() {
         run_native_tool_loop(
             client, model, band, role_dialect, toolbox, approvals, prefix, role, task, events,
-            id, written, read_only, seen,
+            id, written, read_only, seen, deadline,
         )
         .await
     } else if let (true, Some(caller)) = (roles::is_small_model(model), tool_caller) {
         run_tool_loop(
             client, model, band, caller, toolbox, approvals, dialects, prefix, role, task,
-            events, id, written, read_only, seen,
+            events, id, written, read_only, seen, deadline,
         )
         .await
     } else {
@@ -1423,6 +1452,7 @@ async fn run_fanout(
     id: u64,
     written: &mut Vec<String>,
     seen: &std::sync::Mutex<SeenCalls>,
+    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<String> {
     let attempts = (0..k).map(|i| {
         let attempt_task = planner::fanout_attempt_task(task, i + 1, k);
@@ -1437,6 +1467,7 @@ async fn run_fanout(
             let fut = run_task(
                 client, model, attempt_band, dialects, tool_caller, toolbox, approvals,
                 prefix, role, &attempt_task, events, id, &mut sink, true, &attempt_seen,
+                deadline,
             );
             if i == 0 {
                 fut.await
@@ -1499,7 +1530,7 @@ async fn run_fanout(
     }
     run_task(
         client, model, band, dialects, tool_caller, toolbox, approvals, prefix, role,
-        &steered, events, id, written, false, seen,
+        &steered, events, id, written, false, seen, deadline,
     )
     .await
 }
@@ -1575,6 +1606,80 @@ mod tests {
             std::env::temp_dir(),
             Arc::new(Dialects::default()),
         )
+    }
+
+    /// A tool caller that panics if used — the deadline check must return before any
+    /// model or tool call happens, so reaching it is the failure.
+    struct NeverCalled;
+    impl crate::toolcall::ToolCaller for NeverCalled {
+        fn generate(&self, _q: &str, _t: &str) -> anyhow::Result<String> {
+            panic!("tool caller invoked past the deadline");
+        }
+        fn model_id(&self) -> &str {
+            "never"
+        }
+    }
+
+    /// Cooperative cancellation: an already-expired deadline stops the tool loop at the
+    /// top of its first step, before touching the client or the tool caller. The client
+    /// here points at a closed port and the caller panics, so anything other than an
+    /// immediate return fails loudly rather than hanging.
+    ///
+    /// Live runs could not reach this branch reliably — it needs a task to enter step
+    /// two while past the deadline, and the model kept answering in one turn — so the
+    /// guarantee is pinned here instead.
+    #[tokio::test]
+    async fn an_expired_deadline_stops_the_tool_loop_before_any_call() {
+        let dir = std::env::temp_dir().join(format!("corrode-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = Client::new("http://127.0.0.1:1", None);
+        let dialects = Dialects::default();
+        let approvals = ApprovalGate::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+
+        let out = run_tool_loop(
+            &client,
+            "test-model",
+            Priority::Default,
+            Arc::new(NeverCalled),
+            toolbox,
+            &approvals,
+            &dialects,
+            "prefix",
+            Role::Coder,
+            "task",
+            &tx,
+            7,
+            &mut written,
+            false,
+            &seen,
+            Some(expired),
+        )
+        .await
+        .expect("returns rather than erroring");
+
+        assert!(out.contains("stopped: turn budget reached"), "got: {out}");
+        // Cutting a task short is reported, not silent: a truncated answer that looks
+        // complete is how a budget turns into a wrong result.
+        let ev = rx.try_recv().expect("an event was emitted");
+        match ev {
+            AgentEvent::Error { message } => {
+                assert!(message.contains("task 7"), "{message}");
+                assert!(message.contains("tool-step boundary"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(written.is_empty(), "nothing was executed");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // Multi-tenancy keying: a (user, repo) session is created once and reused across
