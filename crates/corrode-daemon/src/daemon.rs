@@ -1970,6 +1970,7 @@ mod tests {
             embed,
             Some(Arc::new(caller)),
             repo.clone(),
+            Project::load(&repo),
             // load() so CORRODE_TOOL_DIALECTS can put a model on its native dialect
             Arc::new(Dialects::load()),
         ));
