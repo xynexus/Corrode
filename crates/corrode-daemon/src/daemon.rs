@@ -12,6 +12,7 @@ use crate::dialect::Dialects;
 use crate::graph::GraphStore;
 use crate::hipfire::Client;
 use crate::plan_graph;
+use crate::project::Project;
 use crate::planner;
 use crate::roles::{self, Role, RoleModels};
 use crate::skills::SkillContext;
@@ -48,6 +49,9 @@ pub struct Daemon {
     approvals: Arc<ApprovalGate>,
     /// Repo root — the working directory for `run_command` in the tool loop.
     repo_root: PathBuf,
+    /// The repository under work: its name (for context + provenance namespacing) and
+    /// the policy for which global skills it admits.
+    project: Project,
     /// Monotonic id source for plan (provenance root) nodes, one per Prompt turn.
     next_plan_id: std::sync::atomic::AtomicU64,
     /// Skill name -> skill dir, for `run_skill_script` in the tool loop. Derived from
@@ -66,6 +70,7 @@ impl Daemon {
         skills: SkillContext,
         tool_caller: Option<Arc<dyn ToolCaller>>,
         repo_root: PathBuf,
+        project: Project,
         dialects: Arc<Dialects>,
     ) -> Self {
         let skill_scripts = Arc::new(skills.script_dirs());
@@ -79,6 +84,7 @@ impl Daemon {
             tool_caller,
             approvals: Arc::new(ApprovalGate::default()),
             repo_root,
+            project,
             next_plan_id: std::sync::atomic::AtomicU64::new(0),
             skill_scripts,
             dialects,
@@ -113,11 +119,14 @@ impl Daemon {
             AgentCommand::Prompt { text, priority } => {
                 // The plan id exists before planning so TurnComplete is unconditional:
                 // clients wait on it as the turn's terminal signal on every exit path.
-                let plan_id = format!(
+                // Namespaced by project: a bare counter makes two repositories sharing
+                // one graph store both write `plan-0`, with no way to tell their
+                // lineage apart.
+                let plan_id = self.project.scope(&format!(
                     "plan-{}",
                     self.next_plan_id
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                );
+                ));
                 let (subtasks, prefix) = match self.plan(&text, priority).await {
                     Ok(planned) => planned,
                     Err(e) => {
@@ -419,9 +428,14 @@ impl Daemon {
     /// (hipfire embeddings/rerank picking which nodes) — but the KV-sharing shape
     /// is already right: identical bytes across the whole swarm, task in the tail.
     async fn context_prefix(&self, task: &str) -> String {
-        let mut s = String::from(
-            "You are a subagent in the Corrode coding-agent swarm working on a shared \
-repository.\n",
+        // Name the repository. Without this the prefix said only "a shared repository",
+        // leaving the skill manifest as the strongest identity signal in the prompt —
+        // which is how a C++ project got explained as if it were hipfire.
+        let mut s = format!(
+            "You are a subagent in the Corrode coding-agent swarm working on the \
+`{}` repository at {}.\n",
+            self.project.name,
+            self.project.root.display(),
         );
         // Project rules (AGENTS.md) + skills relevant to this task. Byte-identical
         // across the turn's subagents (same task), so they share the KV prefill.
@@ -443,7 +457,15 @@ repository.\n",
         match self.vfs.list("").await {
             Ok(entries) => {
                 for e in entries {
-                    s.push_str(&format!("  {} ({} bytes)\n", e.path, e.bytes));
+                    // Mark directories: `bytes` is 0 for a dir (vfs.rs), and an
+                    // empty file is 0 too, so size alone reads as "repo is empty"
+                    // — which is exactly what a subagent concluded on a repo whose
+                    // sources all live one level down.
+                    if e.is_dir {
+                        s.push_str(&format!("  {}/ (dir)\n", e.path));
+                    } else {
+                        s.push_str(&format!("  {} ({} bytes)\n", e.path, e.bytes));
+                    }
                 }
             }
             Err(_) => s.push_str("  (listing unavailable)\n"),
@@ -1005,6 +1027,7 @@ async fn emit_followups(
 mod tests {
     use super::*;
     use crate::hipfire::Client;
+    use crate::project::GlobalSkills;
     use crate::vfs::PassthroughVfs;
 
     fn test_daemon() -> Daemon {
@@ -1016,6 +1039,7 @@ mod tests {
             SkillContext::default(),
             None,
             std::env::temp_dir(),
+            Project::load(&std::env::temp_dir()),
             Arc::new(Dialects::default()),
         )
     }
@@ -1042,7 +1066,7 @@ mod tests {
             return;
         };
         let client = Client::new("http://127.0.0.1:1", None);
-        let skills = SkillContext::build(&repo, &client, None).await;
+        let skills = SkillContext::build(&repo, &client, None, &GlobalSkills::default()).await;
         let section = skills
             .prefix_section("run the tests", &client, TOP_K_SKILLS)
             .await;
@@ -1319,7 +1343,7 @@ mod tests {
             return;
         };
         let client = Client::new("http://127.0.0.1:1", None);
-        let skills = SkillContext::build(&repo, &client, None).await.script_dirs();
+        let skills = SkillContext::build(&repo, &client, None, &GlobalSkills::default()).await.script_dirs();
         assert!(skills.contains_key("run-tests"), "got: {skills:?}");
         let toolbox = ToolBox::new(
             Arc::new(PassthroughVfs::new(&repo)),
@@ -1382,7 +1406,7 @@ mod tests {
         eprintln!("model: {model} (small: {})", roles::is_small_model(&model));
 
         let embed = roles::default_embedding_model(&models).map(str::to_string);
-        let skills = SkillContext::build(&repo, &client, embed).await;
+        let skills = SkillContext::build(&repo, &client, embed, &GlobalSkills::default()).await;
         let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
             .expect("load Needle")
             .expect("Needle assets present");

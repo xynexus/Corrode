@@ -17,6 +17,7 @@ mod fuse;
 mod graph;
 mod hipfire;
 mod plan_graph;
+mod project;
 mod planner;
 mod roles;
 mod server;
@@ -73,8 +74,23 @@ async fn main() -> anyhow::Result<()> {
     // project AGENTS.md, then embed skill descriptions for relevance-ranked selection
     // (if hipfire serves an embedding model). Falls back to the full manifest.
     let embed_model = roles::default_embedding_model(&models).map(str::to_string);
-    let skills =
-        skills::SkillContext::build(std::path::Path::new(&repo_root), &client, embed_model).await;
+    let project = project::Project::load(std::path::Path::new(&repo_root));
+    let skills = skills::SkillContext::build(
+        std::path::Path::new(&repo_root),
+        &client,
+        embed_model,
+        &project.global_skills,
+    )
+    .await;
+    eprintln!(
+        "project: {} ({})",
+        project.name,
+        if project.global_skills.any() {
+            "admits global skills"
+        } else {
+            "project skills only"
+        }
+    );
     eprintln!(
         "skills discovered: {} (ranked retrieval: {})",
         skills.count(),
@@ -93,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
         skills,
         tool_caller,
         std::path::PathBuf::from(&repo_root),
+        project,
         dialects,
     );
 
