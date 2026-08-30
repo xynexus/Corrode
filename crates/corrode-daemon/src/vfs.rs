@@ -24,11 +24,10 @@ pub trait Vfs: Send + Sync {
     /// Attributes for a single path — what FUSE `getattr`/`lookup` needs, without
     /// listing (and scanning) the whole parent directory per call.
     async fn stat(&self, path: &str) -> anyhow::Result<FileNodeView>;
-    // ponytail: read/write have no loop caller yet; wired with ReadFile/WriteFile
-    // commands when the explorer's file open/edit lands. Covered by the vfs test.
-    /// Full contents of a file path.
-    #[allow(dead_code)]
+    /// Full contents of a file path. Used by the context prefix's README digest.
     async fn read(&self, path: &str) -> anyhow::Result<Vec<u8>>;
+    // ponytail: `write` has no loop caller yet; wired with the WriteFile command when
+    // the explorer's file open/edit lands. Covered by the vfs test.
     /// Write a file path (the edit/"absorb" direction).
     #[allow(dead_code)]
     async fn write(&self, path: &str, contents: &[u8]) -> anyhow::Result<()>;

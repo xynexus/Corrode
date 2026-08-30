@@ -30,6 +30,15 @@ use tokio::sync::mpsc;
 /// How many relevance-ranked skills to surface in the shared prefix per turn.
 const TOP_K_SKILLS: usize = 8;
 
+/// Cap on the README digest folded into the shared prefix. Generous on purpose: this
+/// is prefix content, prefilled once per model and reused across the turn's fan-out
+/// and every later turn on the same project.
+const README_CAP: usize = 4096;
+/// Entries listed per directory in the second level of the repo tree.
+const TREE_BREADTH: usize = 24;
+/// Directories never descended into — noise that would crowd out real source.
+const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".venv", "dist", "build"];
+
 pub struct Daemon {
     swarm: Swarm,
     roles: RoleModels,
@@ -453,24 +462,90 @@ impl Daemon {
             s.push('\n');
             s.push_str(&manifest);
         }
-        s.push_str("\nRepository root:\n");
-        match self.vfs.list("").await {
-            Ok(entries) => {
-                for e in entries {
-                    // Mark directories: `bytes` is 0 for a dir (vfs.rs), and an
-                    // empty file is 0 too, so size alone reads as "repo is empty"
-                    // — which is exactly what a subagent concluded on a repo whose
-                    // sources all live one level down.
-                    if e.is_dir {
-                        s.push_str(&format!("  {}/ (dir)\n", e.path));
-                    } else {
-                        s.push_str(&format!("  {} ({} bytes)\n", e.path, e.bytes));
-                    }
+        // The README is the canonical human-written answer to "what is this
+        // repository". Omitting it is why the swarm, told only a list of filenames,
+        // described a lock-free threading library as an image-stitching tool. It is
+        // project-stable, so it rides the shared prefix and is prefilled once.
+        if let Some(readme) = self.readme_digest().await {
+            s.push_str(&readme);
+        }
+        s.push_str("\nRepository tree:\n");
+        s.push_str(&self.repo_tree().await);
+        s
+    }
+
+    /// `README.md` (or a close variant), truncated to [`README_CAP`] on a line
+    /// boundary. `None` when the repo has none.
+    async fn readme_digest(&self) -> Option<String> {
+        for name in ["README.md", "README", "README.txt", "readme.md"] {
+            let Ok(bytes) = self.vfs.read(name).await else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let end = crate::tools::floor_char_boundary(trimmed, README_CAP);
+            let body = &trimmed[..end];
+            // Cut at the last newline so a truncated digest never ends mid-sentence.
+            let body = if end < trimmed.len() {
+                body.rfind('\n').map(|i| &body[..i]).unwrap_or(body)
+            } else {
+                body
+            };
+            let mut out = format!("\nProject README ({name}):\n");
+            out.push_str(body);
+            out.push('\n');
+            if end < trimmed.len() {
+                out.push_str("  [...truncated; read the file for the rest]\n");
+            }
+            return Some(out);
+        }
+        None
+    }
+
+    /// Root listing plus one level into each directory. A single level showed no
+    /// source files at all for any project that keeps them in a subdirectory, which
+    /// left the model inferring a file list instead of reading one.
+    ///
+    /// ponytail: two levels, breadth-capped, no recursion into the tail — the
+    /// graph-backed VFS is where a real relevance-ranked tree comes from.
+    async fn repo_tree(&self) -> String {
+        let Ok(entries) = self.vfs.list("").await else {
+            return "  (listing unavailable)\n".to_string();
+        };
+        let mut out = String::new();
+        for e in &entries {
+            // Mark directories: `bytes` is 0 for a dir (vfs.rs), and an empty file is
+            // 0 too, so size alone reads as "repo is empty" — which is exactly what a
+            // subagent concluded on a repo whose sources all live one level down.
+            if !e.is_dir {
+                out.push_str(&format!("  {} ({} bytes)\n", e.path, e.bytes));
+                continue;
+            }
+            out.push_str(&format!("  {}/\n", e.path));
+            if SKIP_DIRS.contains(&e.path.as_str()) {
+                continue;
+            }
+            let Ok(children) = self.vfs.list(&e.path).await else {
+                continue;
+            };
+            for c in children.iter().take(TREE_BREADTH) {
+                if c.is_dir {
+                    out.push_str(&format!("    {}/\n", c.path));
+                } else {
+                    out.push_str(&format!("    {} ({} bytes)\n", c.path, c.bytes));
                 }
             }
-            Err(_) => s.push_str("  (listing unavailable)\n"),
+            if children.len() > TREE_BREADTH {
+                out.push_str(&format!(
+                    "    ... {} more\n",
+                    children.len() - TREE_BREADTH
+                ));
+            }
         }
-        s
+        out
     }
 }
 
@@ -1051,6 +1126,74 @@ mod tests {
             Project::load(&std::env::temp_dir()),
             Arc::new(Dialects::default()),
         )
+    }
+
+    /// The prefix must carry the repository's own account of itself and enough tree
+    /// to see source files. A one-level listing showed none at all for a project
+    /// that keeps sources in a subdirectory, and the swarm invented file names
+    /// instead — so both halves are asserted here against a synthetic repo shaped
+    /// like that (`stitch/atom.h`, not `atom.h`).
+    #[tokio::test]
+    async fn prefix_carries_readme_and_a_second_tree_level() {
+        let root = std::env::temp_dir().join(format!("corrode-prefix-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("README.md"), "Widget is a lock-free queue library.").unwrap();
+        std::fs::write(root.join("src/atom.h"), "// atom").unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+
+        let daemon = Daemon::new(
+            Swarm::new(Client::new("http://127.0.0.1:1", None), 1),
+            RoleModels::uniform("test-model"),
+            None,
+            Arc::new(PassthroughVfs::new(&root)),
+            SkillContext::default(),
+            None,
+            root.clone(),
+            Project::load(&root),
+            Arc::new(Dialects::default()),
+        );
+        let prefix = daemon.context_prefix("what is this").await;
+
+        // The repo's own words, not a guess from filenames.
+        assert!(prefix.contains("Project README (README.md)"), "{prefix}");
+        assert!(prefix.contains("lock-free queue library"), "{prefix}");
+        // Second level reached: the source file is one directory down.
+        assert!(prefix.contains("src/atom.h"), "{prefix}");
+        // Directories are distinguishable from empty files.
+        assert!(prefix.contains("src/\n"), "{prefix}");
+        // Noise is listed but never descended into.
+        assert!(prefix.contains(".git/"), "{prefix}");
+        assert!(!prefix.contains("HEAD"), "{prefix}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A repo with no README still produces a prefix, and says nothing about one.
+    #[tokio::test]
+    async fn prefix_without_a_readme_omits_the_section() {
+        let root = std::env::temp_dir().join(format!("corrode-prefix-bare-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+
+        let daemon = Daemon::new(
+            Swarm::new(Client::new("http://127.0.0.1:1", None), 1),
+            RoleModels::uniform("test-model"),
+            None,
+            Arc::new(PassthroughVfs::new(&root)),
+            SkillContext::default(),
+            None,
+            root.clone(),
+            Project::load(&root),
+            Arc::new(Dialects::default()),
+        );
+        let prefix = daemon.context_prefix("what is this").await;
+        assert!(!prefix.contains("Project README"), "{prefix}");
+        assert!(prefix.contains("Cargo.toml"), "{prefix}");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The `fixtures/demo-repo` submodule (`xynexus/corrode-demo`) — the deterministic
