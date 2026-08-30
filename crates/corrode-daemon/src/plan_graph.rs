@@ -318,18 +318,49 @@ impl PlanGraph {
 /// ready — until nothing is ready and nothing is in flight. `execute` runs a task
 /// (in the daemon: fan it to the swarm and stream its output); it bounds real
 /// concurrency itself (the swarm's `inflight` semaphore).
-pub async fn run_reactive<E, Fut>(graph: &mut PlanGraph, execute: E)
+/// Unbudgeted drive. Only the tests want this now — the daemon always passes a
+/// deadline (usually `None`, but it decides), so this is a test convenience rather
+/// than a second production entry point.
+#[cfg(test)]
+pub async fn run_reactive<E, Fut>(graph: &mut PlanGraph, execute: E) -> RunSummary
 where
     E: Fn(PlanTask) -> Fut,
     Fut: Future<Output = Outcome>,
 {
+    run_reactive_until(graph, execute, None).await
+}
+
+/// [`run_reactive`] with a wall-clock ceiling for the turn.
+///
+/// Past the deadline no NEW task is launched and no emission is folded in; work already
+/// in flight is awaited rather than killed, because a half-finished mutating tool call
+/// is worse than a slow turn. Shedding stops the graph growing — an agent that emits a
+/// follow-up on every turn otherwise has no natural end, and one observed turn ran 494s
+/// with nothing able to say "that is enough".
+///
+/// ponytail: shed-on-deadline, not cancellation. Killing a running branch needs an abort
+/// path through the tool loop and the approval gate; this bounds growth, which is the
+/// half that can be done without one.
+pub async fn run_reactive_until<E, Fut>(
+    graph: &mut PlanGraph,
+    execute: E,
+    deadline: Option<std::time::Instant>,
+) -> RunSummary
+where
+    E: Fn(PlanTask) -> Fut,
+    Fut: Future<Output = Outcome>,
+{
+    let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
+    let mut summary = RunSummary::default();
     let mut inflight = FuturesUnordered::new();
     loop {
-        for task in graph.ready() {
-            let id = task.id;
-            graph.set_status(id, Status::Running);
-            let fut = execute(task); // borrows `execute`; only the future is moved
-            inflight.push(async move { (id, fut.await) });
+        if !expired() {
+            for task in graph.ready() {
+                let id = task.id;
+                graph.set_status(id, Status::Running);
+                let fut = execute(task); // borrows `execute`; only the future is moved
+                inflight.push(async move { (id, fut.await) });
+            }
         }
         let Some((id, outcome)) = inflight.next().await else {
             break; // nothing running and nothing ready -> settled (or all remaining are stuck)
@@ -347,6 +378,10 @@ where
         }
         graph.set_artifacts(id, outcome.artifacts); // code nodes this task produced
         for emit in outcome.emitted {
+            if expired() {
+                summary.shed += 1;
+                continue;
+            }
             if graph.nodes.len() >= MAX_PLAN_TASKS {
                 eprintln!("plan {}: task budget ({MAX_PLAN_TASKS}) reached, dropping emission", graph.plan_id);
                 break;
@@ -356,6 +391,26 @@ where
             graph.set_emitted_by(emitted_id, id); // the emitted task is a contract of `id`
         }
     }
+    // Anything still Pending when the deadline passed was shed, not stuck on a failed
+    // dependency — the caller reports those differently.
+    if expired() {
+        summary.unlaunched = graph
+            .nodes
+            .iter()
+            .filter(|n| n.status == Status::Pending)
+            .count();
+    }
+    summary.expired = expired();
+    summary
+}
+
+/// What a reactive drive did about its budget. `shed` counts emissions dropped past the
+/// deadline; `unlaunched` counts tasks left Pending because of it.
+#[derive(Debug, Default, PartialEq)]
+pub struct RunSummary {
+    pub expired: bool,
+    pub shed: usize,
+    pub unlaunched: usize,
 }
 
 /// Extract the single follow-up instruction an agent proposed, from a `NEXT:` line
@@ -683,4 +738,73 @@ mod tests {
         assert!(has_edge("plan-7:task:1", "emitted_from", "plan-7:task:0"));
         assert!(has_edge("plan-7:code:src/math.rs", "produced_by", "plan-7:task:0"));
     }
+    /// A deadline stops the graph GROWING without killing work already in flight: an
+    /// agent that emits a follow-up every turn otherwise has no natural end.
+    #[tokio::test]
+    async fn an_expired_budget_sheds_emissions_and_leaves_inflight_work_alone() {
+        let mut g = PlanGraph::new("plan-budget");
+        g.add(Role::Coder, "first", vec![]);
+
+        // Already past: the one ready task never launches.
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let summary = run_reactive_until(&mut g, |_t: PlanTask| async move { unreachable!() }, Some(past)).await;
+        assert!(summary.expired);
+        assert_eq!(summary.unlaunched, 1, "the pending task was shed, not run");
+
+        // A live deadline that expires DURING the run: the task completes, but the
+        // follow-up it emits is dropped rather than folded in.
+        let mut g2 = PlanGraph::new("plan-budget-2");
+        g2.add(Role::Coder, "emits", vec![]);
+        let soon = std::time::Instant::now() + std::time::Duration::from_millis(60);
+        let summary2 = run_reactive_until(
+            &mut g2,
+            |task: PlanTask| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                Outcome {
+                    output: Ok(format!("did {}", task.prompt)),
+                    emitted: vec![Emit {
+                        role: Role::Coder,
+                        prompt: "follow-up".to_string(),
+                        after_emitter: true,
+                    }],
+                    artifacts: Vec::new(),
+                }
+            },
+            Some(soon),
+        )
+        .await;
+        assert!(summary2.expired);
+        assert_eq!(summary2.shed, 1, "the emission was dropped");
+        assert_eq!(g2.nodes.len(), 1, "graph did not grow past the deadline");
+        // The in-flight task was awaited, not killed.
+        assert_eq!(g2.nodes[0].status, Status::Done);
+    }
+
+    /// No budget set -> unchanged behaviour, emissions included.
+    #[tokio::test]
+    async fn no_deadline_means_no_shedding() {
+        let mut g = PlanGraph::new("plan-nobudget");
+        g.add(Role::Coder, "emits", vec![]);
+        let summary = run_reactive_until(
+            &mut g,
+            |task: PlanTask| async move {
+                let emitted = if task.prompt == "emits" {
+                    vec![Emit {
+                        role: Role::Coder,
+                        prompt: "follow-up".to_string(),
+                        after_emitter: true,
+                    }]
+                } else {
+                    vec![]
+                };
+                Outcome { output: Ok("ok".into()), emitted, artifacts: Vec::new() }
+            },
+            None,
+        )
+        .await;
+        assert_eq!(summary, RunSummary::default());
+        assert_eq!(g.nodes.len(), 2, "the follow-up was folded in");
+    }
+
+
 }
