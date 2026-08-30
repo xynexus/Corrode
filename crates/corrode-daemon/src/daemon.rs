@@ -13,7 +13,7 @@ use crate::hipfire::Client;
 use crate::plan_graph;
 use crate::project::Project;
 use crate::planner;
-use crate::roles::{self, Role, RoleModels};
+use crate::roles::{Role, RoleModels};
 use crate::session::{RepoResources, Session, SessionKey};
 use crate::skills::SkillContext;
 use crate::swarm::{Swarm, Task};
@@ -1326,9 +1326,18 @@ async fn run_tool_loop(
 /// One full execution of a task: pick the capability path and run it.
 ///  1. the model emits its own tool calls (its dialect says so) — declare tools on
 ///     the request and parse the reply directly.
-///  2. otherwise a small model runs the Needle-mediated loop, which reconstructs a
-///     call from a plain-English line.
-///  3. anything else answers single-shot.
+///  2. otherwise the Needle-mediated loop, which reconstructs a call from a
+///     plain-English line — for ANY model, not just small ones.
+///  3. single-shot only when there is no tool caller at all.
+///
+/// Path 2 was once gated on `roles::is_small_model`, on the theory that a large
+/// model does not need help formatting a call. The consequence was that it got no
+/// tools at all: the most capable model in the roster could not read a file. A 35B
+/// was observed emitting `<tool_call>` blocks into a void, and the swarm answered
+/// repository questions by guessing. Withholding tools from a model whose
+/// capability is unknown is the wrong default — an agent that can read is
+/// recoverable, one that must guess is not — and the gate was a substring match on
+/// the model id anyway (`is_small_model("Gemma-3-27B") == true`).
 /// `read_only` marks a fan-out proposal pass: mutating tool calls become no-op
 /// observations (see [`gate_and_execute`]) without touching the paths themselves.
 #[allow(clippy::too_many_arguments)]
@@ -1356,7 +1365,7 @@ async fn run_task(
             id, written, read_only, seen,
         )
         .await
-    } else if let (true, Some(caller)) = (roles::is_small_model(model), tool_caller) {
+    } else if let Some(caller) = tool_caller {
         run_tool_loop(
             client, model, band, caller, toolbox, approvals, dialects, prefix, role, task,
             events, id, written, read_only, seen,
@@ -1954,9 +1963,8 @@ mod tests {
             .ok()
             .or_else(|| models.first().cloned())
             .expect("hipfire serves at least one model");
-        eprintln!("model: {model} (small: {})", roles::is_small_model(&model));
 
-        let embed = roles::default_embedding_model(&models).map(str::to_string);
+        let embed = crate::roles::default_embedding_model(&models).map(str::to_string);
         let skills = SkillContext::build(&repo, &client, embed.clone(), &GlobalSkills::default()).await;
         let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
             .expect("load Needle")
