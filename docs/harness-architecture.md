@@ -324,27 +324,39 @@ predecessor byte for byte.
 Derived from §2. Each rung is cheap relative to the one after it, and each removes a
 class of confident failure.
 
-1. **Ground the prefix, and layer it.** README digest, a repository tree deeper than
+**Status, 2026-08-30.** Steps 1–4 and 6 are implemented and in review; step 5 is
+deliberately unstarted (its policy questions — network access above all — want a
+decision, not a default); step 7's gating measurement is taken. Marked below.
+
+1. **[shipped]** **Ground the prefix, and layer it.** README digest, a repository tree deeper than
    one level, provenance/authority labels (§3.1) — emitted as ordered layers with
    declared boundaries rather than one string (§3.2). Hours. Prevents every §2
    grounding failure, and the content is amortized across hundreds of turns once the
    prefix cache engages. Be generous with L0–L2; frugal with L4.
-2. **Give capable models tools.** Decouple the tool loop from `is_small_model`
+2. **[shipped]** **Give capable models tools.** Decouple the tool loop from `is_small_model`
    (`daemon.rs`). Hours. A model that can read stops guessing; this dominates any
    amount of static-context tuning.
-3. **Structured observations** from `cargo --message-format=json` (§3.5). A day.
-4. **Telemetry.** Model, context composition, retrieved objects, tool calls, tokens,
+3. **[shipped]** **Structured observations** from `cargo --message-format=json` (§3.5). A day.
+4. **[shipped]** **Telemetry.** Model, context composition, retrieved objects, tool calls, tokens,
    wall-clock, patch, test result, outcome. Nothing after this point can be tuned
    without it, and it makes every later claim falsifiable.
-5. **Sandbox and capability tiers** (§3.7) — before autonomy widens, not after.
-6. **Cancellation and budgets** (§3.6, §5.1).
-7. **The graph.** The gating measurement has been taken (§2): the embedder separates
+5. **[not started — needs a policy decision]** **Sandbox and capability tiers** (§3.7) — before autonomy widens, not after.
+6. **[shipped, partially]** **Cancellation and budgets** (§3.6, §5.1). A turn
+   declares a wall-clock ceiling; past it nothing new launches, emissions are
+   dropped, and a tool loop stops at its next step boundary. Not preemption — a task
+   inside one long model call still finishes, so a turn can overrun by one call.
+7. **[unblocked]** **The graph.** The gating measurement has been taken (§2): the embedder separates
    real matches by 0.250 on average, so graph retrieval does **not** inherit the
    failure that sank skill ranking. Step 7 is retrieval-structure work, not embedding
    work. What remains unproven is representation — the one real miss was between
    near-identical variants in a family, which is precisely the shape a code graph is
    full of (`foo` vs `foo_batched`, `spsc` vs `mpmc`). Structure is what disambiguates
    those; a description alone does not.
+
+What steps 1-4 and 6 cost, for calibration: roughly one working session each,
+several of them under an hour, and every one of them removed a failure that had
+already been observed. That is the argument for the ordering restated as a
+measurement — the foundation was not expensive, it was merely unglamorous.
 
 The temptation is to start at 7. Step 7 is the most interesting and the most
 defensible on paper. It is also the one whose payoff is bounded by every step above
