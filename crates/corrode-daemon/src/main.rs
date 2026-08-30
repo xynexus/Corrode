@@ -24,6 +24,7 @@ mod roles;
 mod server;
 mod skills;
 mod swarm;
+mod telemetry;
 mod terminal;
 mod toolcall;
 mod tools;

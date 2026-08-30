@@ -17,6 +17,7 @@ use crate::planner;
 use crate::roles::{Role, RoleModels};
 use crate::skills::SkillContext;
 use crate::swarm::{Swarm, Task};
+use crate::telemetry::Telemetry;
 use crate::terminal::Terminals;
 use crate::toolcall::ToolCaller;
 use crate::tools::ToolBox;
@@ -68,6 +69,8 @@ pub struct Daemon {
     skill_scripts: Arc<std::collections::HashMap<String, PathBuf>>,
     /// Per-model tool dialects (schema/names/parse), matched to the tool-call model.
     dialects: Arc<Dialects>,
+    /// Per-task JSONL record. Disabled unless `CORRODE_TELEMETRY` names a path.
+    telemetry: Arc<Telemetry>,
 }
 
 impl Daemon {
@@ -83,6 +86,10 @@ impl Daemon {
         dialects: Arc<Dialects>,
     ) -> Self {
         let skill_scripts = Arc::new(skills.script_dirs());
+        let telemetry = Arc::new(Telemetry::from_env());
+        if telemetry.enabled() {
+            eprintln!("telemetry: recording to $CORRODE_TELEMETRY");
+        }
         Self {
             swarm,
             roles,
@@ -97,6 +104,7 @@ impl Daemon {
             next_plan_id: std::sync::atomic::AtomicU64::new(0),
             skill_scripts,
             dialects,
+            telemetry,
         }
     }
 
@@ -187,6 +195,8 @@ impl Daemon {
                     let root = self.repo_root.clone();
                     let skill_scripts = Arc::clone(&self.skill_scripts);
                     let dialects = Arc::clone(&self.dialects);
+                    let telemetry = Arc::clone(&self.telemetry);
+                    let telemetry_plan = plan_id.clone();
                     let id = task.id;
                     let role = task.role;
                     // The swarm-knowledge digest rides the divergent tail — the
@@ -203,6 +213,7 @@ impl Daemon {
                         // the capability paths directly (see `run_task`).
                         let mut artifacts = Vec::new();
                         let toolbox = ToolBox::new(vfs, root, skill_scripts);
+                        let started = std::time::Instant::now();
                         let output = if role == Role::Coder && fanout > 1 {
                             run_fanout(
                                 fanout,
@@ -243,6 +254,25 @@ impl Daemon {
                             )
                             .await
                         };
+
+                        // One line per execution, before follow-up emission so a task
+                        // that fails is still recorded (see `telemetry.rs`).
+                        telemetry.record(&crate::telemetry::TaskRecord {
+                            at: crate::telemetry::now_secs(),
+                            plan: &telemetry_plan,
+                            task: id,
+                            role: role.as_str(),
+                            model: &model,
+                            band: band.as_u8(),
+                            fanout: if role == Role::Coder { fanout } else { 1 },
+                            prefix_bytes: prefix.len(),
+                            task_bytes: prompt.len(),
+                            output_bytes: output.as_ref().map(|t| t.len()).unwrap_or(0),
+                            duration_ms: started.elapsed().as_millis(),
+                            artifacts: artifacts.len(),
+                            ok: output.is_ok(),
+                            error: output.as_ref().err().map(|e| e.to_string()),
+                        });
 
                         let emitted = match &output {
                             Ok(text) => emit_followups(tool_caller, &dialects, text).await,
