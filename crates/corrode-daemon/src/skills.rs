@@ -290,10 +290,26 @@ impl SkillContext {
     /// testable function of the index + registry.
     fn render(&self, query: &[f32], k: usize) -> String {
         let ranked = self.index.rank(query);
+        // Stage 1 asserts relevance in its header, so it must establish it. Listing the
+        // top-k unconditionally meant a task with NO relevant skill still got k of them
+        // under a heading claiming otherwise — and a model reasonably reads the largest,
+        // most confident block in its prompt as ground truth. Measured: a repo-identity
+        // query scored 8 skills in a 0.26..0.32 band, which is the embedder correctly
+        // saying "nothing here matches"; the same embedder separates real matches by
+        // 0.25 on average (see `docs/harness-architecture.md` §2). The ranker was right
+        // and the harness ignored it.
+        let listed: Vec<&Ranked> = ranked
+            .iter()
+            .take(k)
+            .filter(|r| r.score >= list_min())
+            .collect();
+        if listed.is_empty() {
+            return String::new();
+        }
         let mut s = String::from(
             "Relevant skills for this task (load a skill's full instructions by name):\n",
         );
-        for r in ranked.iter().take(k) {
+        for r in &listed {
             s.push_str(&SkillRegistry::line(r.name, r.description));
         }
         // Activation: inject the single most-relevant skill's instructions, but only
@@ -314,8 +330,20 @@ impl SkillContext {
 /// Cosine bar the top skill must clear to be *activated* (full body injected), not just
 /// listed. Conservative default; override with `CORRODE_SKILL_ACTIVATE_MIN`.
 const DEFAULT_ACTIVATE_MIN: f32 = 0.35;
+/// Cosine bar a skill must clear to be *listed* at all. Progressive disclosure wants
+/// this at or below the activation bar — surface more than you inject — but not at
+/// zero, which is what listing an unfiltered top-k amounts to.
+const DEFAULT_LIST_MIN: f32 = 0.30;
 /// Cap on an injected `SKILL.md` body, so a large skill can't blow the shared prefix.
 const MAX_BODY_BYTES: usize = 8192;
+
+/// Cosine bar for listing a skill (`CORRODE_SKILL_LIST_MIN`).
+fn list_min() -> f32 {
+    std::env::var("CORRODE_SKILL_LIST_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_LIST_MIN)
+}
 
 fn activate_min() -> f32 {
     std::env::var("CORRODE_SKILL_ACTIVATE_MIN")
@@ -622,12 +650,22 @@ mod tests {
         assert!(out.contains("Activated skill: db-skill"), "activated");
         assert!(out.contains("DB INSTRUCTIONS"), "body injected");
 
-        // Query orthogonal to every skill: nothing clears the bar -> no body injected.
+        // Query orthogonal to every skill: the section is omitted ENTIRELY. Listing the
+        // least-irrelevant skill under a "Relevant skills for this task" heading is the
+        // defect that made a swarm describe a C++ library as a GPU inference engine.
         let out2 = ctx.render(&[0.0, 0.0, 1.0], 5);
         assert!(
-            !out2.contains("DB INSTRUCTIONS"),
-            "below the activation bar -> description only"
+            out2.is_empty(),
+            "nothing relevant -> no section at all, got: {out2}"
         );
+
+        // The middle band is what progressive disclosure is for: cos ~= 0.316 clears
+        // the listing bar (0.30) but not the activation bar (0.35), so the skill is
+        // named without its body.
+        let out3 = ctx.render(&[1.0, 0.0, 3.0], 5);
+        assert!(out3.contains("db-skill:"), "listed: {out3}");
+        assert!(!out3.contains("DB INSTRUCTIONS"), "not activated: {out3}");
+        assert!(!out3.contains("ui-skill:"), "orthogonal skill stays out: {out3}");
 
         std::fs::remove_dir_all(&root).ok();
     }
