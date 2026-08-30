@@ -80,7 +80,9 @@ default 0.35), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -> tool-profi
 `CORRODE_NEEDLE_MODEL_ID` (dialect key for the Needle caller, default `needle`),
 `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
 `CORRODE_WEB_ADDR` (web bind, default `0.0.0.0:8787`), `CORRODE_DAEMON_URL`
-(daemon ws the web proxies to), `CORRODE_MAX_TOKENS` (per-call output cap,
+(daemon ws the web proxies to), `CORRODE_TELEMETRY` (path to a JSONL
+file recording one line per subagent execution — role, model, band, prefix/tail bytes,
+duration, artifacts, ok/error; absent -> disabled), `CORRODE_MAX_TOKENS` (per-call output cap,
 default 4096 — a ceiling, so short outputs are unaffected), `CORRODE_STREAM`
 (stream single-shot subagent output over SSE, relaying `SubagentDelta` events to
 the UI as tokens generate; off unless `1`/`true`/`on` — the non-streaming path is
