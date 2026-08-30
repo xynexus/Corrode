@@ -2113,6 +2113,9 @@ mod tests {
             .or_else(|| models.first().cloned())
             .expect("hipfire serves at least one model");
 
+        // Fully qualified: the `roles::` self-import was dropped when the
+        // `is_small_model` gate went, and re-adding it would be unused in the base
+        // build (this call site is feature-gated).
         let embed = crate::roles::default_embedding_model(&models).map(str::to_string);
         let skills = SkillContext::build(&repo, &client, embed.clone(), &GlobalSkills::default()).await;
         let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
