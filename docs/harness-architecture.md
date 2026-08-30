@@ -99,6 +99,20 @@ installed and invoked nowhere — not in corrode, not in hipfire, not in any uni
 wrapper. The `Vfs` escape guard covers `read_file`/`write_file`; `run_command`
 bypasses the VFS entirely, and its `repo_root` cwd is not a boundary.
 
+**The embedder discriminates; the ranker was right.** The 0.057 band above looks
+like an embedding failure, and was recorded as one hypothesis. It is not.
+Embedding stitch's 16 real headers as `filename: \brief` and querying with known
+answers gives **4/6 top-1** — 5/6 counting `hazard_pointers.cpp` beating its own
+`.h` by 0.008 — and a **mean top-8 spread of 0.250**, 4.4x the skill band. The one
+real miss is inside the queue family, whose variants differ by three letters
+(`queue_spsc_waitfree.h` vs `queue_mpmc_lockfree.h`).
+
+So the tight skill band was the ranker *correctly* reporting "nothing here matches"
+a repo-identity query, and the harness listed the results anyway. The defect was
+never retrieval quality; it was a header asserting a relevance the ranker had not
+established. This is the single most important correction in this document, because
+the opposite conclusion would have sent the next month into embedding work.
+
 **No telemetry existed to notice any of this.** The benchmark above and the
 correctness harness were written by hand for one session and thrown away.
 
@@ -122,7 +136,9 @@ claim the harness had no basis to make.
 
 Corollary: a header may never assert relevance the ranker has not established. If
 the score does not clear a bar, the section is labelled *available capabilities*, or
-it is omitted.
+it is omitted. A low spread across candidates is itself the signal — it is the
+ranker reporting that nothing matches — and overriding it is how an unrelated
+project's skills came to be presented as this repository's context.
 
 ### 3.2 Context is layered most-stable first
 
@@ -322,10 +338,13 @@ class of confident failure.
    without it, and it makes every later claim falsifiable.
 5. **Sandbox and capability tiers** (§3.7) — before autonomy widens, not after.
 6. **Cancellation and budgets** (§3.6, §5.1).
-7. **The graph** — and first measure whether the embedder can discriminate at all.
-   Given the 0.057 spread in §2, graph retrieval may inherit exactly the failure that
-   sank skill ranking, with more machinery in the way. That measurement is a day and
-   decides whether step 7 is retrieval work or embedding work.
+7. **The graph.** The gating measurement has been taken (§2): the embedder separates
+   real matches by 0.250 on average, so graph retrieval does **not** inherit the
+   failure that sank skill ranking. Step 7 is retrieval-structure work, not embedding
+   work. What remains unproven is representation — the one real miss was between
+   near-identical variants in a family, which is precisely the shape a code graph is
+   full of (`foo` vs `foo_batched`, `spsc` vs `mpmc`). Structure is what disambiguates
+   those; a description alone does not.
 
 The temptation is to start at 7. Step 7 is the most interesting and the most
 defensible on paper. It is also the one whose payoff is bounded by every step above
@@ -345,8 +364,13 @@ it, and the system currently cannot name the repository it is working in.
 
 ## 8. Open questions
 
-- **Does the embedding model discriminate?** Everything retrieval-shaped depends on
-  it and it has failed once. Measure before building on it.
+- ~~**Does the embedding model discriminate?**~~ **Answered** (§2): yes — 0.250 mean
+  top-8 spread on real code, versus 0.057 on an unmatched query. Retrieval was never
+  the problem.
+- **Can retrieval separate near-identical siblings?** The one real miss was
+  `spsc` vs `mpmc` — same family, three letters apart. Descriptions alone did not
+  do it, and a codebase is full of that shape. Whether graph structure fixes it, or
+  whether it needs a reranker, is untested and is the actual risk in step 7.
 - **Where do the boundaries go?** Checkpoint residency is bounded
   (`resident_checkpoint_max = 4`), so the layer stack in §3.2 spends most of its
   budget immediately. Whether project/turn/role are the right three, and what the
