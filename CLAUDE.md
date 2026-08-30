@@ -59,10 +59,7 @@ JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`),
 `CORRODE_NEEDLE_ASSETS` (Needle asset dir under `--features needle`; defaults to the
 vendored `crates/needle-toolcall-shim/assets/needle`, resolved at build time, so it
 works out of the box; absent -> tool-caller disabled, swarm falls back to
-model-emitted calls), `CORRODE_SMALL_MODELS` (comma-separated substrings that
-force-classify a model as "small" -> uses the Needle tool loop) and
-`CORRODE_SMALL_MODEL_MAX_B` (billions-param cutoff below which a model counts as small,
-default 32), `CORRODE_SKILL_ACTIVATE_MIN` (cosine bar to inject a skill's full body,
+model-emitted calls), `CORRODE_SKILL_ACTIVATE_MIN` (cosine bar to inject a skill's full body,
 default 0.35), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -> tool-profile` file
 — per-model tool names/schema/parse; absent -> the built-in Needle default),
 `CORRODE_NEEDLE_MODEL_ID` (dialect key for the Needle caller, default `needle`),
@@ -206,14 +203,16 @@ small coders' tools are picked up reliably; then its structured args become trus
 too. Note: the guide's enum/literal token-forcing had a bug (the merged `":"` token
 bypassed it) — fixed in `needle-toolcall-shim/src/guide.rs`.
 
-**Second use — the tool-execution loop (`tools.rs`), small models only.** When a
-subagent's role model is *small* (`roles::is_small_model` — a param-size heuristic; see
-`CORRODE_SMALL_MODELS` / `CORRODE_SMALL_MODEL_MAX_B`) and a Needle caller is present,
-`run_tool_loop` runs it: each turn the model writes a plain-English `TOOL:` line, Needle
-builds the call against `tools::TOOL_SCHEMAS`, `ToolBox` executes it and feeds the
-observation back; the loop ends on a turn with no `TOOL:` line (the final answer) or
-after `MAX_TOOL_STEPS`. Larger models (or a build without Needle) take the single-shot
-path unchanged. Path args come through Needle cleanly (paths tokenize well); tool
+**Second use — the tool-execution loop (`tools.rs`), any model.** When a Needle caller
+is present and the role model's dialect doesn't emit its own calls, `run_tool_loop`
+runs it: each turn the model writes a plain-English `TOOL:` line, Needle builds the
+call against `tools::TOOL_SCHEMAS`, `ToolBox` executes it and feeds the observation
+back; the loop ends on a turn with no `TOOL:` line (the final answer) or after
+`MAX_TOOL_STEPS`. Only a build without Needle takes the single-shot path. This was
+once gated to *small* models on the theory that a large one needs no help formatting
+a call — the effect was that it got no tools at all, and a 35B was observed emitting
+`<tool_call>` blocks nothing read while the swarm answered repo questions by guessing.
+The gate and its `CORRODE_SMALL_MODELS` / `CORRODE_SMALL_MODEL_MAX_B` knobs are gone. Path args come through Needle cleanly (paths tokenize well); tool
 *selection* sharpens with the planned finetune. `Daemon`'s `vfs` is `Arc<dyn Vfs>` so the
 loop's `'static` future owns a clone.
 
