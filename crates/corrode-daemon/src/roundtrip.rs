@@ -666,3 +666,289 @@ mod regen_tests {
         assert!(matches!(regenerate("fn ("), Regen::Unparseable(_)));
     }
 }
+
+/// The composer itself: scan a repo into nodes, regenerate it, diff the tree.
+///
+/// Tiers 1 and 2 each measured a *proxy*. Tier 1 counted bytes inside spans found by a
+/// hand-rolled scanner; tier 2 round-tripped whole files through a printer nobody
+/// proposed using. Neither built the thing under test — a node model — so neither could
+/// answer whether a repo survives decomposition and reassembly.
+///
+/// This does. `syn` supplies the item boundaries (real structure, not a brace count);
+/// each node stores its VERBATIM bytes; regeneration concatenates. Byte-exactness is
+/// then a property of the decomposition, not of a printer's manners.
+pub mod compose {
+    use proc_macro2::Span;
+    use syn::spanned::Spanned;
+
+    /// One node as the graph would hold it.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Node {
+        pub path: String,
+        /// Order within the file — the only thing regeneration needs.
+        pub ordinal: usize,
+        /// `fn`, `struct`, `impl`, `use`, `mod`, `macro`, … from syn, or `trivia` for
+        /// the whitespace and free-standing comments between items.
+        pub kind: &'static str,
+        /// Verbatim source. NOT regenerated: tier 2 measured that regeneration loses
+        /// comments and canonicalises punctuation, so content is stored, not printed.
+        pub text: String,
+        /// 1-based, derived at scan time. Storing this is a convenience for the census;
+        /// a live store would derive it from the projection instead, so an edit above
+        /// does not invalidate every node below.
+        pub start_line: usize,
+    }
+
+    fn kind_of(item: &syn::Item) -> &'static str {
+        match item {
+            syn::Item::Fn(_) => "fn",
+            syn::Item::Struct(_) => "struct",
+            syn::Item::Enum(_) => "enum",
+            syn::Item::Impl(_) => "impl",
+            syn::Item::Trait(_) => "trait",
+            syn::Item::Mod(_) => "mod",
+            syn::Item::Use(_) => "use",
+            syn::Item::Const(_) => "const",
+            syn::Item::Static(_) => "static",
+            syn::Item::Type(_) => "type",
+            syn::Item::Macro(_) => "macro",
+            syn::Item::ExternCrate(_) => "extern_crate",
+            syn::Item::ForeignMod(_) => "foreign_mod",
+            syn::Item::TraitAlias(_) => "trait_alias",
+            syn::Item::Union(_) => "union",
+            _ => "item",
+        }
+    }
+
+    /// Byte range of a span, using proc-macro2's `span-locations`.
+    fn range(span: Span) -> std::ops::Range<usize> {
+        span.byte_range()
+    }
+
+    /// Decompose one file into nodes covering every byte.
+    ///
+    /// An item's span does NOT include its outer attributes or doc comments, so those
+    /// would land in trivia and lose their association with the item they document.
+    /// Each item's start is pulled back over any immediately preceding attribute and
+    /// doc-comment lines, which is where they belong.
+    pub fn scan(path: &str, src: &str) -> anyhow::Result<Vec<Node>> {
+        let file = syn::parse_file(src)?;
+        let mut nodes = Vec::new();
+        let mut cursor = 0usize;
+        let mut ordinal = 0usize;
+
+        for item in &file.items {
+            let r = range(item.span());
+            let start = pull_back_attrs(src, r.start, cursor);
+            if start > cursor {
+                push_trivia(&mut nodes, path, &mut ordinal, src, cursor, start);
+            }
+            nodes.push(Node {
+                path: path.to_string(),
+                ordinal,
+                kind: kind_of(item),
+                text: src[start..r.end].to_string(),
+                start_line: line_of(src, start),
+            });
+            ordinal += 1;
+            cursor = r.end;
+        }
+        if cursor < src.len() {
+            push_trivia(&mut nodes, path, &mut ordinal, src, cursor, src.len());
+        }
+        Ok(nodes)
+    }
+
+    fn push_trivia(
+        nodes: &mut Vec<Node>,
+        path: &str,
+        ordinal: &mut usize,
+        src: &str,
+        from: usize,
+        to: usize,
+    ) {
+        nodes.push(Node {
+            path: path.to_string(),
+            ordinal: *ordinal,
+            kind: "trivia",
+            text: src[from..to].to_string(),
+            start_line: line_of(src, from),
+        });
+        *ordinal += 1;
+    }
+
+    /// Walk back from an item's span over attribute and doc-comment lines directly
+    /// above it, stopping at `floor` (the previous item's end) or a blank line.
+    fn pull_back_attrs(src: &str, start: usize, floor: usize) -> usize {
+        let mut at = start;
+        loop {
+            let Some(line_start) = src[floor..at].rfind('\n').map(|i| floor + i + 1) else {
+                break;
+            };
+            let prev_end = line_start.saturating_sub(1);
+            let Some(prev_start) = src[floor..prev_end].rfind('\n').map(|i| floor + i + 1) else {
+                // First line of the region.
+                let l = src[floor..prev_end].trim_start();
+                if l.starts_with("#[") || l.starts_with("///") || l.starts_with("//!") {
+                    return floor;
+                }
+                break;
+            };
+            let line = src[prev_start..prev_end].trim();
+            if line.starts_with("#[") || line.starts_with("///") || line.starts_with("//!") {
+                at = prev_start;
+                continue;
+            }
+            break;
+        }
+        // `at` now points at the first attribute line, or the original start.
+        src[floor..at].rfind('\n').map(|i| floor + i + 1).unwrap_or(at)
+    }
+
+    fn line_of(src: &str, byte: usize) -> usize {
+        src[..byte].bytes().filter(|b| *b == b'\n').count() + 1
+    }
+
+    /// Reassemble a file from its nodes. This is the whole composer.
+    pub fn regenerate(nodes: &[Node]) -> String {
+        let mut out = String::new();
+        let mut sorted: Vec<&Node> = nodes.iter().collect();
+        sorted.sort_by_key(|n| n.ordinal);
+        for n in sorted {
+            out.push_str(&n.text);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod compose_tests {
+    use super::compose::*;
+
+    /// Scan a whole repository into nodes, regenerate every file, diff the tree.
+    ///
+    /// This is the end-to-end claim `graph-model.md` makes — files are a projection of
+    /// the graph — reduced to something that either holds byte-for-byte or does not.
+    /// `CORRODE_SCAN_REPO` points it at any repo; the default is this one.
+    #[test]
+    fn scan_and_regenerate_a_repository() {
+        let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let listed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["ls-files", "-s", "-z"])
+            .output()
+            .expect("git ls-files");
+        let files: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+            .split('\0')
+            .filter_map(|rec| {
+                let (meta, path) = rec.split_once('\t')?;
+                let mode = meta.split_whitespace().next()?;
+                (matches!(mode, "100644" | "100755") && path.ends_with(".rs"))
+                    .then(|| path.to_string())
+            })
+            .collect();
+
+        let (mut ok, mut mismatched, mut unparseable) = (0usize, 0usize, 0usize);
+        let (mut nodes_total, mut bytes_total) = (0usize, 0usize);
+        let mut kinds: std::collections::BTreeMap<&'static str, usize> = Default::default();
+        let mut failures: Vec<String> = Vec::new();
+
+        for rel in &files {
+            let full = std::path::Path::new(&repo).join(rel);
+            let Ok(src) = std::fs::read_to_string(&full) else {
+                continue;
+            };
+            match scan(rel, &src) {
+                Err(_) => unparseable += 1,
+                Ok(nodes) => {
+                    let rebuilt = regenerate(&nodes);
+                    if rebuilt == src {
+                        ok += 1;
+                        nodes_total += nodes.len();
+                        bytes_total += src.len();
+                        for n in &nodes {
+                            *kinds.entry(n.kind).or_default() += 1;
+                        }
+                    } else {
+                        mismatched += 1;
+                        if failures.len() < 5 {
+                            let at = src
+                                .bytes()
+                                .zip(rebuilt.bytes())
+                                .position(|(a, b)| a != b)
+                                .unwrap_or(src.len().min(rebuilt.len()));
+                            failures.push(format!(
+                                "{rel}: first diff at byte {at} (src {} bytes, rebuilt {})",
+                                src.len(),
+                                rebuilt.len()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!("--- scan + regenerate: {} .rs files in {repo} ---", files.len());
+        eprintln!("  byte-exact {ok}, mismatched {mismatched}, unparseable {unparseable}");
+        eprintln!("  {nodes_total} nodes over {bytes_total} bytes");
+        let trivia = kinds.get("trivia").copied().unwrap_or(0);
+        eprintln!(
+            "  node kinds: {}",
+            kinds
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        eprintln!(
+            "  {:.1}% of nodes are real items (rest trivia)",
+            100.0 * (nodes_total - trivia) as f64 / nodes_total.max(1) as f64
+        );
+        for f in &failures {
+            eprintln!("  MISMATCH {f}");
+        }
+
+        assert!(!files.is_empty(), "no .rs files found in {repo}");
+        assert_eq!(mismatched, 0, "regeneration was not byte-exact");
+    }
+
+    /// The point of the exercise: a node knows where it lands, so `path:line` is
+    /// DERIVED rather than stored-and-invalidated. Checked against the real file.
+    #[test]
+    fn nodes_carry_correct_line_numbers() {
+        let path = "crates/corrode-daemon/src/roundtrip.rs";
+        let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/roundtrip.rs");
+        let src = std::fs::read_to_string(&full).unwrap();
+        let nodes = scan(path, &src).expect("parses");
+
+        for n in nodes.iter().filter(|n| n.kind != "trivia") {
+            // The node's first non-blank line must actually appear at start_line.
+            let first = n.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            let actual = src.lines().nth(n.start_line - 1).unwrap_or("");
+            assert_eq!(
+                first.trim_end(),
+                actual.trim_end(),
+                "{path}:{} — node text does not begin at its derived line",
+                n.start_line
+            );
+        }
+
+        // And an edit ABOVE a node shifts its line, which is exactly why a live store
+        // derives this from the projection instead of persisting it.
+        let shifted = format!("// inserted\n{src}");
+        let after = scan(path, &shifted).expect("parses");
+        let before_first = nodes.iter().find(|n| n.kind != "trivia").unwrap().start_line;
+        let after_first = after.iter().find(|n| n.kind != "trivia").unwrap().start_line;
+        assert_eq!(
+            after_first,
+            before_first + 1,
+            "one inserted line must shift every node below it by one"
+        );
+    }
+}

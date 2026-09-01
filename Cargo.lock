@@ -642,6 +642,7 @@ dependencies = [
  "needle-toolcall-shim",
  "portable-pty",
  "prettyplease",
+ "proc-macro2",
  "reqwest",
  "serde",
  "serde_json",

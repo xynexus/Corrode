@@ -40,3 +40,6 @@ corrode-core = { path = "crates/corrode-core" }
 # (tree-sitter, 66 languages) is lossy where byte-exactness is the whole point.
 syn = { version = "2", features = ["full", "parsing", "printing", "visit"] }
 prettyplease = "0.2"
+# `span-locations` gives byte ranges for parsed items, which is what lets a node hold
+# VERBATIM source instead of regenerating it.
+proc-macro2 = { version = "1", features = ["span-locations"] }

@@ -21,6 +21,7 @@ async-trait.workspace = true
 corrode-core.workspace = true
 syn.workspace = true
 prettyplease.workspace = true
+proc-macro2.workspace = true
 # Real pty-backed terminal sessions (replaces the echo). Blocking I/O, bridged to
 # the async event channel by a per-session reader thread.
 portable-pty = "0.9"
