@@ -412,7 +412,8 @@ falsify it.
 | assumption | status | falsifying test | blocks |
 |---|---|---|---|
 | A shared prefix is prefilled once and reused | **FALSE today** | `cached_tokens > 0` on a repeated prefix | §3.2 entirely; all layering |
-| Composing a file from graph nodes is byte-exact | **UNTESTED** | round-trip check over real Rust | graph-backed VFS; derived line numbers |
+| Item decomposition is total (necessary for composition) | **TRUE** — 99.6-99.9% item bytes, remainder pure whitespace, 92 files / 4 crates | `roundtrip.rs` census | graph-backed VFS; derived line numbers |
+| Regenerating an item from structured form is byte-exact | **UNTESTED** (tier 2, needs a parser) | round-trip through `syn` + `prettyplease` | `ProjectionMode::Composed`; the macro story |
 | The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
 | Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
 | The graph is the source of truth, files a projection | **aspiration** | — | bijective line numbers |

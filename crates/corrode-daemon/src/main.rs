@@ -24,6 +24,7 @@ mod plan_graph;
 mod project;
 mod planner;
 mod roles;
+mod roundtrip;
 mod sandbox;
 mod server;
 mod session;
