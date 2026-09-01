@@ -761,8 +761,9 @@ impl Daemon {
     /// provenance — a store that cannot take the write logs once and stops, because
     /// losing an index refresh must never fail the work that produced it.
     ///
-    /// Non-Rust paths are skipped: the projection is per-language by design and only
-    /// Rust has a projector.
+    /// Every written path is ingested, whatever the language: a backend exists for Rust
+    /// and a byte-exact fallback for everything else, so an unfamiliar codebase is
+    /// absorbed with less structure rather than not at all.
     async fn ingest_written(&self, session: &Session, graph: &plan_graph::PlanGraph) {
         let Some(store) = &session.graph else {
             return;
@@ -777,7 +778,7 @@ impl Daemon {
             let Some(path) = node.id.rsplit(":code:").next() else {
                 continue;
             };
-            if !path.ends_with(".rs") || !seen.insert(path) {
+            if !seen.insert(path) {
                 continue;
             }
             let Ok(bytes) = session.vfs.read(path).await else {
@@ -786,7 +787,11 @@ impl Daemon {
             let Ok(src) = String::from_utf8(bytes) else {
                 continue;
             };
-            let Ok(fw) = crate::projection::ingest::file(path, &src) else {
+            // Backend chosen per path: Rust gets syn, anything else falls back to the
+            // plain-text projector, which still ingests and projects byte-exactly with
+            // less structure. Absorbing an unfamiliar codebase is never blocked.
+            let lang = crate::projection::for_path(path);
+            let Ok(fw) = crate::projection::ingest::file(lang.as_ref(), path, &src) else {
                 continue; // unparseable mid-edit: leave the previous nodes in place
             };
             if let Err(e) = store.replace_file(&fw) {

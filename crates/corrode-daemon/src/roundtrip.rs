@@ -1,406 +1,158 @@
-//! Projection fidelity: can a file be reconstructed from the nodes that represent it?
+//! Measurements of the projection, kept separate from the projection itself.
 //!
-//! `graph-model.md` makes a load-bearing claim — files are a *projection* of the graph,
-//! not the other way round — and `ProjectionMode::Composed` is what that claim looks
-//! like when it holds. Everything above it depends on it: a graph-backed VFS, deriving
-//! line numbers instead of storing them, and the argument that we avoid the line-level
-//! failures a Tree-Sitter index pays for (`harness-architecture.md` §10).
-//!
-//! Nothing had ever tested it. This is the cheapest test that can falsify it.
-//!
-//! # What this tier measures, and what it does not
-//!
-//! Byte-exact composition needs two things to hold. This module tests the first:
-//!
-//! 1. **Decomposition is total** — the item spans account for every byte of the file,
-//!    so reassembling them reproduces it exactly. If some bytes belong to no node, the
-//!    node model cannot represent the file and no amount of clever regeneration fixes
-//!    it.
-//! 2. **Regeneration is exact** — an item rendered back from its structured form is
-//!    byte-identical to its source. That is where `RustfmtSkip`, `MacroExpansion` and
-//!    `RawStringMismatch` live, and it needs a real parser + printer (`syn` +
-//!    `prettyplease`), which the workspace does not depend on. Tier 2, not here.
-//!
-//! Tier 1 is the *necessary* condition, so it is the one worth having first: if the
-//! byte census shows unclaimed regions, tier 2 is moot.
-//!
-//! # Honesty rule
-//!
-//! The scanner is a brace/string/comment-aware splitter, not a parser. When it cannot
-//! confidently find a boundary it reports [`Fidelity::Unscannable`] rather than
-//! guessing. A check that says "I could not read this" is useful; one that silently
-//! mis-splits is the failure mode this whole exercise exists to avoid.
+//! These verify the load-bearing claims in `harness-architecture.md` §8 and print the
+//! censuses behind them. They live here rather than in `projection/` because their
+//! corpora are whole repositories and their job is to *measure* the projection rather
+//! than perform it — `CORRODE_SCAN_REPO` points them at any repo.
 
-/// Where a file's bytes went when split into top-level items.
-#[derive(Debug, PartialEq)]
-pub struct Census {
-    /// Bytes inside a top-level item span.
-    pub item_bytes: usize,
-    /// Bytes between items — blank lines, free-standing comments, inner attributes.
-    /// A node model made only of items cannot reproduce these.
-    pub gap_bytes: usize,
-    /// Number of top-level items found.
-    pub items: usize,
-    /// Reassembling spans + gaps reproduced the input exactly. This is the tier-1
-    /// round trip; it fails only if the scanner loses or duplicates bytes.
-    pub exact: bool,
-    /// What the gap bytes actually are, so the schema knows what it must carry.
-    pub gap_kinds: GapKinds,
-}
+use crate::projection::{self, ingest, regenerate, scan, Language};
 
-#[derive(Debug, Default, PartialEq)]
-pub struct GapKinds {
-    pub blank: usize,
-    pub comment: usize,
-    pub attribute: usize,
-    pub other: usize,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Fidelity {
-    Scanned(Census),
-    /// The scanner hit something it cannot bound confidently.
-    Unscannable(&'static str),
-}
-
-/// Split `src` at top-level item boundaries and account for every byte.
-///
-/// "Top-level item" is approximated as: a run of source at brace depth 0 ending at the
-/// `}` that closes a depth-1 block, or at a `;` at depth 0. That covers `fn`, `struct`,
-/// `impl`, `mod`, `use`, `const`, and macro invocations with braces or a trailing `;`.
-pub fn census(src: &str) -> Fidelity {
-    let b = src.as_bytes();
-    let mut i = 0usize;
-    let mut depth: i32 = 0;
-    let mut item_start: Option<usize> = None;
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    // An item begins after the previous one ends. Deriving the start from the file
-    // origin instead made consecutive items resolve to the same offset — every span
-    // after the first then overlapped, which is what the first run of this check
-    // actually found (a defect here, not a fact about Rust).
-    let mut prev_end = 0usize;
-
-    while i < b.len() {
-        match b[i] {
-            // Comments: skip whole, so braces and quotes inside cannot mislead.
-            b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
-                let mut nest = 1;
-                i += 2;
-                while i + 1 < b.len() && nest > 0 {
-                    if b[i] == b'/' && b[i + 1] == b'*' {
-                        nest += 1;
-                        i += 2;
-                    } else if b[i] == b'*' && b[i + 1] == b'/' {
-                        nest -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                if nest > 0 {
-                    return Fidelity::Unscannable("unterminated block comment");
-                }
-                continue;
-            }
-            // Raw strings: r"..", r#".."#, br#".."# — the hash count sets the terminator.
-            b'r' | b'b' if raw_string_start(b, i).is_some() => {
-                let Some((body, hashes)) = raw_string_start(b, i) else {
-                    return Fidelity::Unscannable("raw string");
-                };
-                match raw_string_end(b, body, hashes) {
-                    Some(e) => {
-                        i = e;
-                        continue;
-                    }
-                    None => return Fidelity::Unscannable("unterminated raw string"),
-                }
-            }
-            b'"' => match plain_string_end(b, i) {
-                Some(e) => {
-                    i = e;
-                    continue;
-                }
-                None => return Fidelity::Unscannable("unterminated string"),
-            },
-            // Char literal or lifetime — `'a` is not a string, `'x'` is.
-            b'\'' => {
-                i = char_or_lifetime_end(b, i);
-                continue;
-            }
-            b'{' => {
-                if depth == 0 && item_start.is_none() {
-                    item_start = Some(item_start_after(b, prev_end));
-                }
-                depth += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth < 0 {
-                    return Fidelity::Unscannable("unbalanced closing brace");
-                }
-                if depth == 0 {
-                    if let Some(s) = item_start.take() {
-                        spans.push((s, i + 1));
-                        prev_end = i + 1;
-                    }
-                }
-            }
-            b';' if depth == 0 => {
-                // `use x;`, `const A: u8 = 1;`, `mac!();` — an item with no block.
-                let s = item_start.take().unwrap_or_else(|| item_start_after(b, prev_end));
-                spans.push((s, i + 1));
-                prev_end = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    if depth != 0 {
-        return Fidelity::Unscannable("unbalanced braces at EOF");
-    }
-
-    // Account for every byte: spans, plus the gaps between them.
-    let mut item_bytes = 0usize;
-    let mut gaps: Vec<(usize, usize)> = Vec::new();
-    let mut cursor = 0usize;
-    for (s, e) in &spans {
-        if *s < cursor {
-            return Fidelity::Unscannable("overlapping item spans");
-        }
-        if *s > cursor {
-            gaps.push((cursor, *s));
-        }
-        item_bytes += e - s;
-        cursor = *e;
-    }
-    if cursor < b.len() {
-        gaps.push((cursor, b.len()));
-    }
-
-    // The tier-1 round trip: spans + gaps, in order, must rebuild the input.
-    let mut rebuilt = String::with_capacity(src.len());
-    let mut all: Vec<(usize, usize)> = spans.iter().copied().chain(gaps.iter().copied()).collect();
-    all.sort();
-    for (s, e) in &all {
-        rebuilt.push_str(&src[*s..*e]);
-    }
-
-    let mut kinds = GapKinds::default();
-    let mut gap_bytes = 0usize;
-    for (s, e) in &gaps {
-        let text = &src[*s..*e];
-        gap_bytes += e - s;
-        let t = text.trim();
-        if t.is_empty() {
-            kinds.blank += e - s;
-        } else if t.lines().all(|l| {
-            let l = l.trim();
-            l.is_empty() || l.starts_with("//")
-        }) {
-            kinds.comment += e - s;
-        } else if t.starts_with("#!") || t.starts_with("#[") {
-            kinds.attribute += e - s;
+/// The end-to-end claim: a repository decomposes into nodes and reassembles byte-for-
+/// byte. Runs whatever backend each path selects, so it covers the fallback too.
+#[cfg(test)]
+fn scan_repo(repo: &str) -> (usize, usize, usize, usize) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "-s", "-z"])
+        .output()
+        .expect("git ls-files");
+    let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter_map(|r| {
+            let (m, p) = r.split_once('\t')?;
+            matches!(m.split_whitespace().next()?, "100644" | "100755").then(|| p.to_string())
+        })
+        .collect();
+    let (mut ok, mut bad, mut nodes, mut comments) = (0usize, 0usize, 0usize, 0usize);
+    for rel in &files {
+        let Ok(src) = std::fs::read_to_string(std::path::Path::new(repo).join(rel)) else {
+            continue;
+        };
+        let lang = projection::for_path(rel);
+        let Ok(fw) = ingest::file(lang.as_ref(), rel, &src) else {
+            continue;
+        };
+        if ingest::project(&fw) == src {
+            ok += 1;
+            nodes += fw.code.len();
+            comments += fw.comments.len();
         } else {
-            kinds.other += e - s;
+            bad += 1;
+            eprintln!("  MISMATCH {rel} ({})", lang.name());
         }
     }
-
-    Fidelity::Scanned(Census {
-        item_bytes,
-        gap_bytes,
-        items: spans.len(),
-        exact: rebuilt == src,
-        gap_kinds: kinds,
-    })
-}
-
-/// Where the next item begins, given where the previous one ended: the first
-/// non-whitespace byte at or after `prev_end`. Monotonic by construction, so spans
-/// cannot overlap. Doc comments and attributes preceding an item fall INSIDE its span,
-/// which is correct — they belong to the item they document.
-fn item_start_after(b: &[u8], prev_end: usize) -> usize {
-    let mut j = prev_end;
-    while j < b.len() && b[j].is_ascii_whitespace() {
-        j += 1;
-    }
-    j
-}
-
-pub(super) fn raw_string_start(b: &[u8], i: usize) -> Option<(usize, usize)> {
-    let mut j = i;
-    if b[j] == b'b' {
-        j += 1;
-    }
-    if j >= b.len() || b[j] != b'r' {
-        return None;
-    }
-    j += 1;
-    let mut hashes = 0usize;
-    while j < b.len() && b[j] == b'#' {
-        hashes += 1;
-        j += 1;
-    }
-    if j < b.len() && b[j] == b'"' {
-        Some((j + 1, hashes))
-    } else {
-        None
-    }
-}
-
-pub(super) fn raw_string_end(b: &[u8], body: usize, hashes: usize) -> Option<usize> {
-    let mut j = body;
-    while j < b.len() {
-        if b[j] == b'"' && b[j + 1..].iter().take(hashes).all(|c| *c == b'#') && j + hashes < b.len()
-        {
-            return Some(j + 1 + hashes);
-        }
-        j += 1;
-    }
-    None
-}
-
-pub(super) fn plain_string_end(b: &[u8], i: usize) -> Option<usize> {
-    let mut j = i + 1;
-    while j < b.len() {
-        match b[j] {
-            b'\\' => j += 2,
-            b'"' => return Some(j + 1),
-            _ => j += 1,
-        }
-    }
-    None
-}
-
-/// `'a` (lifetime) vs `'x'` / `'\n'` (char). Returns the index just past it.
-fn char_or_lifetime_end(b: &[u8], i: usize) -> usize {
-    if i + 2 < b.len() && b[i + 1] == b'\\' {
-        let mut j = i + 2;
-        while j < b.len() && b[j] != b'\'' {
-            j += 1;
-        }
-        return j + 1;
-    }
-    if i + 2 < b.len() && b[i + 2] == b'\'' {
-        return i + 3; // 'x'
-    }
-    i + 1 // lifetime
+    (ok, bad, nodes, comments)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn scanned(src: &str) -> Census {
-        match census(src) {
-            Fidelity::Scanned(c) => c,
-            Fidelity::Unscannable(why) => panic!("unscannable: {why}"),
-        }
+    /// Every tracked file in a repo, whatever its language, projects back exactly.
+    #[test]
+    fn a_repository_round_trips() {
+        let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let (ok, bad, nodes, comments) = scan_repo(&repo);
+        eprintln!("--- round trip over {repo} ---");
+        eprintln!("  byte-exact {ok}, mismatched {bad}");
+        eprintln!("  {nodes} code nodes, {comments} comments");
+        assert!(ok > 0, "nothing scanned");
+        assert_eq!(bad, 0, "projection was not byte-exact");
     }
 
+    /// Positions are an OUTPUT of projection, never node state: a byte offset is a fact
+    /// about one source text, and a generated VFS has none.
     #[test]
-    fn every_byte_is_accounted_for() {
-        let c = scanned("use a::b;\n\nfn f() {}\n");
-        assert!(c.exact, "spans + gaps must rebuild the input");
-        assert_eq!(c.items, 2, "`use ...;` and `fn f() {{}}`");
+    fn positions_are_recomputed_not_stored() {
+        let lang = projection::rust::Rust;
+        let src = "use a::b;\n\nfn one() {}\n\nfn two() {}\n";
+        let nodes = scan(&lang, "t.rs", src).unwrap();
+        let (text, places) = projection::project(&nodes);
+        assert_eq!(text, src);
+
+        let two = nodes.iter().find(|n| n.text.contains("fn two")).unwrap();
+        let before = places.iter().find(|p| p.ordinal == two.ordinal).unwrap().start_line;
+
+        let mut mutated: Vec<projection::Node> = nodes
+            .iter()
+            .cloned()
+            .map(|mut n| {
+                n.ordinal += 1;
+                n
+            })
+            .collect();
+        mutated.push(projection::Node {
+            path: "t.rs".into(),
+            ordinal: 0,
+            kind: "use",
+            text: "use inserted::thing;\n\n".into(),
+        });
+        let (_, after) = projection::project(&mutated);
+        let now = after.iter().find(|p| p.ordinal == two.ordinal + 1).unwrap().start_line;
+        assert_eq!(now, before + 2, "projection reports the shifted line");
     }
 
-    /// Braces and quotes inside strings, raw strings and comments must not move an
-    /// item boundary — these are what a naive scanner gets wrong.
+    /// Braces and quotes inside literals and comments must not move a boundary.
     #[test]
-    fn braces_inside_literals_and_comments_do_not_split_items() {
+    fn literals_do_not_confuse_the_rust_backend() {
+        let lang = projection::rust::Rust;
         for src in [
             "fn f() { let s = \"}{\"; }\n",
-            "fn f() { let s = r#\"}{ \"quoted\" \"#; }\n",
+            "fn f() { let s = r#\"}{ \"q\" \"#; }\n",
             "fn f() { /* } { */ }\n",
             "fn f() { let c = '}'; }\n",
             "fn f<'a>(x: &'a str) -> &'a str { x }\n",
         ] {
-            let c = scanned(src);
-            assert!(c.exact, "round trip failed: {src:?}");
-            assert_eq!(c.items, 1, "one item expected in {src:?}");
+            let nodes = scan(&lang, "t.rs", src).unwrap();
+            assert_eq!(regenerate(&nodes), src, "round trip: {src:?}");
+            assert_eq!(
+                nodes.iter().filter(|n| n.kind == "fn").count(),
+                1,
+                "one item: {src:?}"
+            );
         }
     }
 
+    /// A language with no backend is still absorbed: byte-exact, less structure.
     #[test]
-    fn unterminated_input_is_reported_not_guessed() {
-        assert!(matches!(census("fn f() {\n"), Fidelity::Unscannable(_)));
-        assert!(matches!(census("let s = \"oops\n"), Fidelity::Unscannable(_)));
+    fn an_unknown_language_degrades_without_losing_fidelity() {
+        let src = "# a python comment\ndef f():\n    return 1  # trailing\n";
+        let lang = projection::for_path("s.py");
+        assert_eq!(lang.name(), "hash", "hash-comment family selected");
+        let fw = ingest::file(lang.as_ref(), "s.py", src).unwrap();
+
+        assert_eq!(ingest::project(&fw), src, "fidelity is not language-dependent");
+        assert_eq!(fw.code.len(), 1, "no grammar -> one node for the file");
+        assert_eq!(fw.comments.len(), 2, "comments still recovered");
+        assert!(
+            fw.comments.iter().all(|c| c.describes_kind.is_none()),
+            "no anchors without a grammar — reported, not guessed"
+        );
     }
 
-    /// The load-bearing measurement: over this crate's real sources, how many bytes
-    /// belong to no item? Those are bytes an item-only node model cannot reproduce,
-    /// and they decide whether `ProjectionMode::Composed` is reachable at all.
-    ///
-    /// Asserts only the round trip. The census is PRINTED rather than thresholded —
-    /// a number nobody has seen before should not become a pass/fail gate on its
-    /// first run.
+    /// C-family markers cover most of what a mixed repo contains.
     #[test]
-    fn census_over_this_crate() {
-        // Defaults to this crate; `CORRODE_CENSUS_DIR` points it at a wider corpus
-        // (one crate is not evidence about Rust in general).
-        let dir = match std::env::var("CORRODE_CENSUS_DIR") {
-            Ok(d) => std::path::PathBuf::from(d),
-            Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        };
-        let mut files = 0usize;
-        let mut unscannable: Vec<(String, &'static str)> = Vec::new();
-        let (mut item, mut gap) = (0usize, 0usize);
-        let mut kinds = GapKinds::default();
-
-        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let src = std::fs::read_to_string(&path).unwrap();
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            match census(&src) {
-                Fidelity::Scanned(c) => {
-                    assert!(c.exact, "{name}: spans + gaps did not rebuild the file");
-                    files += 1;
-                    item += c.item_bytes;
-                    gap += c.gap_bytes;
-                    kinds.blank += c.gap_kinds.blank;
-                    kinds.comment += c.gap_kinds.comment;
-                    kinds.attribute += c.gap_kinds.attribute;
-                    kinds.other += c.gap_kinds.other;
-                }
-                Fidelity::Unscannable(why) => unscannable.push((name, why)),
-            }
+    fn the_fallback_covers_the_common_comment_families() {
+        for (path, text, want) in [
+            ("a.go", "// go\nfunc f() {}\n", 1),
+            ("a.ts", "/* block */\nlet x = 1;\n", 1),
+            ("a.sql", "-- sql\nSELECT 1;\n", 1),
+            ("a.html", "<!-- markup -->\n<p/>\n", 1),
+            ("a.yaml", "# yaml\nk: v\n", 1),
+        ] {
+            let lang = projection::for_path(path);
+            let fw = ingest::file(lang.as_ref(), path, text).unwrap();
+            assert_eq!(ingest::project(&fw), text, "{path} round trips");
+            assert_eq!(fw.comments.len(), want, "{path}: {:?}", fw.comments);
         }
-
-        let total = item + gap;
-        eprintln!("--- projection census: {files} scanned, {} unscannable ---", unscannable.len());
-        for (f, why) in &unscannable {
-            eprintln!("  UNSCANNABLE {f}: {why}");
-        }
-        eprintln!(
-            "  item bytes {item} ({:.1}%), gap bytes {gap} ({:.1}%)",
-            100.0 * item as f64 / total as f64,
-            100.0 * gap as f64 / total as f64
-        );
-        eprintln!(
-            "  gaps: blank {} comment {} attribute {} other {}",
-            kinds.blank, kinds.comment, kinds.attribute, kinds.other
-        );
-        assert!(files > 0, "no sources scanned");
     }
 }
-
-/// Tier 2: can an item be REGENERATED from its parsed form byte-for-byte?
-///
-/// Tier 1 showed decomposition is total — items plus whitespace account for every
-/// byte. That makes verbatim composition possible. Tier 2 asks the harder question
-/// `ProjectionMode::Composed` actually poses: if a node stores *structure* rather than
-/// text, does rendering it back reproduce the source?
-///
-/// This is where [`crate::FallbackReason`]'s variants were always going to live.
 pub mod regen {
     use corrode_core::FallbackReason;
 
@@ -501,15 +253,15 @@ pub mod regen {
                 }
                 continue;
             }
-            if let Some((body, hashes)) = super::raw_string_start(b, i) {
-                if let Some(e) = super::raw_string_end(b, body, hashes) {
+            if let Some((body, hashes)) = crate::projection::rust::raw_string_start(b, i) {
+                if let Some(e) = crate::projection::rust::raw_string_end(b, body, hashes) {
                     out.push_str(&src[i..e]);
                     i = e;
                     continue;
                 }
             }
             if b[i] == b'"' {
-                if let Some(e) = super::plain_string_end(b, i) {
+                if let Some(e) = crate::projection::rust::plain_string_end(b, i) {
                     out.push_str(&src[i..e]);
                     i = e;
                     continue;
@@ -576,6 +328,74 @@ pub mod regen {
                 first_diff_offset: 0,
             }
         }
+    }
+}
+
+pub mod canonical {
+    /// Does printing a canonical file reproduce it? If the printer is not idempotent
+    /// there is no fixed point to converge on and the scheme has no foundation.
+    pub fn is_idempotent(src: &str) -> Option<bool> {
+        let once = prettyplease::unparse(&syn::parse_file(src).ok()?);
+        let twice = prettyplease::unparse(&syn::parse_file(&once).ok()?);
+        Some(once == twice)
+    }
+
+    /// What canonicalisation destroys. `syn`'s AST has no node for a plain comment, so
+    /// rewriting a repo into printer output deletes every one of them permanently.
+    /// Doc comments become attributes and survive.
+    #[derive(Debug, Default, PartialEq)]
+    pub struct Loss {
+        pub plain_comment_lines: usize,
+        pub plain_comment_bytes: usize,
+        pub doc_comment_lines: usize,
+        pub total_bytes: usize,
+    }
+
+    /// Splits the destroyed comments into the ones that could be SAVED by rewriting
+    /// them as doc comments (they sit between items, so they attach to the next one)
+    /// and the ones that cannot (inside a function body, where `///` is not legal).
+    /// Uses the composer's own node decomposition, so the split is structural rather
+    /// than an indentation guess.
+    pub fn migratable(path: &str, src: &str) -> (usize, usize) {
+        let Ok(nodes) = crate::projection::scan(&crate::projection::rust::Rust, path, src)
+        else {
+            return (0, 0);
+        };
+        let (mut between, mut inside) = (0usize, 0usize);
+        for n in &nodes {
+            for line in n.text.lines() {
+                let t = line.trim_start();
+                let plain = (t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!"))
+                    || t.starts_with("/*");
+                if !plain {
+                    continue;
+                }
+                if n.kind == "trivia" {
+                    between += 1;
+                } else {
+                    inside += 1;
+                }
+            }
+        }
+        (between, inside)
+    }
+
+    pub fn loss(src: &str) -> Loss {
+        let mut l = Loss {
+            total_bytes: src.len(),
+            ..Default::default()
+        };
+        let stripped = crate::roundtrip::regen::strip_plain_comments(src);
+        l.plain_comment_bytes = src.len().saturating_sub(stripped.len());
+        for line in src.lines() {
+            let t = line.trim_start();
+            if t.starts_with("///") || t.starts_with("//!") {
+                l.doc_comment_lines += 1;
+            } else if t.starts_with("//") || t.starts_with("/*") || t.starts_with("*") {
+                l.plain_comment_lines += 1;
+            }
+        }
+        l
     }
 }
 
@@ -667,263 +487,6 @@ mod regen_tests {
     }
 }
 
-
-#[cfg(test)]
-mod compose_tests {
-    use crate::projection::compose::*;
-
-    /// Scan a whole repository into nodes, regenerate every file, diff the tree.
-    ///
-    /// This is the end-to-end claim `graph-model.md` makes — files are a projection of
-    /// the graph — reduced to something that either holds byte-for-byte or does not.
-    /// `CORRODE_SCAN_REPO` points it at any repo; the default is this one.
-    #[test]
-    fn scan_and_regenerate_a_repository() {
-        let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .to_string_lossy()
-                .into_owned()
-        });
-        let listed = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["ls-files", "-s", "-z"])
-            .output()
-            .expect("git ls-files");
-        let files: Vec<String> = String::from_utf8_lossy(&listed.stdout)
-            .split('\0')
-            .filter_map(|rec| {
-                let (meta, path) = rec.split_once('\t')?;
-                let mode = meta.split_whitespace().next()?;
-                (matches!(mode, "100644" | "100755") && path.ends_with(".rs"))
-                    .then(|| path.to_string())
-            })
-            .collect();
-
-        let (mut ok, mut mismatched, mut unparseable) = (0usize, 0usize, 0usize);
-        let (mut nodes_total, mut bytes_total) = (0usize, 0usize);
-        let mut kinds: std::collections::BTreeMap<&'static str, usize> = Default::default();
-        let mut failures: Vec<String> = Vec::new();
-
-        for rel in &files {
-            let full = std::path::Path::new(&repo).join(rel);
-            let Ok(src) = std::fs::read_to_string(&full) else {
-                continue;
-            };
-            match scan(rel, &src) {
-                Err(_) => unparseable += 1,
-                Ok(nodes) => {
-                    let rebuilt = regenerate(&nodes);
-                    if rebuilt == src {
-                        ok += 1;
-                        nodes_total += nodes.len();
-                        bytes_total += src.len();
-                        for n in &nodes {
-                            *kinds.entry(n.kind).or_default() += 1;
-                        }
-                    } else {
-                        mismatched += 1;
-                        if failures.len() < 5 {
-                            let at = src
-                                .bytes()
-                                .zip(rebuilt.bytes())
-                                .position(|(a, b)| a != b)
-                                .unwrap_or(src.len().min(rebuilt.len()));
-                            failures.push(format!(
-                                "{rel}: first diff at byte {at} (src {} bytes, rebuilt {})",
-                                src.len(),
-                                rebuilt.len()
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        eprintln!("--- scan + regenerate: {} .rs files in {repo} ---", files.len());
-        eprintln!("  byte-exact {ok}, mismatched {mismatched}, unparseable {unparseable}");
-        eprintln!("  {nodes_total} nodes over {bytes_total} bytes");
-        let trivia = kinds.get("trivia").copied().unwrap_or(0);
-        eprintln!(
-            "  node kinds: {}",
-            kinds
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        eprintln!(
-            "  {:.1}% of nodes are real items (rest trivia)",
-            100.0 * (nodes_total - trivia) as f64 / nodes_total.max(1) as f64
-        );
-        for f in &failures {
-            eprintln!("  MISMATCH {f}");
-        }
-
-        assert!(!files.is_empty(), "no .rs files found in {repo}");
-        assert_eq!(mismatched, 0, "regeneration was not byte-exact");
-    }
-
-    /// Positions are an OUTPUT of projection, not node state.
-    ///
-    /// The distinction is not academic: a dynamically generated VFS projects files
-    /// that were never on disk, from nodes that get reordered, inserted and edited. A
-    /// byte offset or line number stored on a node is a fact about one source text,
-    /// so it is stale or meaningless the moment the graph moves. This asserts that
-    /// `project` reports the truth after a mutation that would invalidate any stored
-    /// position.
-    #[test]
-    fn positions_are_recomputed_not_stored() {
-        let src = "use a::b;\n\nfn one() {}\n\nfn two() {}\n";
-        let nodes = scan("t.rs", src).unwrap();
-        let (text, places) = project(&nodes);
-        assert_eq!(text, src, "projection reproduces the source");
-
-        let line_of = |ord: usize| places.iter().find(|p| p.ordinal == ord).unwrap().start_line;
-        let two = nodes.iter().find(|n| n.text.contains("fn two")).unwrap();
-        assert_eq!(line_of(two.ordinal), 5, "fn two starts at line 5");
-        let stored_before = two.scan_line;
-
-        // Now do what a live graph does: insert a node ahead of it.
-        let mut mutated: Vec<Node> = nodes
-            .iter()
-            .cloned()
-            .map(|mut n| {
-                n.ordinal += 2;
-                n
-            })
-            .collect();
-        mutated.push(Node {
-            path: "t.rs".into(),
-            ordinal: 0,
-            kind: "use",
-            text: "use inserted::thing;".into(),
-            scan_line: 0,
-        });
-        mutated.push(Node {
-            path: "t.rs".into(),
-            ordinal: 1,
-            kind: "trivia",
-            text: "\n\n".into(),
-            scan_line: 0,
-        });
-
-        let (text2, places2) = project(&mutated);
-        assert!(text2.starts_with("use inserted::thing;"), "insert took effect");
-        let two_after = places2
-            .iter()
-            .find(|p| p.ordinal == two.ordinal + 2)
-            .expect("fn two still projected");
-        assert_eq!(
-            two_after.start_line,
-            stored_before + 2,
-            "two inserted lines shifted it; projection reports the new line"
-        );
-        // The node's own `scan_line` is now wrong — which is exactly why a projector
-        // must never read it.
-        assert_ne!(
-            stored_before, two_after.start_line,
-            "a stored position would have been stale here"
-        );
-    }
-
-    /// Comments bind to (node, line-within-node), so they survive the same mutation.
-    /// An absolute line would not.
-    #[test]
-    fn comment_attachment_survives_reordering() {
-        use crate::projection::comments::*;
-        let src = "fn f() {\n    // explains the loop\n    let x = 1;\n}\n";
-        let nodes = scan("t.rs", src).unwrap();
-        let refs = extract("t.rs", src, &nodes);
-        let c = refs.iter().find(|c| c.text.contains("explains")).expect("found");
-        assert_eq!(c.line_in_node, 2, "second line of its node");
-
-        // Shift the whole file down; the relative position is unchanged, the absolute
-        // one is not.
-        let shifted = format!("// header\n\n{src}");
-        let nodes2 = scan("t.rs", &shifted).unwrap();
-        let refs2 = extract("t.rs", &shifted, &nodes2);
-        let c2 = refs2.iter().find(|c| c.text.contains("explains")).expect("found");
-        assert_eq!(c2.line_in_node, 2, "line WITHIN the node is stable");
-        assert_ne!(c.abs_line, c2.abs_line, "the absolute line moved");
-    }
-}
-
-/// The canonical-form alternative: instead of preserving arbitrary source, rewrite the
-/// repo ONCE into the projector's own form, after which regeneration is exact because
-/// the source is already what the printer emits.
-///
-/// Measured and REJECTED ON COST, not feasibility: the printer reaches a fixed point in
-/// two passes, but canonicalising destroys 35,477 body comments that no migration can
-/// recover. Kept so the measurement can be re-run rather than re-argued.
-pub mod canonical {
-    /// Does printing a canonical file reproduce it? If the printer is not idempotent
-    /// there is no fixed point to converge on and the scheme has no foundation.
-    pub fn is_idempotent(src: &str) -> Option<bool> {
-        let once = prettyplease::unparse(&syn::parse_file(src).ok()?);
-        let twice = prettyplease::unparse(&syn::parse_file(&once).ok()?);
-        Some(once == twice)
-    }
-
-    /// What canonicalisation destroys. `syn`'s AST has no node for a plain comment, so
-    /// rewriting a repo into printer output deletes every one of them permanently.
-    /// Doc comments become attributes and survive.
-    #[derive(Debug, Default, PartialEq)]
-    pub struct Loss {
-        pub plain_comment_lines: usize,
-        pub plain_comment_bytes: usize,
-        pub doc_comment_lines: usize,
-        pub total_bytes: usize,
-    }
-
-    /// Splits the destroyed comments into the ones that could be SAVED by rewriting
-    /// them as doc comments (they sit between items, so they attach to the next one)
-    /// and the ones that cannot (inside a function body, where `///` is not legal).
-    /// Uses the composer's own node decomposition, so the split is structural rather
-    /// than an indentation guess.
-    pub fn migratable(path: &str, src: &str) -> (usize, usize) {
-        let Ok(nodes) = crate::projection::compose::scan(path, src) else {
-            return (0, 0);
-        };
-        let (mut between, mut inside) = (0usize, 0usize);
-        for n in &nodes {
-            for line in n.text.lines() {
-                let t = line.trim_start();
-                let plain = (t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!"))
-                    || t.starts_with("/*");
-                if !plain {
-                    continue;
-                }
-                if n.kind == "trivia" {
-                    between += 1;
-                } else {
-                    inside += 1;
-                }
-            }
-        }
-        (between, inside)
-    }
-
-    pub fn loss(src: &str) -> Loss {
-        let mut l = Loss {
-            total_bytes: src.len(),
-            ..Default::default()
-        };
-        let stripped = crate::roundtrip::regen::strip_plain_comments(src);
-        l.plain_comment_bytes = src.len().saturating_sub(stripped.len());
-        for line in src.lines() {
-            let t = line.trim_start();
-            if t.starts_with("///") || t.starts_with("//!") {
-                l.doc_comment_lines += 1;
-            } else if t.starts_with("//") || t.starts_with("/*") || t.starts_with("*") {
-                l.plain_comment_lines += 1;
-            }
-        }
-        l
-    }
-}
-
 #[cfg(test)]
 mod canonical_tests {
     use super::canonical::*;
@@ -993,143 +556,6 @@ mod canonical_tests {
             "  of the destroyed: {between_items} between items (could migrate to ///), \
              {inside_bodies} inside bodies (unrecoverable — /// is not legal there)"
         );
-        assert!(!files.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod attach_tests {
-    use crate::projection::compose::*;
-
-
-}
-
-
-
-#[cfg(test)]
-mod describes_tests {
-    use crate::projection::comments;
-    use crate::projection::compose;
-    use crate::projection::describes::*;
-
-    const SRC: &str = "\
-/// documented
-fn outer() {
-    // sets the seed
-    let seed = 7;
-    let x = compute(seed); // trailing note
-    match x {
-        // the happy path
-        Ok(v) => use_it(v),
-        Err(_) => {}
-    }
-}
-";
-
-    fn edges_for(src: &str) -> Vec<Edge> {
-        let nodes = compose::scan("t.rs", src).unwrap();
-        let cs = comments::extract("t.rs", src, &nodes);
-        let anchors = anchors(src).unwrap();
-        bind(src, &cs, &anchors)
-    }
-
-    /// Query 1: what is this comment describing?
-    #[test]
-    fn a_comment_resolves_to_the_element_it_describes() {
-        let edges = edges_for(SRC);
-        let find = |needle: &str| {
-            edges
-                .iter()
-                .find(|e| e.comment.text.contains(needle))
-                .unwrap_or_else(|| panic!("no comment matching {needle}"))
-        };
-
-        let seed = find("sets the seed");
-        assert_eq!(seed.relation, Relation::Precedes);
-        let t = seed.target.as_ref().expect("has a target");
-        assert_eq!(t.kind, "stmt");
-        assert!(SRC[t.start..t.end].starts_with("let seed"), "{:?}", &SRC[t.start..t.end]);
-
-        // A trailing comment describes the code to its LEFT, not the next line.
-        let trailing = find("trailing note");
-        assert_eq!(trailing.relation, Relation::Trailing);
-        let t = trailing.target.as_ref().expect("has a target");
-        assert!(SRC[t.start..t.end].contains("compute(seed)"), "{:?}", &SRC[t.start..t.end]);
-
-        // Sub-item granularity: a comment inside a match binds to the arm.
-        let arm = find("happy path");
-        let t = arm.target.as_ref().expect("has a target");
-        assert_eq!(t.kind, "match_arm");
-        assert!(SRC[t.start..t.end].starts_with("Ok(v)"), "{:?}", &SRC[t.start..t.end]);
-    }
-
-    /// Query 2: what commentary applies to this region of code?
-    #[test]
-    fn a_region_resolves_to_the_commentary_about_it() {
-        let edges = edges_for(SRC);
-        let match_start = SRC.find("match x").unwrap();
-        let match_end = SRC[match_start..].find("\n    }").unwrap() + match_start;
-
-        let found = comments_for(&edges, match_start, match_end);
-        let texts: Vec<&str> = found.iter().map(|e| e.comment.text.trim()).collect();
-        assert!(
-            texts.iter().any(|t| t.contains("happy path")),
-            "the arm's comment belongs to the match region: {texts:?}"
-        );
-        assert!(
-            !texts.iter().any(|t| t.contains("sets the seed")),
-            "a comment about an earlier statement does not: {texts:?}"
-        );
-    }
-
-    /// Over a real repo: how much commentary actually binds to something?
-    #[test]
-    fn binding_census() {
-        let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .to_string_lossy()
-                .into_owned()
-        });
-        let out = std::process::Command::new("git")
-            .arg("-C").arg(&repo).args(["ls-files", "-s", "-z"])
-            .output().expect("git");
-        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .split('\0')
-            .filter_map(|r| {
-                let (m, p) = r.split_once('\t')?;
-                (matches!(m.split_whitespace().next()?, "100644" | "100755") && p.ends_with(".rs"))
-                    .then(|| p.to_string())
-            })
-            .collect();
-
-        let (mut bound, mut unbound) = (0usize, 0usize);
-        let mut rel: std::collections::BTreeMap<&'static str, usize> = Default::default();
-        let mut kinds: std::collections::BTreeMap<&'static str, usize> = Default::default();
-        for f in &files {
-            let Ok(src) = std::fs::read_to_string(std::path::Path::new(&repo).join(f)) else { continue };
-            let Ok(nodes) = compose::scan(f, &src) else { continue };
-            let Ok(a) = anchors(&src) else { continue };
-            for e in bind(&src, &comments::extract(f, &src, &nodes), &a) {
-                if !is_plain(&e.comment) { continue; }
-                match &e.target {
-                    Some(t) => {
-                        bound += 1;
-                        *kinds.entry(t.kind).or_default() += 1;
-                        *rel.entry(match e.relation {
-                            Relation::Precedes => "precedes",
-                            Relation::Trailing => "trailing",
-                            Relation::Encloses => "encloses",
-                        }).or_default() += 1;
-                    }
-                    None => unbound += 1,
-                }
-            }
-        }
-        eprintln!("--- comment binding over {} files ---", files.len());
-        eprintln!("  plain comments bound to an element: {bound}, unbound: {unbound}");
-        eprintln!("  relation: {}", rel.iter().map(|(k,v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
-        eprintln!("  target kinds: {}", kinds.iter().map(|(k,v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
         assert!(!files.is_empty());
     }
 }
