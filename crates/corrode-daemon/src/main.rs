@@ -29,6 +29,7 @@ mod server;
 mod session;
 mod skills;
 mod swarm;
+mod telemetry;
 mod terminal;
 mod toolcall;
 mod tools;

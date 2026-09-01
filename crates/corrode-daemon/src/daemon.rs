@@ -17,6 +17,7 @@ use crate::roles::{Role, RoleModels};
 use crate::session::{RepoResources, Session, SessionKey};
 use crate::skills::SkillContext;
 use crate::swarm::{Swarm, Task};
+use crate::telemetry::Telemetry;
 use crate::toolcall::ToolCaller;
 use crate::tools::ToolBox;
 use crate::vfs::{PassthroughVfs, Vfs};
@@ -81,6 +82,8 @@ pub struct Daemon {
     tool_caller: Option<Arc<dyn ToolCaller>>,
     /// Per-model tool dialects (schema/names/parse), matched to the tool-call model.
     dialects: Arc<Dialects>,
+    /// Per-task JSONL record. Disabled unless `CORRODE_TELEMETRY` names a path.
+    telemetry: Arc<Telemetry>,
     /// Optional bubblewrap confinement for every process the daemon spawns. Off
     /// unless `CORRODE_SANDBOX` is set; each session's terminals bind its own repo.
     sandbox: crate::sandbox::Sandbox,
@@ -114,6 +117,10 @@ impl Daemon {
         project: Project,
         dialects: Arc<Dialects>,
     ) -> Self {
+        let telemetry = Arc::new(Telemetry::from_env());
+        if telemetry.enabled() {
+            eprintln!("telemetry: recording to $CORRODE_TELEMETRY");
+        }
         let sandbox = crate::sandbox::Sandbox::from_env();
         let default_repo = canonical(&repo_root.to_string_lossy());
         // The default repo's resources come pre-built from `main` (or a test); seed
@@ -133,6 +140,7 @@ impl Daemon {
             roles,
             tool_caller,
             dialects,
+            telemetry,
             sandbox,
             next_plan_id: std::sync::atomic::AtomicU64::new(0),
             repos: Mutex::new(repos),
@@ -370,6 +378,8 @@ impl Daemon {
                     let owner_token = session.owner_token.clone();
                     let sandbox = self.sandbox.clone();
                     let dialects = Arc::clone(&self.dialects);
+                    let telemetry = Arc::clone(&self.telemetry);
+                    let telemetry_plan = plan_id.clone();
                     let id = task.id;
                     let role = task.role;
                     // The swarm-knowledge digest rides the divergent tail — the
@@ -391,6 +401,7 @@ impl Daemon {
                         let toolbox = ToolBox::new(vfs, root, skill_scripts)
                             .with_sandbox(sandbox)
                             .with_owner_token(owner_token);
+                        let started = std::time::Instant::now();
                         let output = if role == Role::Coder && fanout > 1 {
                             run_fanout(
                                 fanout,
@@ -431,6 +442,25 @@ impl Daemon {
                             )
                             .await
                         };
+
+                        // One line per execution, before follow-up emission so a task
+                        // that fails is still recorded (see `telemetry.rs`).
+                        telemetry.record(&crate::telemetry::TaskRecord {
+                            at: crate::telemetry::now_secs(),
+                            plan: &telemetry_plan,
+                            task: id,
+                            role: role.as_str(),
+                            model: &model,
+                            band: band.as_u8(),
+                            fanout: if role == Role::Coder { fanout } else { 1 },
+                            prefix_bytes: prefix.len(),
+                            task_bytes: prompt.len(),
+                            output_bytes: output.as_ref().map(|t| t.len()).unwrap_or(0),
+                            duration_ms: started.elapsed().as_millis(),
+                            artifacts: artifacts.len(),
+                            ok: output.is_ok(),
+                            error: output.as_ref().err().map(|e| e.to_string()),
+                        });
 
                         let emitted = match &output {
                             Ok(text) => emit_followups(tool_caller, &dialects, text).await,
