@@ -809,6 +809,44 @@ pub mod compose {
         src[..byte].bytes().filter(|b| *b == b'\n').count() + 1
     }
 
+    /// Attach each trivia block's comment to the item that follows it.
+    ///
+    /// Comments are absent from syn's AST — Rust's lexer discards them before a token
+    /// stream exists, so nothing built on proc-macro2 can see one. They are NOT absent
+    /// from the source, and `Span::byte_range()` says where every item begins, so the
+    /// text between items is recoverable and can be associated structurally.
+    ///
+    /// This is why a comment-aware *parser* is not required for projection: the
+    /// composer keeps the bytes, and attachment is a post-pass over positions we
+    /// already have. A lossless CST (rust-analyzer's `ra_ap_syntax`, built on rowan)
+    /// would be the tool if comments had to attach to sub-item elements — a comment on
+    /// one statement inside a function — which spans alone cannot resolve.
+    pub fn attach_comments(nodes: &[Node]) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for (i, n) in nodes.iter().enumerate() {
+            if n.kind != "trivia" {
+                continue;
+            }
+            let comment: String = n
+                .text
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("//") || t.starts_with("/*") || t.starts_with('*')
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if comment.trim().is_empty() {
+                continue;
+            }
+            // The next non-trivia node is the item this comment introduces.
+            if let Some(target) = nodes.iter().skip(i + 1).find(|m| m.kind != "trivia") {
+                out.push((target.ordinal, comment));
+            }
+        }
+        out
+    }
+
     /// Reassemble a file from its nodes. This is the whole composer.
     pub fn regenerate(nodes: &[Node]) -> String {
         let mut out = String::new();
@@ -1097,6 +1135,77 @@ mod canonical_tests {
             "  of the destroyed: {between_items} between items (could migrate to ///), \
              {inside_bodies} inside bodies (unrecoverable — /// is not legal there)"
         );
+        assert!(!files.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use super::compose::*;
+
+    /// Comments are recoverable and attachable even though syn cannot see them.
+    #[test]
+    fn comments_attach_to_the_item_they_introduce() {
+        let src = "\
+// explains the constant
+const A: u8 = 1;
+
+// explains the function
+// on two lines
+fn f() {}
+";
+        let nodes = scan("t.rs", src).unwrap();
+        let attached = attach_comments(&nodes);
+        assert_eq!(attached.len(), 2, "both comments attached: {attached:?}");
+
+        let kind_of = |ord: usize| nodes.iter().find(|n| n.ordinal == ord).unwrap().kind;
+        assert_eq!(kind_of(attached[0].0), "const");
+        assert!(attached[0].1.contains("explains the constant"));
+        assert_eq!(kind_of(attached[1].0), "fn");
+        assert!(attached[1].1.contains("on two lines"), "multi-line block kept together");
+
+        // And the file still regenerates byte-exactly: attachment is a VIEW over the
+        // nodes, not a transformation of them.
+        assert_eq!(regenerate(&nodes), src);
+    }
+
+    /// How much of a real repo's commentary can be attached structurally?
+    #[test]
+    fn attachment_census() {
+        let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let out = std::process::Command::new("git")
+            .arg("-C").arg(&repo).args(["ls-files", "-s", "-z"])
+            .output().expect("git");
+        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter_map(|r| {
+                let (m, p) = r.split_once('\t')?;
+                (matches!(m.split_whitespace().next()?, "100644" | "100755") && p.ends_with(".rs"))
+                    .then(|| p.to_string())
+            })
+            .collect();
+        let (mut attached, mut inside) = (0usize, 0usize);
+        for rel in &files {
+            let Ok(src) = std::fs::read_to_string(std::path::Path::new(&repo).join(rel)) else { continue };
+            let Ok(nodes) = scan(rel, &src) else { continue };
+            attached += attach_comments(&nodes).len();
+            for n in nodes.iter().filter(|n| n.kind != "trivia") {
+                inside += n.text.lines().filter(|l| {
+                    let t = l.trim_start();
+                    (t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!"))
+                        || t.starts_with("/*")
+                }).count();
+            }
+        }
+        eprintln!("--- comment attachment over {} files ---", files.len());
+        eprintln!("  {attached} comment blocks attached to the item they introduce");
+        eprintln!("  {inside} plain-comment lines live INSIDE item bodies (kept verbatim in the node,");
+        eprintln!("    attachable to a sub-item element only with a lossless CST)");
         assert!(!files.is_empty());
     }
 }

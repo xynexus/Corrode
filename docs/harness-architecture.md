@@ -466,6 +466,26 @@ abandoned. Trading them for a simpler VFS buys implementation convenience with
 institutional memory. The verbatim-span composer already delivers byte-exactness, so
 the simplification is not needed to make projection work — only to make it tidier.
 
+**Comments are lost in the lexer, not in `syn`.** Rust's grammar treats a plain
+comment as trivia and emits no token for it; a doc comment is desugared to
+`#[doc = "..."]`. Parsing `// plain\n/// doc\nfn f() { /* inner */ let x = 1; }` yields
+the token stream `# [doc = " doc"] fn f () { let x = 1 ; }` — both plain comments are
+simply absent. So `syn` cannot be asked to attach them: nothing built on the
+proc-macro token model can see one.
+
+It does not need to. `Span::byte_range()` locates every item in the ORIGINAL source, so
+the text between items is recoverable and attachment is a post-pass over positions we
+already hold: 2,187 comment blocks in hipfire bind to the item they introduce, and the
+file still regenerates byte-exactly because attachment is a view over the nodes rather
+than a transformation of them.
+
+The limit is sub-item granularity. **35,477 plain-comment lines live inside function
+bodies**, kept verbatim inside their node but not attachable to the statement they
+describe. Resolving those needs a lossless concrete syntax tree — rust-analyzer's
+`ra_ap_syntax`, built on `rowan`, which keeps every byte including trivia as a node.
+That is the right tool if comments must attach to sub-item elements; it is not needed
+for projection, which spans already satisfy.
+
 Line numbers fall out of the same mechanism. A node knows where it lands, so
 `path:line` is derived at projection time; an edit above a node shifts it, which is
 exactly why deriving beats persisting.
