@@ -413,7 +413,7 @@ falsify it.
 |---|---|---|---|
 | A shared prefix is prefilled once and reused | **FALSE today** | `cached_tokens > 0` on a repeated prefix | §3.2 entirely; all layering |
 | Item decomposition is total (necessary for composition) | **TRUE** — 99.6-99.9% item bytes, remainder pure whitespace, 92 files / 4 crates | `roundtrip.rs` census | graph-backed VFS; derived line numbers |
-| Regenerating an item from structured form is byte-exact | **UNTESTED** (tier 2, needs a parser) | round-trip through `syn` + `prettyplease` | `ProjectionMode::Composed`; the macro story |
+| Regenerating an item from structured form is byte-exact | **FALSE** — 0 of 91 files, 3 crates | `roundtrip::regen` census | `ProjectionMode::Composed` as regeneration; the `FallbackReason` variants |
 | The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
 | Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
 | The graph is the source of truth, files a projection | **aspiration** | — | bijective line numbers |
@@ -426,6 +426,20 @@ asserting the economics of it. "Metadata latency will dominate a FUSE build" —
 is 1.5x, bulk reads are 16x, so the hypothesis was not merely unproven but inverted.
 
 Two habits follow, and both are cheap:
+
+**A composed file must store its text, not regenerate it.** Tier 1 showed
+decomposition is total (99.6-99.9% item bytes, remainder whitespace). Tier 2 showed
+regeneration through `syn` + `prettyplease` is byte-exact for **0 of 91 files** across
+three crates, for two independent reasons: plain comments have no node in the AST and
+are simply gone, and the printer canonicalises — it adds a trailing comma when it
+breaks a parameter list, which is semantically null and textually divergent.
+
+That settles what `Composed` can mean. Composition must concatenate each node's
+verbatim span; `syn` supplies *structure* (signatures, calls, types) for querying, not
+*content* for rendering. Byte-exactness then holds by construction rather than by the
+printer's good behaviour — and the `FallbackReason` variants describe failure modes of
+the regeneration approach the measurement rules out, so they want revisiting rather
+than implementing.
 
 **Measure the artifact, not a proxy.** The prefix defect was invisible until someone
 printed the literal prefix. A sibling-discrimination run produced a dramatic false

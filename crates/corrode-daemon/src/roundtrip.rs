@@ -232,7 +232,7 @@ fn item_start_after(b: &[u8], prev_end: usize) -> usize {
     j
 }
 
-fn raw_string_start(b: &[u8], i: usize) -> Option<(usize, usize)> {
+pub(super) fn raw_string_start(b: &[u8], i: usize) -> Option<(usize, usize)> {
     let mut j = i;
     if b[j] == b'b' {
         j += 1;
@@ -253,7 +253,7 @@ fn raw_string_start(b: &[u8], i: usize) -> Option<(usize, usize)> {
     }
 }
 
-fn raw_string_end(b: &[u8], body: usize, hashes: usize) -> Option<usize> {
+pub(super) fn raw_string_end(b: &[u8], body: usize, hashes: usize) -> Option<usize> {
     let mut j = body;
     while j < b.len() {
         if b[j] == b'"' && b[j + 1..].iter().take(hashes).all(|c| *c == b'#') && j + hashes < b.len()
@@ -265,7 +265,7 @@ fn raw_string_end(b: &[u8], body: usize, hashes: usize) -> Option<usize> {
     None
 }
 
-fn plain_string_end(b: &[u8], i: usize) -> Option<usize> {
+pub(super) fn plain_string_end(b: &[u8], i: usize) -> Option<usize> {
     let mut j = i + 1;
     while j < b.len() {
         match b[j] {
@@ -390,5 +390,279 @@ mod tests {
             kinds.blank, kinds.comment, kinds.attribute, kinds.other
         );
         assert!(files > 0, "no sources scanned");
+    }
+}
+
+/// Tier 2: can an item be REGENERATED from its parsed form byte-for-byte?
+///
+/// Tier 1 showed decomposition is total — items plus whitespace account for every
+/// byte. That makes verbatim composition possible. Tier 2 asks the harder question
+/// `ProjectionMode::Composed` actually poses: if a node stores *structure* rather than
+/// text, does rendering it back reproduce the source?
+///
+/// This is where [`crate::FallbackReason`]'s variants were always going to live.
+pub mod regen {
+    use corrode_core::FallbackReason;
+
+    /// Outcome of regenerating one file through `syn` -> `prettyplease`.
+    #[derive(Debug, PartialEq)]
+    pub enum Regen {
+        /// Byte-identical to the source.
+        Exact,
+        /// Parsed and printed, but diverged. Carries the classification and the first
+        /// differing byte offset — the same information `UnknownDivergence` exists for.
+        Diverged(FallbackReason),
+        /// `syn` could not parse it at all.
+        Unparseable(String),
+    }
+
+    /// Parse `src` as a Rust file, print it back, and classify any divergence.
+    pub fn regenerate(src: &str) -> Regen {
+        let file = match syn::parse_file(src) {
+            Ok(f) => f,
+            Err(e) => return Regen::Unparseable(e.to_string()),
+        };
+        let printed = prettyplease::unparse(&file);
+        if printed == src {
+            return Regen::Exact;
+        }
+        Regen::Diverged(classify(src, &printed))
+    }
+
+    /// Is the divergence only in whitespace?
+    ///
+    /// Deliberately coarse, and the limit is worth stating: this cannot separate
+    /// "content was lost" from "the printer canonicalised". prettyplease adds a
+    /// trailing comma when it breaks a parameter list — semantically null, but a real
+    /// token, so no text-level comparison classifies it as formatting. A sound split
+    /// needs token-level comparison, and even then the trailing comma is a token.
+    ///
+    /// Two attempts at a finer classification were wrong before this one: splitting on
+    /// whitespace made cosmetic reflow look like content loss, and stripping whitespace
+    /// still cannot see a canonicalised comma. The census reports what it can defend.
+    pub fn formatting_only(src: &str, printed: &str) -> bool {
+        // Remove whitespace ENTIRELY rather than normalising runs of it. Splitting on
+        // whitespace and rejoining looks equivalent and is not: `lookup(&self,` is one
+        // token and `lookup( &self,` is two, so a purely cosmetic reflow inside a
+        // parameter list reads as changed content. That mistake turned 76 of 78 files
+        // into false "content lost" results on the first run of this census.
+        let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        strip(src) == strip(printed)
+    }
+
+    /// Regenerate and report both the classification and whether the loss was purely
+    /// cosmetic — the pair a schema decision actually needs.
+    pub fn diagnose(src: &str) -> (Regen, bool) {
+        let file = match syn::parse_file(src) {
+            Ok(f) => f,
+            Err(e) => return (Regen::Unparseable(e.to_string()), false),
+        };
+        let printed = prettyplease::unparse(&file);
+        if printed == src {
+            return (Regen::Exact, true);
+        }
+        let fmt_only = formatting_only(src, &printed);
+        (Regen::Diverged(classify(src, &printed)), fmt_only)
+    }
+
+    /// Strip plain (non-doc) comments, respecting strings and raw strings, so the
+    /// census can ATTRIBUTE divergence rather than assume its cause. If a file
+    /// regenerates exactly once its comments are gone, comment loss explains it.
+    pub fn strip_plain_comments(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        while i < b.len() {
+            // Doc comments are attributes in the AST and DO survive; keep them.
+            if b[i] == b'/' && i + 2 < b.len() && b[i + 1] == b'/' {
+                let doc = b[i + 2] == b'/' || b[i + 2] == b'!';
+                let start = i;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                if doc {
+                    out.push_str(&src[start..i]);
+                }
+                continue;
+            }
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                let mut nest = 1;
+                i += 2;
+                while i + 1 < b.len() && nest > 0 {
+                    if b[i] == b'/' && b[i + 1] == b'*' {
+                        nest += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b[i + 1] == b'/' {
+                        nest -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            if let Some((body, hashes)) = super::raw_string_start(b, i) {
+                if let Some(e) = super::raw_string_end(b, body, hashes) {
+                    out.push_str(&src[i..e]);
+                    i = e;
+                    continue;
+                }
+            }
+            if b[i] == b'"' {
+                if let Some(e) = super::plain_string_end(b, i) {
+                    out.push_str(&src[i..e]);
+                    i = e;
+                    continue;
+                }
+            }
+            let ch_end = i + src[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+            out.push_str(&src[i..ch_end]);
+            i = ch_end;
+        }
+        out
+    }
+
+    /// Attribute a divergence to a cause, in the order the causes actually dominate.
+    ///
+    /// The order matters: a file can have several of these at once, and reporting the
+    /// most explanatory one is the point. A `#[rustfmt::skip]` region is *intentionally*
+    /// non-canonical, so it outranks a generic formatting difference.
+    fn classify(src: &str, printed: &str) -> FallbackReason {
+        if src.contains("rustfmt::skip") {
+            return FallbackReason::RustfmtSkip;
+        }
+        // A non-doc comment cannot survive: `syn`'s AST has no node for it. Doc
+        // comments become attributes and do survive, so only plain ones count.
+        if has_plain_comment(src) && !has_plain_comment(printed) {
+            return FallbackReason::MacroExpansion.pick_comment_loss();
+        }
+        if src.contains("r#\"") || src.contains("br#\"") {
+            return FallbackReason::RawStringMismatch;
+        }
+        if src.contains("macro_rules!") || src.contains("!(") || src.contains("![") {
+            return FallbackReason::MacroExpansion;
+        }
+        let first_diff = src
+            .bytes()
+            .zip(printed.bytes())
+            .position(|(a, b)| a != b)
+            .unwrap_or(src.len().min(printed.len())) as u64;
+        FallbackReason::UnknownDivergence {
+            first_diff_offset: first_diff,
+        }
+    }
+
+    /// A `//` or `/* */` comment that is not a doc comment.
+    fn has_plain_comment(s: &str) -> bool {
+        s.lines().any(|l| {
+            let t = l.trim_start();
+            (t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!"))
+                || t.starts_with("/*")
+        })
+    }
+
+    /// `FallbackReason` has no comment-loss variant. Rather than invent one here, this
+    /// names the gap explicitly: comment loss is the DOMINANT divergence for `syn`
+    /// regeneration and the enum does not model it.
+    trait CommentLoss {
+        fn pick_comment_loss(self) -> FallbackReason;
+    }
+    impl CommentLoss for FallbackReason {
+        fn pick_comment_loss(self) -> FallbackReason {
+            // ponytail: reported as UnknownDivergence(0) until `FallbackReason` gains a
+            // `CommentsDropped` variant — inventing one in a check module would put the
+            // wire type's shape in the wrong crate.
+            FallbackReason::UnknownDivergence {
+                first_diff_offset: 0,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod regen_tests {
+    use super::regen::*;
+
+    /// Tier 2 over real Rust. Like the tier-1 census this PRINTS rather than
+    /// thresholds: the point is to learn what regeneration actually costs before
+    /// anything depends on `Composed`.
+    #[test]
+    fn regeneration_census() {
+        let dir = match std::env::var("CORRODE_CENSUS_DIR") {
+            Ok(d) => std::path::PathBuf::from(d),
+            Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        };
+        let (mut exact, mut diverged, mut unparseable) = (0usize, 0usize, 0usize);
+        let (mut fmt_recoverable, mut beyond_ws) = (0usize, 0usize);
+        let mut comments_explain = 0usize;
+        let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
+
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            match regenerate(&src) {
+                Regen::Exact => exact += 1,
+                Regen::Diverged(r) => {
+                    diverged += 1;
+                    let (_, fmt_only) = diagnose(&src);
+                    if fmt_only {
+                        fmt_recoverable += 1;
+                    } else {
+                        beyond_ws += 1;
+                        // Attribution: does removing plain comments make it exact?
+                        let stripped = strip_plain_comments(&src);
+                        if let Ok(f) = syn::parse_file(&stripped) {
+                            if formatting_only(&stripped, &prettyplease::unparse(&f)) {
+                                comments_explain += 1;
+                            }
+                        }
+                    }
+                    let key = match r {
+                        corrode_core::FallbackReason::UnknownDivergence { .. } => {
+                            "UnknownDivergence".to_string()
+                        }
+                        other => format!("{other:?}"),
+                    };
+                    *reasons.entry(key).or_default() += 1;
+                }
+                Regen::Unparseable(_) => unparseable += 1,
+            }
+        }
+        let total = exact + diverged + unparseable;
+        eprintln!("--- regeneration census: {total} files ---");
+        eprintln!("  exact {exact}, diverged {diverged}, unparseable {unparseable}");
+        eprintln!("  of the diverged: {fmt_recoverable} whitespace-only, {beyond_ws} differ beyond whitespace");
+        eprintln!("  of those: {comments_explain} become whitespace-only once plain comments are removed");
+        eprintln!("  (remainder is canonicalisation — prettyplease adds trailing commas when it");
+        eprintln!("   breaks a parameter list, which no text-level comparison can call formatting)");
+        for (r, n) in &reasons {
+            eprintln!("    {r}: {n}");
+        }
+        assert!(total > 0, "no sources scanned");
+    }
+
+    /// The specific thing that decides the schema: a plain comment has no node in
+    /// syn's AST, so regeneration cannot reproduce it. Doc comments become attributes
+    /// and do survive. This is why a node storing STRUCTURE cannot be byte-exact,
+    /// while a node storing its verbatim span can.
+    #[test]
+    fn plain_comments_do_not_survive_regeneration_but_doc_comments_do() {
+        let with_plain = "fn f() {\n    // a plain comment\n}\n";
+        assert_ne!(regenerate(with_plain), Regen::Exact, "plain comment survived?");
+
+        let with_doc = "/// documented\nfn f() {}\n";
+        let printed = match syn::parse_file(with_doc) {
+            Ok(f) => prettyplease::unparse(&f),
+            Err(e) => panic!("parse: {e}"),
+        };
+        assert!(printed.contains("/// documented"), "doc comment lost: {printed}");
+    }
+
+    #[test]
+    fn unparseable_input_is_reported_not_guessed() {
+        assert!(matches!(regenerate("fn ("), Regen::Unparseable(_)));
     }
 }
