@@ -952,3 +952,151 @@ mod compose_tests {
         );
     }
 }
+
+/// The canonical-form alternative: instead of preserving arbitrary source, rewrite the
+/// repo ONCE into the projector's own form, after which regeneration is exact because
+/// the source is already what the printer emits.
+///
+/// It would simplify a great deal — nodes hold structure with no verbatim text, no
+/// trivia nodes (half of them today), and item order becomes a property of the graph
+/// rather than of the file. Two things decide whether it is viable, and both are
+/// measurable rather than arguable.
+pub mod canonical {
+    /// Does printing a canonical file reproduce it? If the printer is not idempotent
+    /// there is no fixed point to converge on and the scheme has no foundation.
+    pub fn is_idempotent(src: &str) -> Option<bool> {
+        let once = prettyplease::unparse(&syn::parse_file(src).ok()?);
+        let twice = prettyplease::unparse(&syn::parse_file(&once).ok()?);
+        Some(once == twice)
+    }
+
+    /// What canonicalisation destroys. `syn`'s AST has no node for a plain comment, so
+    /// rewriting a repo into printer output deletes every one of them permanently.
+    /// Doc comments become attributes and survive.
+    #[derive(Debug, Default, PartialEq)]
+    pub struct Loss {
+        pub plain_comment_lines: usize,
+        pub plain_comment_bytes: usize,
+        pub doc_comment_lines: usize,
+        pub total_bytes: usize,
+    }
+
+    /// Splits the destroyed comments into the ones that could be SAVED by rewriting
+    /// them as doc comments (they sit between items, so they attach to the next one)
+    /// and the ones that cannot (inside a function body, where `///` is not legal).
+    /// Uses the composer's own node decomposition, so the split is structural rather
+    /// than an indentation guess.
+    pub fn migratable(path: &str, src: &str) -> (usize, usize) {
+        let Ok(nodes) = super::compose::scan(path, src) else {
+            return (0, 0);
+        };
+        let (mut between, mut inside) = (0usize, 0usize);
+        for n in &nodes {
+            for line in n.text.lines() {
+                let t = line.trim_start();
+                let plain = (t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!"))
+                    || t.starts_with("/*");
+                if !plain {
+                    continue;
+                }
+                if n.kind == "trivia" {
+                    between += 1;
+                } else {
+                    inside += 1;
+                }
+            }
+        }
+        (between, inside)
+    }
+
+    pub fn loss(src: &str) -> Loss {
+        let mut l = Loss {
+            total_bytes: src.len(),
+            ..Default::default()
+        };
+        let stripped = super::regen::strip_plain_comments(src);
+        l.plain_comment_bytes = src.len().saturating_sub(stripped.len());
+        for line in src.lines() {
+            let t = line.trim_start();
+            if t.starts_with("///") || t.starts_with("//!") {
+                l.doc_comment_lines += 1;
+            } else if t.starts_with("//") || t.starts_with("/*") || t.starts_with("*") {
+                l.plain_comment_lines += 1;
+            }
+        }
+        l
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::canonical::*;
+
+    /// Both halves of the canonical-form question, over a real repo.
+    #[test]
+    fn canonical_form_viability() {
+        let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["ls-files", "-s", "-z"])
+            .output()
+            .expect("git");
+        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter_map(|r| {
+                let (m, p) = r.split_once('\t')?;
+                (matches!(m.split_whitespace().next()?, "100644" | "100755") && p.ends_with(".rs"))
+                    .then(|| p.to_string())
+            })
+            .collect();
+
+        let (mut idem, mut not_idem, mut skipped) = (0usize, 0usize, 0usize);
+        let mut agg = Loss::default();
+        let (mut between_items, mut inside_bodies) = (0usize, 0usize);
+        for rel in &files {
+            let Ok(src) = std::fs::read_to_string(std::path::Path::new(&repo).join(rel)) else {
+                continue;
+            };
+            match is_idempotent(&src) {
+                Some(true) => idem += 1,
+                Some(false) => {
+                    not_idem += 1;
+                    eprintln!("  NOT IDEMPOTENT: {rel}");
+                }
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            let l = loss(&src);
+            agg.plain_comment_lines += l.plain_comment_lines;
+            agg.plain_comment_bytes += l.plain_comment_bytes;
+            agg.doc_comment_lines += l.doc_comment_lines;
+            agg.total_bytes += l.total_bytes;
+            let (b, i) = migratable(rel, &src);
+            between_items += b;
+            inside_bodies += i;
+        }
+
+        eprintln!("--- canonical-form viability over {} .rs files ---", files.len());
+        eprintln!("  printer idempotent: {idem} yes, {not_idem} no, {skipped} unparseable");
+        eprintln!(
+            "  destroyed by canonicalisation: {} plain-comment lines, {} bytes ({:.1}% of source)",
+            agg.plain_comment_lines,
+            agg.plain_comment_bytes,
+            100.0 * agg.plain_comment_bytes as f64 / agg.total_bytes.max(1) as f64
+        );
+        eprintln!("  preserved (become attributes): {} doc-comment lines", agg.doc_comment_lines);
+        eprintln!(
+            "  of the destroyed: {between_items} between items (could migrate to ///), \
+             {inside_bodies} inside bodies (unrecoverable — /// is not legal there)"
+        );
+        assert!(!files.is_empty());
+    }
+}

@@ -415,6 +415,7 @@ falsify it.
 | Item decomposition is total (necessary for composition) | **TRUE** — 99.6-99.9% item bytes, remainder pure whitespace, 92 files / 4 crates | `roundtrip.rs` census | graph-backed VFS; derived line numbers |
 | Regenerating an item by PRINTING its AST is byte-exact | **FALSE** — 0 of 91 files | `roundtrip::regen` census | rules out a printer-based composer |
 | Composing a repo from verbatim item nodes is byte-exact | **TRUE** — 1515 files, 31 MB, 3 repos | `roundtrip::compose` scan + regenerate | graph-backed VFS; derived line numbers |
+| A canonical-form repo would remove the need for verbatim text | **REJECTED on cost, not feasibility** — converges in 2 passes, but destroys 35k body comments | `roundtrip::canonical` viability | — |
 | The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
 | Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
 | The graph is the source of truth, files a projection | **aspiration** | — | bijective line numbers |
@@ -444,6 +445,26 @@ So `ProjectionMode::Composed` is reachable, and the route matters: structure fro
 parser, content from the source. The `FallbackReason` variants describe failure modes
 of the printer-based approach this rules out — a span-based composer has none of them,
 so they want revisiting rather than implementing.
+
+**The canonical-form alternative was measured, not argued away.** Rewriting the repo
+once into the printer's own form would remove the need for verbatim text entirely:
+nodes would hold structure, trivia nodes would vanish (half of all nodes today), and
+item order would become a property of the graph rather than the file. On feasibility it
+holds up — the printer is idempotent for 1510 of 1514 files, and the four exceptions
+converge to a fixed point in two passes (width oscillation: re-parsing changes the
+nesting context, so a call that fitted on one line no longer does). No cycles.
+
+It fails on cost. Canonicalisation deletes every plain comment, because `syn`'s AST has
+no node for one: **42,309 lines, 8.5% of hipfire's source.** Doc comments survive as
+attributes, and 5,827 of the losses sit between items so could be rewritten as `///`.
+The remaining **35,477 are inside function bodies, where `///` is not legal** — they are
+unrecoverable by any migration.
+
+That is the wrong 8.5% to lose. This codebase's comments carry the reasoning that the
+code cannot: why a gate exists, what a measurement cost, which approach was tried and
+abandoned. Trading them for a simpler VFS buys implementation convenience with
+institutional memory. The verbatim-span composer already delivers byte-exactness, so
+the simplification is not needed to make projection work — only to make it tidier.
 
 Line numbers fall out of the same mechanism. A node knows where it lands, so
 `path:line` is derived at projection time; an edit above a node shifts it, which is
