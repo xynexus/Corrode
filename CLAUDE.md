@@ -88,7 +88,9 @@ the UI as tokens generate; off unless `1`/`true`/`on` — the non-streaming path
 unchanged when off), `CORRODE_FANOUT` (coder-task ensemble size — K read-only proposal
 attempts judged by the review model before one writable execution; default 1 = off,
 clamped to 8), `CORRODE_PLAN_REVIEW` (plan-level review pass after the plan settles;
-on unless `0`/`false`), `CORRODE_SANDBOX` (bubblewrap-confine every spawned process
+on unless `0`/`false`), `CORRODE_TURN_BUDGET_S` (wall-clock ceiling for one Prompt
+turn — past it no new task launches and no emission is folded in, though in-flight
+work is awaited; absent/0 -> unbounded), `CORRODE_SANDBOX` (bubblewrap-confine every spawned process
 — `run_command`/`run_skill_script` and the web terminal — off unless `on`/`1`/`true`;
 see `sandbox.rs` + `docs/sessions-and-sandbox.md`), `CORRODE_SANDBOX_NET` (share the
 host network into the sandbox; off by default — needed for tools that fetch),
@@ -157,7 +159,9 @@ agent can grow: `run_reactive` launches every ready task, and on each completion
 marks it, folds in the tasks it emitted, and reschedules — until nothing is ready
 or in flight. A subagent emits follow-up work (a test contract, a research
 spin-off) by ending its reply with a fenced ` ```tasks ` JSON block, which
-`parse_emitted` folds back in (`after: true` depends on the emitter). Tasks left
+`parse_emitted` folds back in (`after: true` depends on the emitter). `run_reactive_until`
+bounds the turn: past `CORRODE_TURN_BUDGET_S` it launches nothing new and drops
+emissions, so a swarm that emits a follow-up every turn still terminates. Tasks left
 unschedulable after the run settles (`stuck`) surface as an Error. `band_for` maps
 role→band (orchestration→Realtime, architect/coder/review→Default,
 research→Opportunistic).

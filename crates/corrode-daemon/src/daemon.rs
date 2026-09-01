@@ -480,7 +480,11 @@ impl Daemon {
                         }
                     }
                 };
-                plan_graph::run_reactive(&mut graph, &execute).await;
+                // The turn declares its ceiling before it starts. hipfire's bands
+                // schedule the GPU; nothing else bounds how much work the swarm
+                // decides to create for itself.
+                let deadline = turn_budget().map(|d| std::time::Instant::now() + d);
+                let mut budget = plan_graph::run_reactive_until(&mut graph, &execute, deadline).await;
 
                 // One plan-level review pass over the settled work: the review role
                 // reads the digest (and, through its tools, the written files) and
@@ -491,23 +495,42 @@ impl Daemon {
                 if plan_review_enabled() {
                     if let Some(digest) = graph.review_digest(REVIEW_OUTPUT_CAP) {
                         graph.add(Role::Review, planner::plan_review_task(&digest), Vec::new());
-                        plan_graph::run_reactive(&mut graph, &execute).await;
+                        let second =
+                            plan_graph::run_reactive_until(&mut graph, &execute, deadline).await;
+                        budget.expired |= second.expired;
+                        budget.shed += second.shed;
+                        budget.unlaunched = second.unlaunched;
                     }
                 }
 
                 // Tasks left pending after the scheduler settled had a failed or
                 // unmet dependency (a failed emitter) — surface them rather than
                 // dropping them silently.
-                let stuck = graph.stuck();
-                if !stuck.is_empty() {
+                // A turn cut short by its budget is reported as such: "could not be
+                // scheduled (a dependency failed)" would be a lie, and the two have
+                // opposite fixes — raise the budget vs debug the failure.
+                if budget.expired {
                     let _ = events
                         .send(AgentEvent::Error {
                             message: format!(
-                                "{} task(s) could not be scheduled (a dependency failed)",
-                                stuck.len()
+                                "turn budget exhausted: {} task(s) not launched, \
+                                 {} emission(s) dropped (CORRODE_TURN_BUDGET_S)",
+                                budget.unlaunched, budget.shed
                             ),
                         })
                         .await;
+                } else {
+                    let stuck = graph.stuck();
+                    if !stuck.is_empty() {
+                        let _ = events
+                            .send(AgentEvent::Error {
+                                message: format!(
+                                    "{} task(s) could not be scheduled (a dependency failed)",
+                                    stuck.len()
+                                ),
+                            })
+                            .await;
+                    }
                 }
 
                 // Persist the plan's provenance (plan <- task/contract <- code) to the
@@ -1107,6 +1130,18 @@ fn fanout_k() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .map(|k| k.clamp(1, 8))
         .unwrap_or(1)
+}
+
+/// `CORRODE_TURN_BUDGET_S`: wall-clock ceiling for one Prompt turn. Absent, zero or
+/// unparseable -> unbounded, which is today's behaviour and stays the default: a ceiling
+/// that silently truncates work is worse than a slow turn for anyone who has not asked
+/// for one.
+fn turn_budget() -> Option<std::time::Duration> {
+    std::env::var("CORRODE_TURN_BUDGET_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(std::time::Duration::from_secs)
 }
 
 /// `CORRODE_MAX_CONCURRENCY`: cap on subagent generations in flight at once. Default
