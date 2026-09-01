@@ -127,7 +127,7 @@ mod tests {
             let node_text: usize = nodes.iter().map(|n| n.text.len()).sum();
             let ids: usize = nodes
                 .iter()
-                .map(|n| format!("code:{rel}#{}", n.ordinal).len())
+                .map(|n| format!("code:{rel}#{}", n.order).len())
                 .sum::<usize>()
                 + (0..edges.len()).map(|i| format!("comment:{rel}#{i}").len()).sum::<usize>();
 
@@ -222,6 +222,28 @@ mod tests {
                 eprintln!("  slowest [{name}] {:.0}ms {p}", d.as_secs_f64() * 1000.0);
             }
         }
+        // Node-count distribution decides whether ordering needs anything cleverer
+        // than a dense index: renumbering on insert is O(nodes in file), which is
+        // free at 10 and painful at 10,000.
+        let mut counts: Vec<usize> = Vec::new();
+        for rel in &files {
+            let Ok(src) = std::fs::read_to_string(std::path::Path::new(&repo).join(rel)) else {
+                continue;
+            };
+            let lang = projection::for_path(rel);
+            if let Ok(fw) = ingest::file(lang.as_ref(), rel, &src) {
+                counts.push(fw.code.len());
+            }
+        }
+        counts.sort_unstable();
+        let at = |q: f64| counts[((counts.len() as f64 - 1.0) * q) as usize];
+        eprintln!(
+            "nodes/file: p50 {} p90 {} p99 {} max {}",
+            at(0.50),
+            at(0.90),
+            at(0.99),
+            counts.last().copied().unwrap_or(0)
+        );
         assert!(agg.files > 0, "nothing ingested");
     }
 }

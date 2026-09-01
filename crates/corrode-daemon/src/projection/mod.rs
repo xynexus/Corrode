@@ -121,12 +121,58 @@ pub fn for_path(path: &str) -> Box<dyn Language> {
     Box::new(text::PlainText::for_extension(ext))
 }
 
+/// Gap left between adjacent nodes on first ingest.
+///
+/// Dense indices make an insert renumber every node below it. On a 1,821-node file
+/// (the measured maximum) that is 1,820 rewrites for one added item — and in a
+/// provenance graph the cost is not the writes but the CHURN: every node below the
+/// edit is marked modified, a one-item diff reads as 1,821 changes, and "which task
+/// produced this node" becomes noise.
+///
+/// A stride of 2^32 leaves room for ~32 successive midpoint insertions at any single
+/// point before the gap is exhausted, without touching a neighbour.
+pub const ORDER_STRIDE: u64 = 1 << 32;
+
+/// The order key for the `i`-th node of a freshly ingested file.
+///
+/// Deterministic on purpose. A random key would also be sparse, but the same file
+/// would ingest to a different graph every time, which breaks diffing, caching and
+/// content-addressing — the reproducibility this is supposed to protect.
+/// Keys start at one stride, not zero, so there is room to insert BEFORE the first
+/// node — a file gaining a new leading import or licence header is common, and a
+/// zero-based first key would force a rebalance for it.
+pub fn initial_order(i: usize) -> u64 {
+    (i as u64 + 1).saturating_mul(ORDER_STRIDE)
+}
+
+/// A key strictly between `a` and `b`, or `None` when the gap is exhausted and the
+/// file needs [`rebalance`].
+#[allow(dead_code)] // mutation API: used once the graph is edited in place
+pub fn order_between(a: u64, b: u64) -> Option<u64> {
+    (b.saturating_sub(a) >= 2).then(|| a + (b - a) / 2)
+}
+
+/// Reassign every key at full stride, restoring room to insert.
+///
+/// Rare, bounded to one file, and the reason the key is documented as overwriteable:
+/// exhaustion is recoverable rather than terminal. Node identity derives from the key,
+/// so this IS a re-addressing operation — callers holding ids must re-read.
+#[allow(dead_code)] // mutation API: used once the graph is edited in place
+pub fn rebalance(nodes: &mut [Node]) {
+    nodes.sort_by_key(|n| n.order);
+    for (i, n) in nodes.iter_mut().enumerate() {
+        n.order = initial_order(i);
+    }
+}
+
 /// One node: a slice of the file, stored verbatim.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub path: String,
-    /// Order within the file — the only thing projection needs.
-    pub ordinal: usize,
+    /// Sparse order key within the file. Projection sorts by it; nothing else reads it.
+    /// Sparse rather than dense so an insert costs one write instead of renumbering
+    /// every node below it — see [`ORDER_STRIDE`].
+    pub order: u64,
     /// Backend-defined kind, or `trivia` for the bytes between items.
     pub kind: &'static str,
     /// Verbatim source. Never regenerated.
@@ -134,6 +180,7 @@ pub struct Node {
 }
 
 /// Decompose a file into nodes covering every byte.
+#[allow(dead_code)] // `ingest::file` uses the single-parse `spans` path instead
 pub fn scan(lang: &dyn Language, path: &str, src: &str) -> anyhow::Result<Vec<Node>> {
     Ok(nodes_from_items(path, src, &lang.items(src)?))
 }
@@ -143,11 +190,12 @@ pub fn scan(lang: &dyn Language, path: &str, src: &str) -> anyhow::Result<Vec<No
 pub fn nodes_from_items(path: &str, src: &str, items: &[Span]) -> Vec<Node> {
     let mut nodes = Vec::new();
     let (mut cursor, mut ordinal) = (0usize, 0usize);
+    // `ordinal` is a local counter only; what is stored is the sparse key.
     for it in items {
         if it.start > cursor {
             nodes.push(Node {
                 path: path.into(),
-                ordinal,
+                order: initial_order(ordinal),
                 kind: "trivia",
                 text: src[cursor..it.start].into(),
             });
@@ -155,7 +203,7 @@ pub fn nodes_from_items(path: &str, src: &str, items: &[Span]) -> Vec<Node> {
         }
         nodes.push(Node {
             path: path.into(),
-            ordinal,
+            order: initial_order(ordinal),
             kind: it.kind,
             text: src[it.start..it.end].into(),
         });
@@ -165,7 +213,7 @@ pub fn nodes_from_items(path: &str, src: &str, items: &[Span]) -> Vec<Node> {
     if cursor < src.len() {
         nodes.push(Node {
             path: path.into(),
-            ordinal,
+            order: initial_order(ordinal),
             kind: "trivia",
             text: src[cursor..].into(),
         });
@@ -177,7 +225,7 @@ pub fn nodes_from_items(path: &str, src: &str, items: &[Span]) -> Vec<Node> {
 /// about one source text, and a generated VFS has none.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Placement {
-    pub ordinal: usize,
+    pub order: u64,
     pub kind: &'static str,
     pub start_line: usize,
     pub start_byte: usize,
@@ -186,11 +234,11 @@ pub struct Placement {
 /// Project nodes into a file and report where each landed.
 pub fn project(nodes: &[Node]) -> (String, Vec<Placement>) {
     let mut sorted: Vec<&Node> = nodes.iter().collect();
-    sorted.sort_by_key(|n| n.ordinal);
+    sorted.sort_by_key(|n| n.order);
     let (mut text, mut places) = (String::new(), Vec::with_capacity(sorted.len()));
     for n in sorted {
         places.push(Placement {
-            ordinal: n.ordinal,
+            order: n.order,
             kind: n.kind,
             start_line: text.bytes().filter(|b| *b == b'\n').count() + 1,
             start_byte: text.len(),
@@ -201,6 +249,7 @@ pub fn project(nodes: &[Node]) -> (String, Vec<Placement>) {
 }
 
 /// Reassemble a file from its nodes.
+#[allow(dead_code)] // read half: called when the VFS projects from the graph
 pub fn regenerate(nodes: &[Node]) -> String {
     project(nodes).0
 }
@@ -213,8 +262,8 @@ pub struct Edge {
     pub relation: Relation,
     /// The element it describes, if any.
     pub target: Option<Span>,
-    /// Which node contains it.
-    pub node_ordinal: Option<usize>,
+    /// Order key of the node containing it.
+    pub node_order: Option<u64>,
     /// 1-based line WITHIN that node — stable under edits elsewhere in the file.
     pub line_in_node: usize,
 }
@@ -232,11 +281,11 @@ pub fn bind(src: &str, comments: &[CommentSpan], anchors: &[Span], nodes: &[Node
     let anchors = &anchors[..];
     // Node extents in projection order, so a comment can be located within one.
     let mut sorted: Vec<&Node> = nodes.iter().collect();
-    sorted.sort_by_key(|n| n.ordinal);
-    let mut extents: Vec<(usize, usize, usize)> = Vec::new();
+    sorted.sort_by_key(|n| n.order);
+    let mut extents: Vec<(usize, usize, u64)> = Vec::new();
     let mut at = 0usize;
     for n in &sorted {
-        extents.push((at, at + n.text.len(), n.ordinal));
+        extents.push((at, at + n.text.len(), n.order));
         at += n.text.len();
     }
 
@@ -289,7 +338,7 @@ pub fn bind(src: &str, comments: &[CommentSpan], anchors: &[Span], nodes: &[Node
                 text: src[c.start..c.end].to_string(),
                 relation,
                 target,
-                node_ordinal: owner.map(|(_, _, o)| *o),
+                node_order: owner.map(|(_, _, o)| *o),
                 // Lines are a subtraction now, not a scan.
                 line_in_node: line_of(c.start)
                     - line_of(owner.map(|(s, _, _)| *s).unwrap_or(0))

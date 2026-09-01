@@ -12,7 +12,9 @@ use super::{bind, project as project_nodes, CommentKind, Language, Relation};
 pub struct CodeNode {
     pub id: String,
     pub kind: &'static str,
-    pub ordinal: usize,
+    /// Sparse order key. Identity derives from it, so a node keeps its id when
+        /// something is inserted above it — which a dense index could not offer.
+        pub order: u64,
     pub text: String,
 }
 
@@ -63,9 +65,9 @@ pub fn file(lang: &dyn Language, path: &str, src: &str) -> anyhow::Result<FileWr
     let code = nodes
         .iter()
         .map(|n| CodeNode {
-            id: format!("code:{path}#{}", n.ordinal),
+            id: format!("code:{path}#{}", n.order),
             kind: n.kind,
-            ordinal: n.ordinal,
+            order: n.order,
             text: n.text.clone(),
         })
         .collect();
@@ -76,7 +78,7 @@ pub fn file(lang: &dyn Language, path: &str, src: &str) -> anyhow::Result<FileWr
         .map(|(i, e)| CommentNode {
             id: format!("comment:{path}#{i}"),
             text: e.text.clone(),
-            in_node: e.node_ordinal.map(|o| format!("code:{path}#{o}")),
+            in_node: e.node_order.map(|o| format!("code:{path}#{o}")),
             line_in_node: e.line_in_node,
             relation: match e.relation {
                 Relation::Precedes => "precedes",
@@ -105,7 +107,7 @@ pub fn project(fw: &FileWrite) -> String {
         .iter()
         .map(|c| super::Node {
             path: fw.path.clone(),
-            ordinal: c.ordinal,
+            order: c.order,
             kind: c.kind,
             text: c.text.clone(),
         })

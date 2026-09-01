@@ -152,34 +152,78 @@ mod tests {
 
     /// Positions are an OUTPUT of projection, never node state: a byte offset is a fact
     /// about one source text, and a generated VFS has none.
+    ///
+    /// Also the point of the sparse key: inserting a node touches ONE key, and every
+    /// existing node keeps its own — so identity survives the edit.
     #[test]
-    fn positions_are_recomputed_not_stored() {
+    fn positions_are_recomputed_and_inserting_touches_one_key() {
         let lang = projection::rust::Rust;
         let src = "use a::b;\n\nfn one() {}\n\nfn two() {}\n";
         let nodes = scan(&lang, "t.rs", src).unwrap();
         let (text, places) = projection::project(&nodes);
         assert_eq!(text, src);
 
-        let two = nodes.iter().find(|n| n.text.contains("fn two")).unwrap();
-        let before = places.iter().find(|p| p.ordinal == two.ordinal).unwrap().start_line;
+        let two = nodes.iter().find(|n| n.text.contains("fn two")).unwrap().clone();
+        let before_line = places.iter().find(|p| p.order == two.order).unwrap().start_line;
 
-        let mut mutated: Vec<projection::Node> = nodes
-            .iter()
-            .cloned()
-            .map(|mut n| {
-                n.ordinal += 1;
-                n
-            })
-            .collect();
+        // Insert ahead of everything: one new key between the file start and the first
+        // node. No existing key changes — with a dense index every one of them would.
+        let first = nodes.iter().map(|n| n.order).min().unwrap();
+        let key = projection::order_between(0, first).expect("stride leaves room");
+        let mut mutated = nodes.clone();
         mutated.push(projection::Node {
             path: "t.rs".into(),
-            ordinal: 0,
+            order: key,
             kind: "use",
             text: "use inserted::thing;\n\n".into(),
         });
+
+        assert!(
+            nodes.iter().all(|n| mutated.iter().any(|m| m.order == n.order && m.text == n.text)),
+            "no existing node was renumbered"
+        );
         let (_, after) = projection::project(&mutated);
-        let now = after.iter().find(|p| p.ordinal == two.ordinal + 1).unwrap().start_line;
-        assert_eq!(now, before + 2, "projection reports the shifted line");
+        let now = after.iter().find(|p| p.order == two.order).unwrap().start_line;
+        assert_eq!(now, before_line + 2, "projection reports the shifted line");
+    }
+
+    /// The key is deterministic: the same file ingests to the same graph. A random key
+    /// would be equally sparse and would break diffing, caching and content-addressing.
+    #[test]
+    fn ingest_is_reproducible() {
+        let lang = projection::rust::Rust;
+        let src = "fn a() {}\n\nfn b() {}\n";
+        let one = scan(&lang, "t.rs", src).unwrap();
+        let two = scan(&lang, "t.rs", src).unwrap();
+        assert_eq!(one, two, "same input, same keys");
+        assert_eq!(one[0].order, projection::ORDER_STRIDE, "keys start at one stride");
+        assert_eq!(one[1].order, 2 * projection::ORDER_STRIDE);
+    }
+
+    /// Exhaustion is recoverable, not terminal: rebalance restores the stride.
+    #[test]
+    fn an_exhausted_gap_rebalances() {
+        assert_eq!(projection::order_between(0, 2), Some(1));
+        assert_eq!(projection::order_between(4, 5), None, "adjacent keys have no room");
+
+        let mut nodes: Vec<projection::Node> = [5u64, 6, 7]
+            .iter()
+            .map(|o| projection::Node {
+                path: "t.rs".into(),
+                order: *o,
+                kind: "fn",
+                text: format!("fn f{o}() {{}}\n"),
+            })
+            .collect();
+        let before = projection::regenerate(&nodes);
+        projection::rebalance(&mut nodes);
+        assert_eq!(nodes[0].order, projection::ORDER_STRIDE);
+        assert_eq!(nodes[1].order, 2 * projection::ORDER_STRIDE);
+        assert!(
+            projection::order_between(nodes[0].order, nodes[1].order).is_some(),
+            "room restored"
+        );
+        assert_eq!(projection::regenerate(&nodes), before, "order preserved");
     }
 
     /// Braces and quotes inside literals and comments must not move a boundary.

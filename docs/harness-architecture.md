@@ -664,5 +664,38 @@ therefore on the fast fallback path) this is single-digit minutes, not hours. Ru
 the slow backend at ~1.5 MB/s against ~25 MB/s for the fallback, because `syn` parses;
 a repo that is mostly Rust will be bound by that.
 
+### Ordering: a sparse key, not a dense index
+
+Node order is a **sparse u64**, assigned `(i+1) << 32` on first ingest.
+
+Dense indices make an insert renumber every node below it. The cost is not the writes
+— it is the churn: on the measured worst-case file (1,821 nodes) adding one item marks
+1,820 nodes modified, so a one-item diff reads as 1,821 changes and "which task
+produced this node" becomes noise. With a sparse key an insert takes the midpoint of
+its neighbours and touches exactly one key; every other node keeps its own, and
+therefore keeps its id.
+
+Deterministic, not random. A random key would be equally sparse and would make the
+same file ingest to a different graph each time, breaking diffing, caching and
+content-addressing — the reproducibility the scheme exists to protect.
+
+Keys start at one stride rather than zero, so a file can gain a leading import or
+licence header without a rebalance. That was found by a test, not by design: the first
+version keyed from zero and left no room before the first node.
+
+Exhaustion is recoverable. `order_between` returns `None` when a gap is spent and
+`rebalance` restores full stride for that file — bounded, local, and the reason the key
+is documented as overwriteable. At p99 = 121 nodes a rebalance is 121 writes and rare.
+
+Rejected: **file-order edges** (`file -> n1 -> n2 -> …`). They make insert O(1) and
+projection O(n) *dependent traversals*, which is the wrong trade — projection is the
+VFS read path and runs on every materialisation, while inserts are occasional. A broken
+link also truncates a file silently and a cycle hangs it. Containment stays an edge;
+order stays a property.
+
+**Unmeasured:** the insert-versus-update ratio in practice. If agent edits turn out to
+be almost entirely in-place body rewrites, a dense index would have sufficed. Ingest
+telemetry against a live store settles it.
+
 **Not expected to break:** byte-exactness, in any language. If a mismatch appears, the
 span cover is wrong and that is a real defect rather than a missing backend.
