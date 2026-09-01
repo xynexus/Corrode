@@ -116,3 +116,54 @@ pub fn for_each_file(
     }
     Ok((seen, skipped))
 }
+
+/// Stream an archive and process entries on a worker pool.
+///
+/// Ingest is per-file independent, so the only sequential part is reading the tar —
+/// which is inherent: a tar is a stream, and its entries can only be walked in order.
+/// The reader therefore stays on one thread and hands work to N workers.
+///
+/// The channel is **bounded**. An unbounded one would let the reader race ahead and
+/// buffer the whole archive in memory, which for a kernel tree is 1.6 GB of content —
+/// turning a throughput problem into an OOM. A small bound applies backpressure so the
+/// reader runs exactly as far ahead as the workers allow.
+///
+/// `f` must be `Sync` because every worker calls it; accumulate through a lock or an
+/// atomic, or return per-worker state and merge.
+pub fn par_for_each_file<F>(
+    archive: &Path,
+    workers: usize,
+    f: F,
+) -> anyhow::Result<(usize, usize)>
+where
+    F: Fn(Entry<'_>) + Sync,
+{
+    use std::sync::mpsc::sync_channel;
+
+    let workers = workers.max(1);
+    // Two slots per worker: enough that nobody idles waiting for the reader, small
+    // enough that the in-flight bytes stay bounded.
+    let (tx, rx) = sync_channel::<(String, String)>(workers * 2);
+    let rx = std::sync::Mutex::new(rx);
+    let f = &f;
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let rx = &rx;
+            scope.spawn(move || loop {
+                // Lock only to take the next item, never while working.
+                let next = rx.lock().unwrap().recv();
+                match next {
+                    Ok((path, text)) => f(Entry { path: &path, text: &text }),
+                    Err(_) => break, // sender dropped: archive exhausted
+                }
+            });
+        }
+        let counts = for_each_file(archive, |e| {
+            // Ownership transfer: the worker outlives this borrow.
+            let _ = tx.send((e.path.to_string(), e.text.to_string()));
+        });
+        drop(tx);
+        counts
+    })
+}

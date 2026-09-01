@@ -35,6 +35,7 @@
 //! only less queryable.
 
 pub mod archive;
+pub mod c;
 pub mod rust;
 pub mod text;
 
@@ -118,6 +119,9 @@ pub fn for_path(path: &str) -> Box<dyn Language> {
     let ext = base.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
     if rust::Rust.extensions().contains(&ext) {
         return Box::new(rust::Rust);
+    }
+    if c::C.extensions().contains(&ext) {
+        return Box::new(c::C);
     }
     Box::new(text::PlainText::for_extension(ext))
 }
@@ -236,14 +240,26 @@ pub struct Placement {
 pub fn project(nodes: &[Node]) -> (String, Vec<Placement>) {
     let mut sorted: Vec<&Node> = nodes.iter().collect();
     sorted.sort_by_key(|n| n.order);
-    let (mut text, mut places) = (String::new(), Vec::with_capacity(sorted.len()));
+    // Preallocate: growing a 24 MB string by doubling copies it repeatedly.
+    let total: usize = sorted.iter().map(|n| n.text.len()).sum();
+    let mut text = String::with_capacity(total);
+    let mut places = Vec::with_capacity(sorted.len());
+    // Carry the line count forward instead of recounting the accumulated text for
+    // every node. That recount was O(nodes x text), which on a 24 MB generated header
+    // with 400k nodes meant PROJECTION took minutes: 2 MB cost 5s, 4 MB 18s, 8 MB 73s.
+    //
+    // This is the same defect as the one fixed in `bind` — a line number derived by
+    // scanning from the beginning — written a second time in the function next to it.
+    // Projection is the VFS read path, so here it would have been worse than slow.
+    let mut line = 1usize;
     for n in sorted {
         places.push(Placement {
             order: n.order,
             kind: n.kind,
-            start_line: text.bytes().filter(|b| *b == b'\n').count() + 1,
+            start_line: line,
             start_byte: text.len(),
         });
+        line += n.text.bytes().filter(|b| *b == b'\n').count();
         text.push_str(&n.text);
     }
     (text, places)
@@ -310,28 +326,27 @@ pub fn bind(src: &str, comments: &[CommentSpan], anchors: &[Span], nodes: &[Node
             // O(comments x anchors). Binary search bounds the work instead.
             let after = anchors.partition_point(|a| a.start < c.end);
             let containing_end = anchors.partition_point(|a| a.start <= c.start);
+            // Anchors nest, so among those containing a point the one with the LARGEST
+            // start is the innermost — and therefore the smallest. Scanning backwards
+            // and stopping at the first hit finds it in a step or two, where the
+            // forward `filter().min_by_key()` scanned the whole prefix: on a kernel
+            // header with 6,108 anchors that was the real cost of ingest, not the
+            // parser, which runs at ~77 MB/s.
+            let innermost = |covering: usize| {
+                anchors[..containing_end]
+                    .iter()
+                    .rev()
+                    .find(|a| a.end >= covering)
+                    .cloned()
+            };
             let (relation, target) = if trailing {
-                (
-                    Relation::Trailing,
-                    anchors[..containing_end]
-                        .iter()
-                        .filter(|a| a.end >= line_start)
-                        .min_by_key(|a| a.end - a.start)
-                        .cloned(),
-                )
+                (Relation::Trailing, innermost(line_start))
             } else if after < anchors.len() {
                 // `partition_point` gives the FIRST anchor starting at or after the
                 // comment's end, which is exactly "the element it introduces".
                 (Relation::Precedes, Some(anchors[after].clone()))
             } else {
-                (
-                    Relation::Encloses,
-                    anchors[..containing_end]
-                        .iter()
-                        .filter(|a| a.end >= c.end)
-                        .min_by_key(|a| a.end - a.start)
-                        .cloned(),
-                )
+                (Relation::Encloses, innermost(c.end))
             };
             let owner = extents.iter().find(|(s, e, _)| c.start >= *s && c.start < *e);
             Edge {

@@ -762,5 +762,52 @@ Worth noting how those were found: not by reading the mapping table and thinking
 harder, but by measuring which types produced suspiciously zero comments. The signal
 came from the corpus.
 
+### C backend, and the ingest that got 15x faster
+
+`projection/c.rs` is a lexer, not a parser — the projection needs byte ranges and never
+regenerates, so a preprocessor is not required. Lexing C correctly is, and the failure
+mode of getting it wrong is silent: a miscounted brace shifts every later boundary
+without an error.
+
+The gotchas were checked against the kernel rather than assumed. **Directives with
+unbalanced braces are the critical one and are common** — `# define
+randomized_struct_fields_start struct {` opens a brace that never closes, so directives
+are lexed as opaque regions and never depth-counted. Block comments do not nest in C
+(the first `*/` closes). Backslash-continued `//` comments are legal, handled, and
+occurred **zero** times in the sample — a predicted gotcha that turned out not to
+matter. Apostrophes inside comments are not character literals.
+
+Result on the kernel: **70,506 C files, 2,257,988 of 2,259,710 comments bound to a
+syntax element** — from zero. That is 88% of the tree's commentary moving from stored
+to queryable, and it is what the sweep predicted a C backend was worth.
+
+| | before | after |
+|---|---|---|
+| kernel ingest | 106 s (fallback, no C) | **7.2 s** |
+| throughput | 15 MB/s | **225.6 MB/s** |
+| comments bound | 53,669 | **2,311,657** |
+
+Three things got it there, and only one was the obvious one.
+
+**Parallelism was not the fix.** Ingest is per-file independent, so a bounded channel
+feeding N workers is the right shape — the channel must be bounded, or the reader
+buffers 1.6 GB. But threading alone changed nothing, because a single 24 MB generated
+header was a single work item taking minutes. No thread count divides one file.
+
+**`project` was quadratic.** It recomputed a node's line by counting newlines across
+the whole accumulated text, per node: 2 MB cost 5.0 s, 4 MB 18.4 s, 8 MB 72.6 s.
+Carrying the count forward made the same file 2 ms, 4 ms and 10 ms. This is the **same
+defect fixed in `bind` an hour earlier** — a line number derived by scanning from the
+beginning — reintroduced in the function beside it. Projection is the VFS read path, so
+it would have been worse than slow.
+
+**`bind`'s container search** scanned a whole anchor prefix per comment. Anchors nest,
+so the innermost container is the last one in start order; a backward scan stops
+immediately.
+
+The lesson repeats the one from the first benchmark: the fix that looked obvious
+(threads) was worth nothing, and the fix that mattered was a line-counting loop nobody
+would look at twice. Measuring found it; reasoning had already missed it once.
+
 **Not expected to break:** byte-exactness, in any language. If a mismatch appears, the
 span cover is wrong and that is a real defect rather than a missing backend.

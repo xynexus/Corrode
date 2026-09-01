@@ -272,30 +272,47 @@ mod archive_tests {
         let mut bytes = 0usize;
         let wall = Instant::now();
 
-        let (seen, skipped) = archive::for_each_file(std::path::Path::new(&path), |e| {
-            let lang = projection::for_path(e.path);
-            let slot = by.entry(lang.name()).or_default();
-            slot.0 += 1;
-            bytes += e.text.len();
-            match ingest::file(lang.as_ref(), e.path, e.text) {
-                Err(_) => failed += 1,
-                Ok(fw) => {
-                    slot.1 += fw.code.len();
-                    slot.2 += fw.comments.len();
-                    slot.3 += fw.comments.iter().filter(|c| c.describes_kind.is_some()).count();
-                    // The invariant that must survive a different transport.
-                    if ingest::project(&fw) == e.text {
-                        exact += 1;
-                    } else {
-                        mismatched += 1;
-                        if mismatched <= 3 {
-                            eprintln!("  MISMATCH [{}] {}", lang.name(), e.path);
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        // One lock around the tallies rather than per-worker maps: the work is the
+        // ingest, and the accumulate is a handful of adds.
+        let acc = std::sync::Mutex::new((by, exact, mismatched, failed, bytes));
+        let (seen, skipped) =
+            archive::par_for_each_file(std::path::Path::new(&path), workers, |e| {
+                let lang = projection::for_path(e.path);
+                let result = ingest::file(lang.as_ref(), e.path, e.text);
+                let exact_here = result
+                    .as_ref()
+                    .map(|fw| ingest::project(fw) == e.text)
+                    .unwrap_or(false);
+                let mut g = acc.lock().unwrap();
+                let slot = g.0.entry(lang.name()).or_default();
+                slot.0 += 1;
+                g.4 += e.text.len();
+                match result {
+                    Err(_) => g.3 += 1,
+                    Ok(fw) => {
+                        let slot = g.0.entry(lang.name()).or_default();
+                        slot.1 += fw.code.len();
+                        slot.2 += fw.comments.len();
+                        slot.3 += fw
+                            .comments
+                            .iter()
+                            .filter(|c| c.describes_kind.is_some())
+                            .count();
+                        if exact_here {
+                            g.1 += 1;
+                        } else {
+                            g.2 += 1;
+                            if g.2 <= 3 {
+                                eprintln!("  MISMATCH [{}] {}", lang.name(), e.path);
+                            }
                         }
                     }
                 }
-            }
-        })
-        .expect("archive readable");
+            })
+            .expect("archive readable");
+        let (by, exact, mismatched, failed, bytes) = acc.into_inner().unwrap();
+        eprintln!("({workers} workers)");
 
         let secs = wall.elapsed().as_secs_f64();
         eprintln!("=== archive ingest: {path} ===");
@@ -416,5 +433,82 @@ mod sweep {
             eprintln!("{:<16} {:>8} {:>12} {:>12}", k, e.files, e.backend, e.commentless);
         }
         assert!(files > 0);
+    }
+}
+
+#[cfg(test)]
+mod c_profile {
+    use crate::projection::{self, Language};
+    use std::time::Instant;
+
+    /// Where does the C backend's time go on real kernel sources?
+    #[test]
+    #[ignore = "probe"]
+    fn profile_c_backend() {
+        let dir = std::env::var("CORRODE_C_DIR").unwrap_or_default();
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(d) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out); }
+                else if matches!(p.extension().and_then(|e| e.to_str()), Some("c") | Some("h")) {
+                    out.push(p);
+                }
+            }
+        }
+        walk(std::path::Path::new(&dir), &mut files);
+        files.truncate(300);
+        let c = projection::c::C;
+        let (mut lex_t, mut items_t, mut anchors_t, mut bytes) = (0u128, 0u128, 0u128, 0usize);
+        let mut bind_t = 0u128;
+        let mut worst = (0u128, String::new(), 0usize);
+        for f in &files {
+            let Ok(src) = std::fs::read_to_string(f) else { continue };
+            bytes += src.len();
+            let t = Instant::now(); let _ = c.comments(&src); lex_t += t.elapsed().as_micros();
+            let t = Instant::now(); let it = c.items(&src).unwrap(); items_t += t.elapsed().as_micros();
+            let t = Instant::now(); let an = c.anchors(&src).unwrap(); let a = t.elapsed().as_micros();
+            anchors_t += a;
+            // The phase the benchmark could not see: binding, with REAL anchor counts.
+            let cs = c.comments(&src);
+            let nodes = crate::projection::nodes_from_items("t.c", &src, &it);
+            let t = Instant::now();
+            let _edges = crate::projection::bind(&src, &cs, &an, &nodes);
+            let bt = t.elapsed().as_micros();
+            bind_t += bt;
+            if bt > worst.0 { worst = (bt, f.display().to_string(), an.len()); }
+        }
+        eprintln!("{} files, {:.1} MB", files.len(), bytes as f64 / 1e6);
+        eprintln!("comments {}ms  items {}ms  anchors {}ms  BIND {}ms", lex_t/1000, items_t/1000, anchors_t/1000, bind_t/1000);
+        eprintln!("worst bind: {}ms {} ({} anchors)", worst.0/1000, worst.1, worst.2);
+    }
+}
+
+#[cfg(test)]
+mod one_file {
+    use crate::projection::{self, ingest, Language};
+    use std::time::Instant;
+    #[test]
+    #[ignore = "probe"]
+    fn time_one_file() {
+        let f = std::env::var("PROBE_FILE").unwrap();
+        let src = std::fs::read_to_string(&f).unwrap();
+        eprintln!("{:.1} MB", src.len() as f64 / 1e6);
+        let c = projection::c::C;
+        let t = Instant::now(); let items = c.items(&src).unwrap();
+        eprintln!("items   {:>7}ms -> {} items", t.elapsed().as_millis(), items.len());
+        let t = Instant::now(); let an = c.anchors(&src).unwrap();
+        eprintln!("anchors {:>7}ms -> {} anchors", t.elapsed().as_millis(), an.len());
+        let t = Instant::now(); let cs = c.comments(&src);
+        eprintln!("comments{:>7}ms -> {} comments", t.elapsed().as_millis(), cs.len());
+        let t = Instant::now(); let nodes = projection::nodes_from_items("x.h", &src, &items);
+        eprintln!("nodes   {:>7}ms -> {} nodes", t.elapsed().as_millis(), nodes.len());
+        let t = Instant::now(); let _ = projection::bind(&src, &cs, &an, &nodes);
+        eprintln!("bind    {:>7}ms", t.elapsed().as_millis());
+        let t = Instant::now(); let fw = ingest::file(&c, "x.h", &src).unwrap();
+        eprintln!("ingest  {:>7}ms", t.elapsed().as_millis());
+        let t = Instant::now(); let ok = ingest::project(&fw) == src;
+        eprintln!("project {:>7}ms (exact: {ok})", t.elapsed().as_millis());
     }
 }
