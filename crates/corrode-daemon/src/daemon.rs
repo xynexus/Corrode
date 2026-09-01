@@ -539,6 +539,11 @@ impl Daemon {
                 // graph store, so the code<->task<->plan lineage is queryable — and
                 // ship it to the graph explorer.
                 self.persist_provenance(session, &graph);
+                // Re-ingest what the turn wrote. Staleness is the one real cost of
+                // indexing code — a stale index is confidently wrong where reading
+                // files is merely slow — so the index is refreshed at the moment the
+                // truth changes, using the written paths provenance already collects.
+                self.ingest_written(session, &graph).await;
                 let prov = graph.provenance();
                 let nodes = prov
                     .nodes
@@ -747,6 +752,48 @@ impl Daemon {
             }];
         }
         Ok((plan, prefix))
+    }
+
+    /// Re-ingest every file this turn wrote into the code graph.
+    ///
+    /// Only files the swarm actually changed: a full re-scan would be wasteful and,
+    /// worse, would hide which nodes a turn is responsible for. Best-effort like
+    /// provenance — a store that cannot take the write logs once and stops, because
+    /// losing an index refresh must never fail the work that produced it.
+    ///
+    /// Non-Rust paths are skipped: the projection is per-language by design and only
+    /// Rust has a projector.
+    async fn ingest_written(&self, session: &Session, graph: &plan_graph::PlanGraph) {
+        let Some(store) = &session.graph else {
+            return;
+        };
+        let mut seen: std::collections::BTreeSet<&str> = Default::default();
+        for node in &graph.provenance().nodes {
+            // Code nodes are `{plan}:code:{path}`; match on the kind rather than
+            // reaching for the plan id, which the graph keeps private.
+            if node.kind != plan_graph::NodeKind::Code {
+                continue;
+            }
+            let Some(path) = node.id.rsplit(":code:").next() else {
+                continue;
+            };
+            if !path.ends_with(".rs") || !seen.insert(path) {
+                continue;
+            }
+            let Ok(bytes) = session.vfs.read(path).await else {
+                continue; // written then removed, or outside the VFS
+            };
+            let Ok(src) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let Ok(fw) = crate::projection::ingest::file(path, &src) else {
+                continue; // unparseable mid-edit: leave the previous nodes in place
+            };
+            if let Err(e) = store.replace_file(&fw) {
+                eprintln!("code ingest unavailable ({e}); skipping");
+                return;
+            }
+        }
     }
 
     /// Persist a plan's provenance subgraph to the graph store, if one is open.

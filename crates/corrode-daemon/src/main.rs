@@ -24,8 +24,9 @@ mod plan_graph;
 mod project;
 mod planner;
 mod roles;
-// Projection-fidelity checks. Test-only until a projector exists that uses them at
-// runtime — better than an allow(dead_code) on a module that looks like API.
+mod projection;
+// Projection-fidelity checks. Test-only: these MEASURE the projection rather than
+// performing it, and their corpora are whole repositories.
 #[cfg(test)]
 mod roundtrip;
 mod sandbox;

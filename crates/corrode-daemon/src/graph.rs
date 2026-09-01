@@ -48,6 +48,21 @@ pub trait GraphStore: Send + Sync {
     /// a shrunk/shifted doc never leaves stale chunks serving deleted content.
     fn replace_doc(&self, doc: &DocWrite) -> anyhow::Result<()>;
 
+    /// Replace a source file and ALL its nodes atomically: the `file` node, each code
+    /// node with its verbatim text, each comment node, and the edges binding them
+    /// (`part_of` file, `in_node`, `describes`). Prunes anything previously linked to
+    /// this file that is not in the write — so re-ingesting a shrunk or reordered file
+    /// never leaves a node serving deleted code.
+    ///
+    /// Same contract as [`GraphStore::replace_doc`], for the same reason: re-ingest is
+    /// how staleness is prevented, and it is only safe if replacement is atomic.
+    ///
+    /// Default is a no-op error so a store that has not implemented it fails loudly
+    /// rather than silently accepting writes it drops.
+    fn replace_file(&self, _file: &crate::projection::ingest::FileWrite) -> anyhow::Result<()> {
+        anyhow::bail!("replace_file is not implemented by this store")
+    }
+
     /// Every ingested document as `(doc_id, title)`, so the UI can show what the
     /// doc GraphRAG holds (ingest -> list -> ask). Chunks/provenance nodes are
     /// excluded (kind == "doc" only).

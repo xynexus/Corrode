@@ -418,7 +418,8 @@ falsify it.
 | A canonical-form repo would remove the need for verbatim text | **REJECTED on cost, not feasibility** — converges in 2 passes, but destroys 35k body comments | `roundtrip::canonical` viability | — |
 | The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
 | Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
-| The graph is the source of truth, files a projection | **aspiration** | — | bijective line numbers |
+| The graph is the source of truth, files a projection | **aspiration** — ingest built, projection direction unwired | — | bijective line numbers |
+| Re-ingest on write keeps the code index fresh | **UNTESTED** — wired, needs a live `--features helix` store | ingest a repo, edit a file, query the graph | trusting index-backed search |
 
 Why this section exists, from the record of one session: every miss was a claim nobody
 executed. "Two of the five survivors fall to property tests" — `needle.vocab` is plain
