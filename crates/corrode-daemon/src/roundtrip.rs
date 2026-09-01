@@ -704,6 +704,11 @@ pub mod compose {
         pub scan_line: usize,
     }
 
+    /// Public alias so the `describes` visitor can label item anchors identically.
+    pub fn kind_of_public(item: &syn::Item) -> &'static str {
+        kind_of(item)
+    }
+
     fn kind_of(item: &syn::Item) -> &'static str {
         match item {
             syn::Item::Fn(_) => "fn",
@@ -1437,5 +1442,304 @@ pub mod comments {
             kind,
             text: src[start..end].to_string(),
         }
+    }
+}
+
+/// What a comment DESCRIBES, as an edge rather than a position.
+///
+/// Graph search asks two things a coordinate cannot answer: what is this comment
+/// about, and what commentary applies to this region of code. Both need an edge from
+/// the comment to the syntax element it annotates.
+///
+/// `syn` gives spans for any syntax node, not just top-level items — a statement inside
+/// a body has a byte range like anything else — so anchors go all the way down without
+/// a lossless CST. That corrects an earlier note in this module.
+pub mod describes {
+    use super::comments::{CommentRef, Kind};
+    use syn::spanned::Spanned;
+    use syn::visit::Visit;
+
+    /// A syntax element a comment can be about.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Anchor {
+        pub kind: &'static str,
+        pub start: usize,
+        pub end: usize,
+    }
+
+    /// How the comment relates to what it describes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Relation {
+        /// On its own line(s), immediately above the element.
+        Precedes,
+        /// After code on the same line — describes that line's element.
+        Trailing,
+        /// Nothing follows it in scope; it belongs to the element enclosing it.
+        Encloses,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Edge {
+        pub comment: CommentRef,
+        pub relation: Relation,
+        pub target: Option<Anchor>,
+    }
+
+    #[derive(Default)]
+    struct Collect {
+        anchors: Vec<Anchor>,
+    }
+
+    impl<'ast> Visit<'ast> for Collect {
+        fn visit_item(&mut self, i: &'ast syn::Item) {
+            let s = i.span().byte_range();
+            self.anchors.push(Anchor {
+                kind: super::compose::kind_of_public(i),
+                start: s.start,
+                end: s.end,
+            });
+            syn::visit::visit_item(self, i);
+        }
+        fn visit_stmt(&mut self, s: &'ast syn::Stmt) {
+            let r = s.span().byte_range();
+            self.anchors.push(Anchor {
+                kind: "stmt",
+                start: r.start,
+                end: r.end,
+            });
+            syn::visit::visit_stmt(self, s);
+        }
+        fn visit_arm(&mut self, a: &'ast syn::Arm) {
+            let r = a.span().byte_range();
+            self.anchors.push(Anchor {
+                kind: "match_arm",
+                start: r.start,
+                end: r.end,
+            });
+            syn::visit::visit_arm(self, a);
+        }
+        fn visit_field(&mut self, f: &'ast syn::Field) {
+            let r = f.span().byte_range();
+            self.anchors.push(Anchor {
+                kind: "field",
+                start: r.start,
+                end: r.end,
+            });
+            syn::visit::visit_field(self, f);
+        }
+    }
+
+    /// Every anchorable element in the file, innermost-last.
+    pub fn anchors(src: &str) -> anyhow::Result<Vec<Anchor>> {
+        let file = syn::parse_file(src)?;
+        let mut c = Collect::default();
+        c.visit_file(&file);
+        c.anchors.sort_by_key(|a| (a.start, std::cmp::Reverse(a.end)));
+        Ok(c.anchors)
+    }
+
+    /// Bind each comment to what it describes.
+    pub fn bind(src: &str, comments: &[CommentRef], anchors: &[Anchor]) -> Vec<Edge> {
+        comments
+            .iter()
+            .map(|c| {
+                let start = byte_of(src, c);
+                let end = start + c.text.len();
+                // Is there code before it on this line? Then it trails that code.
+                let line_start = src[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let trailing = !src[line_start..start].trim().is_empty();
+
+                let (relation, target) = if trailing {
+                    // The innermost anchor whose span covers the code to its left.
+                    let t = anchors
+                        .iter()
+                        .filter(|a| a.start <= start && a.end >= line_start)
+                        .min_by_key(|a| a.end - a.start)
+                        .cloned();
+                    (Relation::Trailing, t)
+                } else {
+                    // The first element starting after it — what it introduces.
+                    match anchors.iter().filter(|a| a.start >= end).min_by_key(|a| a.start) {
+                        Some(a) => (Relation::Precedes, Some(a.clone())),
+                        None => {
+                            let t = anchors
+                                .iter()
+                                .filter(|a| a.start <= start && a.end >= end)
+                                .min_by_key(|a| a.end - a.start)
+                                .cloned();
+                            (Relation::Encloses, t)
+                        }
+                    }
+                };
+                Edge {
+                    comment: c.clone(),
+                    relation,
+                    target,
+                }
+            })
+            .collect()
+    }
+
+    /// Query 2: what commentary applies to a byte region of the source?
+    ///
+    /// Everything whose TARGET falls in the region — so a comment introducing a
+    /// function is returned when asking about that function's body, not merely when
+    /// asking about the line it sits on.
+    pub fn comments_for(edges: &[Edge], from: usize, to: usize) -> Vec<&Edge> {
+        edges
+            .iter()
+            .filter(|e| match &e.target {
+                Some(a) => a.start < to && a.end > from,
+                None => false,
+            })
+            .collect()
+    }
+
+    /// Doc comments already reach the AST as attributes; plain ones are the reason this
+    /// module exists.
+    pub fn is_plain(c: &CommentRef) -> bool {
+        matches!(c.kind, Kind::Line | Kind::Block)
+    }
+
+    fn byte_of(src: &str, c: &CommentRef) -> usize {
+        // `abs_line` is 1-based; walk to that line then find the comment text on it.
+        let mut at = 0usize;
+        for _ in 1..c.abs_line {
+            match src[at..].find('\n') {
+                Some(i) => at += i + 1,
+                None => break,
+            }
+        }
+        let line_end = src[at..].find('\n').map(|i| at + i).unwrap_or(src.len());
+        let first = c.text.lines().next().unwrap_or("");
+        src[at..line_end].find(first).map(|i| at + i).unwrap_or(at)
+    }
+}
+
+#[cfg(test)]
+mod describes_tests {
+    use super::comments;
+    use super::compose;
+    use super::describes::*;
+
+    const SRC: &str = "\
+/// documented
+fn outer() {
+    // sets the seed
+    let seed = 7;
+    let x = compute(seed); // trailing note
+    match x {
+        // the happy path
+        Ok(v) => use_it(v),
+        Err(_) => {}
+    }
+}
+";
+
+    fn edges_for(src: &str) -> Vec<Edge> {
+        let nodes = compose::scan("t.rs", src).unwrap();
+        let cs = comments::extract("t.rs", src, &nodes);
+        let anchors = anchors(src).unwrap();
+        bind(src, &cs, &anchors)
+    }
+
+    /// Query 1: what is this comment describing?
+    #[test]
+    fn a_comment_resolves_to_the_element_it_describes() {
+        let edges = edges_for(SRC);
+        let find = |needle: &str| {
+            edges
+                .iter()
+                .find(|e| e.comment.text.contains(needle))
+                .unwrap_or_else(|| panic!("no comment matching {needle}"))
+        };
+
+        let seed = find("sets the seed");
+        assert_eq!(seed.relation, Relation::Precedes);
+        let t = seed.target.as_ref().expect("has a target");
+        assert_eq!(t.kind, "stmt");
+        assert!(SRC[t.start..t.end].starts_with("let seed"), "{:?}", &SRC[t.start..t.end]);
+
+        // A trailing comment describes the code to its LEFT, not the next line.
+        let trailing = find("trailing note");
+        assert_eq!(trailing.relation, Relation::Trailing);
+        let t = trailing.target.as_ref().expect("has a target");
+        assert!(SRC[t.start..t.end].contains("compute(seed)"), "{:?}", &SRC[t.start..t.end]);
+
+        // Sub-item granularity: a comment inside a match binds to the arm.
+        let arm = find("happy path");
+        let t = arm.target.as_ref().expect("has a target");
+        assert_eq!(t.kind, "match_arm");
+        assert!(SRC[t.start..t.end].starts_with("Ok(v)"), "{:?}", &SRC[t.start..t.end]);
+    }
+
+    /// Query 2: what commentary applies to this region of code?
+    #[test]
+    fn a_region_resolves_to_the_commentary_about_it() {
+        let edges = edges_for(SRC);
+        let match_start = SRC.find("match x").unwrap();
+        let match_end = SRC[match_start..].find("\n    }").unwrap() + match_start;
+
+        let found = comments_for(&edges, match_start, match_end);
+        let texts: Vec<&str> = found.iter().map(|e| e.comment.text.trim()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("happy path")),
+            "the arm's comment belongs to the match region: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("sets the seed")),
+            "a comment about an earlier statement does not: {texts:?}"
+        );
+    }
+
+    /// Over a real repo: how much commentary actually binds to something?
+    #[test]
+    fn binding_census() {
+        let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let out = std::process::Command::new("git")
+            .arg("-C").arg(&repo).args(["ls-files", "-s", "-z"])
+            .output().expect("git");
+        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter_map(|r| {
+                let (m, p) = r.split_once('\t')?;
+                (matches!(m.split_whitespace().next()?, "100644" | "100755") && p.ends_with(".rs"))
+                    .then(|| p.to_string())
+            })
+            .collect();
+
+        let (mut bound, mut unbound) = (0usize, 0usize);
+        let mut rel: std::collections::BTreeMap<&'static str, usize> = Default::default();
+        let mut kinds: std::collections::BTreeMap<&'static str, usize> = Default::default();
+        for f in &files {
+            let Ok(src) = std::fs::read_to_string(std::path::Path::new(&repo).join(f)) else { continue };
+            let Ok(nodes) = compose::scan(f, &src) else { continue };
+            let Ok(a) = anchors(&src) else { continue };
+            for e in bind(&src, &comments::extract(f, &src, &nodes), &a) {
+                if !is_plain(&e.comment) { continue; }
+                match &e.target {
+                    Some(t) => {
+                        bound += 1;
+                        *kinds.entry(t.kind).or_default() += 1;
+                        *rel.entry(match e.relation {
+                            Relation::Precedes => "precedes",
+                            Relation::Trailing => "trailing",
+                            Relation::Encloses => "encloses",
+                        }).or_default() += 1;
+                    }
+                    None => unbound += 1,
+                }
+            }
+        }
+        eprintln!("--- comment binding over {} files ---", files.len());
+        eprintln!("  plain comments bound to an element: {bound}, unbound: {unbound}");
+        eprintln!("  relation: {}", rel.iter().map(|(k,v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
+        eprintln!("  target kinds: {}", kinds.iter().map(|(k,v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
+        assert!(!files.is_empty());
     }
 }

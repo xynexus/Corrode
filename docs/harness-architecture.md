@@ -492,12 +492,29 @@ already hold: 2,187 comment blocks in hipfire bind to the item they introduce, a
 file still regenerates byte-exactly because attachment is a view over the nodes rather
 than a transformation of them.
 
-The limit is sub-item granularity. **35,477 plain-comment lines live inside function
-bodies**, kept verbatim inside their node but not attachable to the statement they
-describe. Resolving those needs a lossless concrete syntax tree — rust-analyzer's
-`ra_ap_syntax`, built on `rowan`, which keeps every byte including trivia as a node.
-That is the right tool if comments must attach to sub-item elements; it is not needed
-for projection, which spans already satisfy.
+**Position is not the useful relation; the edge is.** Graph search asks what a comment
+is *about*, and what commentary applies to a *region* — neither of which a coordinate
+answers. `describes` binds each comment to the syntax element it annotates, with the
+relation typed: `Precedes` (introduces the element below it), `Trailing` (annotates the
+code to its left, on the same line), `Encloses` (nothing follows in scope, so it belongs
+to its container).
+
+Sub-item granularity turned out not to need a CST after all, correcting an earlier note
+here: `syn` gives a byte range for *any* syntax node, so statements, match arms and
+struct fields are anchorable exactly like items. Measured over hipfire, **44,562 of
+44,574 plain comments bind to an element — 12 unbound**:
+
+| relation | | target kind | |
+|---|---|---|---|
+| precedes | 41,086 | stmt | 34,627 |
+| trailing | 3,421 | use | 3,205 |
+| encloses | 55 | match_arm | 1,568 |
+| | | fn | 1,564 |
+
+Statements dominate, which is the point: the 35,477 body comments that looked
+unreachable are the bulk of the corpus's reasoning, and they resolve to the statement
+they describe. `ra_ap_syntax` remains the tool if a comment ever has to bind *below*
+expression level, which nothing here needs.
 
 Line numbers fall out of the same mechanism. A node knows where it lands, so
 `path:line` is derived at projection time; an edit above a node shifts it, which is
