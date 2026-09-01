@@ -12,6 +12,7 @@
 mod approval;
 mod daemon;
 mod dialect;
+mod digest;
 mod doctor;
 #[cfg(feature = "fuse")]
 mod fuse;

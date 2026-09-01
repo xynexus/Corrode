@@ -133,9 +133,6 @@ const MAX_PATH_VALUES: usize = 64;
 /// Cap on how many bytes of a file a `read_file` observation carries back into the
 /// model's context — enough to be useful without blowing the window.
 const MAX_READ_BYTES: usize = 4096;
-/// Cap on captured command / script output. Retained as head+tail so a build/test
-/// failure (error at the end) survives alongside the command's start.
-const MAX_CMD_BYTES: usize = 8192;
 
 /// Whether a tool call mutates or executes and so must clear the human approval gate
 /// before it runs. Read-only tools (read_file, list_dir) return false.
@@ -561,6 +558,11 @@ fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
 }
 
 /// Format a finished process's exit code + stdout/stderr into a bounded observation.
+///
+/// Delegates to [`crate::digest`], which recognizes rustc diagnostics and libtest
+/// results and renders them structured. It matters that this is not a plain truncation:
+/// a build log prints progress first and its verdict last, so the previous head-only cut
+/// kept the least useful bytes and dropped the counts entirely.
 fn format_command_output(out: std::process::Output) -> String {
     let mut text = String::new();
     if !out.stdout.is_empty() {
@@ -570,23 +572,7 @@ fn format_command_output(out: std::process::Output) -> String {
         text.push_str("\n[stderr]\n");
         text.push_str(&String::from_utf8_lossy(&out.stderr));
     }
-    if text.len() > MAX_CMD_BYTES {
-        // Keep the head AND the tail: for `cargo build`/`test`, what ran is at the
-        // top but the error/summary is at the bottom — head-only truncation hid it.
-        let half = MAX_CMD_BYTES / 2;
-        let head_end = floor_char_boundary(&text, half);
-        let mut tail_start = text.len() - half;
-        while !text.is_char_boundary(tail_start) {
-            tail_start += 1;
-        }
-        let elided = tail_start - head_end;
-        text = format!(
-            "{}\n… ({elided} bytes elided) …\n{}",
-            &text[..head_end],
-            &text[tail_start..]
-        );
-    }
-    format!("exit {}:\n{}", out.status.code().unwrap_or(-1), text.trim())
+    crate::digest::command_observation(out.status.code().unwrap_or(-1), &text)
 }
 
 /// Largest index `<= max` on a char boundary — truncating mid-multibyte-char panics.
@@ -749,7 +735,7 @@ mod tests {
 
         // Command output over the cap keeps head AND tail (a unique marker at each
         // end must survive), elides the middle, and never splits a multibyte char.
-        let big = format!("HEADMARK{}TAILMARK", "€".repeat(MAX_CMD_BYTES));
+        let big = format!("HEADMARK{}TAILMARK", "€".repeat(8192));
         let out = std::process::Output {
             status: std::process::ExitStatus::from_raw(0),
             stdout: big.into_bytes(),
