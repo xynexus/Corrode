@@ -3,10 +3,11 @@
 **Status: aspirational.** This is a target, not a description. What exists today is
 the swarm (`plan_graph` reactive scheduling, role→model routing, priority bands,
 `CORRODE_FANOUT` ensembles, the plan-review pass), the tool loop behind an approval
-gate, and a filesystem `PassthroughVfs`; project scoping (`project.rs`) is on
-`feat/project-awareness` and not yet on `main`. What does not exist: the graph
-write path (`graph.rs` stubs bail), telemetry, sandboxing, cancellation, and
-budgets. Sections below mark which is which.
+gate, a filesystem `PassthroughVfs`, **bubblewrap sandboxing** (`sandbox.rs`), and a
+**live provenance write path** — `upsert_node`/`add_edge` are real LMDB write
+transactions under `--features helix`, not stubs. Project scoping (`project.rs`),
+telemetry, structured observations, budgets and cancellation are in review. Sections
+below mark which is which.
 
 Companion documents: `graph-model.md` (the graph the VFS projects from) and
 `todo/`. This one is about the harness *around* the models.
@@ -93,7 +94,7 @@ reads the largest `<n>b` marker in the id; its own test asserts
 benchmark does not, and was observed emitting `<tool_call>` blocks into a void that
 nothing reads.
 
-**Nothing is sandboxed.** `run_command` and `run_skill_script` execute
+**Nothing is sandboxed** *(fixed since — see the note at the end of this section)*. `run_command` and `run_skill_script` execute
 model-generated shell directly on the host with the user's privileges. `bwrap` is
 installed and invoked nowhere — not in corrode, not in hipfire, not in any unit or
 wrapper. The `Vfs` escape guard covers `read_file`/`write_file`; `run_command`
@@ -115,6 +116,13 @@ the opposite conclusion would have sent the next month into embedding work.
 
 **No telemetry existed to notice any of this.** The benchmark above and the
 correctness harness were written by hand for one session and thrown away.
+
+**What has since changed.** This section is a dated record and is left as measured,
+but two of its findings no longer hold: `sandbox.rs` now wraps every spawned process
+in an unprivileged `bwrap` namespace — repo read-write, graph store read-only, rest
+of the filesystem read-only, no network by default — and fails closed rather than
+dropping silently to unsandboxed when `bwrap` is unavailable. Telemetry is in review.
+The rest of the section stands.
 
 ## 3. Principles
 
@@ -267,6 +275,14 @@ grant, not one approval prompt. Speculative execution (§5.3) is only sound when
 abandoning a branch is free, which means worktrees and snapshots come *before* the
 orchestrator is allowed to fan out writes.
 
+Half of this exists. `sandbox.rs` provides *confinement* — a `bwrap` namespace per
+spawned process, failing closed — but not *tiering*: approval is still one yes/no per
+mutating call, and `CORRODE_AUTO_APPROVE` removes even that for unattended runs. The
+two interact in the direction that matters: with auto-approve on, the sandbox is the
+only boundary left, so it stops being defence in depth and becomes the whole defence.
+Tiered grants are what would let an unattended swarm keep *some* authority without
+being handed all of it.
+
 ## 4. Structure
 
 Three planes. The split matters because they have different persistence and
@@ -279,8 +295,9 @@ profiles. Owned by the harness, survives model replacement and context compressi
 the code it touched, and the evidence it saw are one traversal apart.
 
 **Execution plane** — the real engineering loop: filesystem, shell, build,
-formatters, linters, tests, debugger, profiler, git, CI. Every action sandboxed and
-capability-gated (§3.7), every result a structured observation (§3.5).
+formatters, linters, tests, debugger, profiler, git, CI. Every action sandboxed
+(`sandbox.rs`, real) and capability-gated (§3.7, still one yes/no), every result a
+structured observation (§3.5).
 
 **Supervision plane** — what a human sees and steers: the live task graph, active
 agents, hypotheses, proposed diffs, test status, spend against budget, and
@@ -340,7 +357,16 @@ decision, not a default); step 7's gating measurement is taken. Marked below.
 4. **[shipped]** **Telemetry.** Model, context composition, retrieved objects, tool calls, tokens,
    wall-clock, patch, test result, outcome. Nothing after this point can be tuned
    without it, and it makes every later claim falsifiable.
-5. **[not started — needs a policy decision]** **Sandbox and capability tiers** (§3.7) — before autonomy widens, not after.
+5. **[shipped, partially]** **Sandbox and capability tiers** (§3.7). `sandbox.rs`
+   confines every spawned process — the agent's `run_command`/`run_skill_script` and
+   the web terminal alike — in an unprivileged `bwrap` user namespace: repo
+   read-write, graph store read-only, everything else read-only, no network unless
+   `CORRODE_SANDBOX_NET` says so. Off by default (`CORRODE_SANDBOX`) so existing
+   behaviour is unchanged, and it fails CLOSED: if `bwrap` cannot run, the command
+   does not either. The *capability tiers* half is still open — approval remains one
+   yes/no per mutating call, not a graded grant, and `CORRODE_AUTO_APPROVE` can
+   disable even that for unattended runs, which is precisely the configuration that
+   makes the sandbox load-bearing rather than belt-and-braces.
 6. **[shipped, partially]** **Cancellation and budgets** (§3.6, §5.1). A turn
    declares a wall-clock ceiling; past it nothing new launches, emissions are
    dropped, and a tool loop stops at its next step boundary. Not preemption — a task
