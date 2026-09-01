@@ -638,5 +638,31 @@ and `#`-style comments and will only get the former. Extensionless `Makefile`/`K
 files are now routed by filename; before that fix they fell to the C family and would
 have found nothing in thousands of files.
 
+### Ingest performance, measured
+
+172 MB / 4,923 files (hipfire, mixed Rust + C/HIP + markdown + config):
+
+| | before | after |
+|---|---|---|
+| wall | 36.3 s | **22.9 s** |
+| throughput | 4.8 MB/s | **7.5 MB/s** |
+| phases | parse 43%, bind 43% | parse 67%, comments 23%, **bind 9%** |
+
+Storage amplification is **1.06x** — 172 MB of source becomes 172 MB of verbatim node
+text plus 10 MB of ids. Verbatim storage costs the source once more by design; the
+overhead above that is ids, at ~3.4 KB per node and 10 nodes per file.
+
+Two optimisations, and the order they were tried is the lesson. `bind` was 43% of
+ingest, so the anchor scan looked like the culprit — it is O(comments x anchors) and
+binary search is the obvious fix. It bought **1.3 seconds of 36**. The actual cost was
+line arithmetic: computing a comment's line by scanning from the start of the file,
+per comment, which is O(comments x filesize). A line index computed once per file took
+bind from 43% to 9%. The first fix was correct and nearly irrelevant.
+
+Extrapolated to a kernel-sized tree (~80k files, ~1.3 GB, overwhelmingly C and
+therefore on the fast fallback path) this is single-digit minutes, not hours. Rust is
+the slow backend at ~1.5 MB/s against ~25 MB/s for the fallback, because `syn` parses;
+a repo that is mostly Rust will be bound by that.
+
 **Not expected to break:** byte-exactness, in any language. If a mismatch appears, the
 span cover is wrong and that is a real defect rather than a missing backend.

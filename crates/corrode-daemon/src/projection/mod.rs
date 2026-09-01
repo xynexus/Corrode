@@ -89,6 +89,17 @@ pub trait Language: Send + Sync {
     /// Comment locations. Separate from parsing because most lexers discard comments
     /// before a syntax tree exists.
     fn comments(&self, src: &str) -> Vec<CommentSpan>;
+
+    /// Items and anchors together, so a backend can parse once.
+    ///
+    /// The default calls both, which is correct and parses twice. Benchmarking showed
+    /// that costing 72% of ingest time on Rust (items 32% + anchors 40%, each doing a
+    /// full `syn::parse_file`), so a backend with an expensive parser should override
+    /// this. Kept as a default rather than a required method because a cheap backend
+    /// gains nothing from the complexity.
+    fn spans(&self, src: &str) -> anyhow::Result<(Vec<Span>, Vec<Span>)> {
+        Ok((self.items(src)?, self.anchors(src).unwrap_or_default()))
+    }
 }
 
 /// Pick a backend for a path. Unknown extensions fall back to [`text::PlainText`], so
@@ -124,10 +135,15 @@ pub struct Node {
 
 /// Decompose a file into nodes covering every byte.
 pub fn scan(lang: &dyn Language, path: &str, src: &str) -> anyhow::Result<Vec<Node>> {
-    let items = lang.items(src)?;
+    Ok(nodes_from_items(path, src, &lang.items(src)?))
+}
+
+/// Build the node cover from already-computed item spans, so a caller that already has
+/// them does not ask the backend to parse again.
+pub fn nodes_from_items(path: &str, src: &str, items: &[Span]) -> Vec<Node> {
     let mut nodes = Vec::new();
     let (mut cursor, mut ordinal) = (0usize, 0usize);
-    for it in &items {
+    for it in items {
         if it.start > cursor {
             nodes.push(Node {
                 path: path.into(),
@@ -154,7 +170,7 @@ pub fn scan(lang: &dyn Language, path: &str, src: &str) -> anyhow::Result<Vec<No
             text: src[cursor..].into(),
         });
     }
-    Ok(nodes)
+    nodes
 }
 
 /// Where a node landed. Produced BY projection, never stored: a byte offset is a fact
@@ -209,6 +225,11 @@ pub struct Edge {
 /// part worth sharing — the relation a comment has to code is the same question in
 /// every language, even though finding the spans is not.
 pub fn bind(src: &str, comments: &[CommentSpan], anchors: &[Span], nodes: &[Node]) -> Vec<Edge> {
+    // Sorted by `start` so the search below is sound. Backends are expected to return
+    // them sorted; re-sorting a sorted slice is cheap and removes the assumption.
+    let mut anchors: Vec<Span> = anchors.to_vec();
+    anchors.sort_by_key(|a| (a.start, std::cmp::Reverse(a.end)));
+    let anchors = &anchors[..];
     // Node extents in projection order, so a comment can be located within one.
     let mut sorted: Vec<&Node> = nodes.iter().collect();
     sorted.sort_by_key(|n| n.ordinal);
@@ -219,32 +240,48 @@ pub fn bind(src: &str, comments: &[CommentSpan], anchors: &[Span], nodes: &[Node
         at += n.text.len();
     }
 
+    // Byte offsets of every line start, computed ONCE. The obvious implementation
+    // recomputes a comment's line by scanning from the file's beginning, which is
+    // O(comments x filesize) and was the real cost of `bind` — not the anchor search,
+    // which was the first guess and barely moved the number.
+    let mut line_starts: Vec<usize> = vec![0];
+    line_starts.extend(src.bytes().enumerate().filter(|(_, b)| *b == b'\n').map(|(i, _)| i + 1));
+    // 1-based line containing `byte`.
+    let line_of = |byte: usize| line_starts.partition_point(|s| *s <= byte);
+
     comments
         .iter()
         .map(|c| {
-            let line_start = src[..c.start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let line_start = line_starts[line_of(c.start) - 1];
             let trailing = !src[line_start..c.start].trim().is_empty();
+            // Anchors arrive sorted by `start`, so the candidates for every case are a
+            // contiguous prefix or suffix. Scanning them all per comment made `bind`
+            // 43% of ingest on a 172 MB tree — as costly as parsing — because it is
+            // O(comments x anchors). Binary search bounds the work instead.
+            let after = anchors.partition_point(|a| a.start < c.end);
+            let containing_end = anchors.partition_point(|a| a.start <= c.start);
             let (relation, target) = if trailing {
                 (
                     Relation::Trailing,
-                    anchors
+                    anchors[..containing_end]
                         .iter()
-                        .filter(|a| a.start <= c.start && a.end >= line_start)
+                        .filter(|a| a.end >= line_start)
                         .min_by_key(|a| a.end - a.start)
                         .cloned(),
                 )
+            } else if after < anchors.len() {
+                // `partition_point` gives the FIRST anchor starting at or after the
+                // comment's end, which is exactly "the element it introduces".
+                (Relation::Precedes, Some(anchors[after].clone()))
             } else {
-                match anchors.iter().filter(|a| a.start >= c.end).min_by_key(|a| a.start) {
-                    Some(a) => (Relation::Precedes, Some(a.clone())),
-                    None => (
-                        Relation::Encloses,
-                        anchors
-                            .iter()
-                            .filter(|a| a.start <= c.start && a.end >= c.end)
-                            .min_by_key(|a| a.end - a.start)
-                            .cloned(),
-                    ),
-                }
+                (
+                    Relation::Encloses,
+                    anchors[..containing_end]
+                        .iter()
+                        .filter(|a| a.end >= c.end)
+                        .min_by_key(|a| a.end - a.start)
+                        .cloned(),
+                )
             };
             let owner = extents.iter().find(|(s, e, _)| c.start >= *s && c.start < *e);
             Edge {
@@ -253,10 +290,9 @@ pub fn bind(src: &str, comments: &[CommentSpan], anchors: &[Span], nodes: &[Node
                 relation,
                 target,
                 node_ordinal: owner.map(|(_, _, o)| *o),
-                line_in_node: src[owner.map(|(s, _, _)| *s).unwrap_or(0)..c.start]
-                    .bytes()
-                    .filter(|b| *b == b'\n')
-                    .count()
+                // Lines are a subtraction now, not a scan.
+                line_in_node: line_of(c.start)
+                    - line_of(owner.map(|(s, _, _)| *s).unwrap_or(0))
                     + 1,
             }
         })

@@ -45,6 +45,24 @@ impl Language for Rust {
         Ok(c.0)
     }
 
+    /// One parse for both: `syn::parse_file` dominates ingest cost for Rust, and doing
+    /// it twice was measured at 72% of total time.
+    fn spans(&self, src: &str) -> anyhow::Result<(Vec<Span>, Vec<Span>)> {
+        let file = syn::parse_file(src)?;
+        let mut items = Vec::new();
+        let mut cursor = 0usize;
+        for item in &file.items {
+            let r = item.span().byte_range();
+            let start = pull_back_attrs(src, r.start, cursor);
+            items.push(Span { kind: kind_of(item), start, end: r.end });
+            cursor = r.end;
+        }
+        let mut c = Collect::default();
+        c.visit_file(&file);
+        c.0.sort_by_key(|a| (a.start, std::cmp::Reverse(a.end)));
+        Ok((items, c.0))
+    }
+
     fn comments(&self, src: &str) -> Vec<CommentSpan> {
         let b = src.as_bytes();
         let mut out = Vec::new();

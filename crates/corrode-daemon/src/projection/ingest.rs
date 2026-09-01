@@ -4,7 +4,7 @@
 //! whatever the backend is. Ids derive from path + ordinal, so re-ingesting addresses
 //! the same nodes rather than accumulating duplicates.
 
-use super::{bind, project as project_nodes, scan, CommentKind, Language, Relation};
+use super::{bind, project as project_nodes, CommentKind, Language, Relation};
 
 
 /// One code node: an item, with its verbatim text.
@@ -53,10 +53,11 @@ pub struct FileWrite {
 /// Trivia nodes are kept: they carry the whitespace that makes projection
 /// byte-exact. They are marked as such so a query can ignore them.
 pub fn file(lang: &dyn Language, path: &str, src: &str) -> anyhow::Result<FileWrite> {
-    let nodes = scan(lang, path, src)?;
+    // One call so a backend with an expensive parser parses once (see `Language::spans`).
     // A backend with no grammar returns no anchors; comments then bind to nothing,
     // which is reported rather than guessed.
-    let anchors = lang.anchors(src).unwrap_or_default();
+    let (items, anchors) = lang.spans(src)?;
+    let nodes = super::nodes_from_items(path, src, &items);
     let edges = bind(src, &lang.comments(src), &anchors, &nodes);
 
     let code = nodes
