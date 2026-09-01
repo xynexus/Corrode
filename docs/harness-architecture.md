@@ -400,7 +400,47 @@ it, and the system currently cannot name the repository it is working in.
 - **Autonomy ahead of auditability.** Any capability that cannot report what it did
   and why is not shipped, regardless of how well it demos.
 
-## 8. Open questions
+## 8. Load-bearing assumptions
+
+An open question costs a decision. A load-bearing assumption costs a *rewrite* — it is
+a claim that, if false, invalidates work already built on it. They are tracked
+separately for that reason, and each one names the cheapest experiment that would
+falsify it.
+
+**The rule: dependent work does not start while its assumption is UNTESTED.**
+
+| assumption | status | falsifying test | blocks |
+|---|---|---|---|
+| A shared prefix is prefilled once and reused | **FALSE today** | `cached_tokens > 0` on a repeated prefix | §3.2 entirely; all layering |
+| Composing a file from graph nodes is byte-exact | **UNTESTED** | round-trip check over real Rust | graph-backed VFS; derived line numbers |
+| The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
+| Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
+| The graph is the source of truth, files a projection | **aspiration** | — | bijective line numbers |
+
+Why this section exists, from the record of one session: every miss was a claim nobody
+executed. "Two of the five survivors fall to property tests" — `needle.vocab` is plain
+text and does not. "Shared prefix means shared KV" — the cross-session cache has never
+engaged, and `cached_tokens: 0` sat in a benchmark result hours before §3.2 was written
+asserting the economics of it. "Metadata latency will dominate a FUSE build" — metadata
+is 1.5x, bulk reads are 16x, so the hypothesis was not merely unproven but inverted.
+
+Two habits follow, and both are cheap:
+
+**Measure the artifact, not a proxy.** The prefix defect was invisible until someone
+printed the literal prefix. A sibling-discrimination run produced a dramatic false
+negative because it measured `\brief` text that three of the four files did not have.
+
+**Record predictions so being wrong is cheap.** When a measurement contradicts a
+document, correct the document with a dated note rather than quietly working around it.
+Three lines of diff, and the next reader inherits the correction instead of the error.
+
+The counter-example worth imitating is already in this codebase:
+`FallbackReason::MacroExpansion` was written before any projector existed. Someone at
+design time asked what would break when composing Rust, and put the answer in the type
+system. That is the same failure — macros absent from an AST — that costs a comparable
+published system its worst score (0.58 versus 1.00; §10).
+
+## 9. Open questions
 
 - ~~**Does the embedding model discriminate?**~~ **Answered** (§2): yes — 0.250 mean
   top-8 spread on real code, versus 0.057 on an unmatched query. Retrieval was never
@@ -423,3 +463,47 @@ it, and the system currently cannot name the repository it is working in.
   task is clear; a hunk authored by one agent and revised by another is not.
 - **How much context is too much?** No measurement exists relating context size to
   success rate. Telemetry (step 4) is what turns this from taste into data.
+
+## 10. Related work
+
+**Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via
+MCP** (Vogel, Meyer-Eschenbach, Kohler, Grünewald, Balzer, arXiv 2603.27277). Parses
+66 languages with Tree-Sitter into a SQLite knowledge graph served over MCP. Linux
+kernel in ~3 minutes (2.1M nodes, 4.9M edges); sub-millisecond queries against 10-30s
+for a file-exploration agent; **10x fewer tokens and 2.1x fewer tool calls**.
+
+It independently reaches the architecture §6 step 7 is heading for: *"the optimal
+architecture is a hybrid: graph-based retrieval for structural queries, with fallback
+to file exploration for source-level tasks."* Their failure analysis names the same two
+categories the hybrid exists to cover — full source context (16/31 languages) and
+exhaustive call-site grep (10/31), *"queries requiring line-level code that the graph
+intentionally does not store."*
+
+Three divergences matter here, and each is a decision rather than an oversight:
+
+**They store no line numbers; we can derive them.** Their graph is an index *derived
+from* files, so line information is lost at parse time and they pay for it in exactly
+those two categories. Corrode inverts the direction — files are a projection *of* the
+graph — so a line number is a function of the projection rather than a fact to store.
+Deriving on a hit also costs nothing until something is found, and storing absolute
+lines would reintroduce staleness: one insertion at the top of a file invalidates every
+node below it. Store position relative to the node; resolve absolute lines at query
+time.
+
+**They use no embeddings at all** — Table 7 lists "No embed. model" as a design choice.
+That silently bounds what their benchmark can ask: their 12 categories are structural
+(who calls this, what does it return), and an AST index cannot serve an intent-shaped
+query. Measured here, embedding retrieval answered 4/4 queries with *zero* literal
+overlap where substring search returns nothing. So their 83% vs 92% is not a ceiling
+for a system with both; it is the score on a question set that excludes the capability.
+
+**Macros.** Their worst case is macro-heavy C at 0.58 versus 1.00, because *"macros are
+not represented in Tree-Sitter ASTs"*. Rust's `macro_rules!` and proc-macros are
+equally invisible, and this codebase uses them — but `FallbackReason::MacroExpansion`
+already exists to mark a node whose expansion the projector cannot reproduce, so the
+degradation is tracked per node instead of silently lowering answer quality.
+
+Two caveats on their evidence: answer quality was scored by the paper's first author
+against their own reference answers, not blind; and the hybrid they advocate has **no
+experimental evaluation** — it is the one part of the paper nobody has measured, which
+is precisely the part being adopted.
