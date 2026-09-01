@@ -21,6 +21,7 @@ use crate::approval::ApprovalGate;
 use crate::graph::GraphStore;
 use crate::skills::SkillContext;
 use crate::terminal::Terminals;
+use crate::project::Project;
 use crate::vfs::Vfs;
 
 /// Identity of a tenant session: the authenticated user (`""` when auth is off)
@@ -37,6 +38,10 @@ pub struct SessionKey {
 #[derive(Clone)]
 pub struct RepoResources {
     pub repo_root: PathBuf,
+    /// The repository's identity and policy (`.corrode/project.json`). Repo-derived,
+    /// so it lives here rather than on the daemon: one daemon serves many repos, and
+    /// "which project is this" is exactly a per-repo answer.
+    pub project: Arc<Project>,
     /// Embedded HelixDB for this repo (`None` without `--features helix`).
     pub graph: Option<Arc<dyn GraphStore>>,
     pub vfs: Arc<dyn Vfs>,
@@ -50,6 +55,8 @@ pub struct RepoResources {
 pub struct Session {
     pub key: SessionKey,
     pub repo_root: PathBuf,
+    /// This repo's identity + global-skill policy (shared with `RepoResources`).
+    pub project: Arc<Project>,
     pub graph: Option<Arc<dyn GraphStore>>,
     pub vfs: Arc<dyn Vfs>,
     pub skills: Arc<SkillContext>,
@@ -79,6 +86,7 @@ impl Session {
             terminals: Terminals::new(repo.repo_root.clone()).with_sandbox(sandbox),
             approvals: Arc::new(ApprovalGate::from_env()),
             repo_root: repo.repo_root,
+            project: repo.project,
             graph: repo.graph,
             vfs: repo.vfs,
             skills: repo.skills,

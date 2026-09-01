@@ -16,8 +16,17 @@
 //! through the tool loop) is still ahead.
 
 use crate::hipfire::Client;
+use crate::project::GlobalSkills;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Where a skill came from. A project skill belongs to the repository under work; a
+/// global one is installed in `~/` and belongs to no project until a project admits it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillOrigin {
+    Project,
+    Global,
+}
 
 /// A discovered skill (name + description + its directory). The full `SKILL.md`
 /// body is read lazily by [`SkillRegistry::body`] only when a task activates it.
@@ -35,18 +44,19 @@ pub struct SkillRegistry {
 }
 
 impl SkillRegistry {
-    /// Scan the standard + Corrode skill locations and the project `AGENTS.md`.
-    pub fn discover(repo_root: &Path) -> Self {
+    /// Scan the project's skill locations — plus the global (`~/`) ones the project
+    /// admits — and the project `AGENTS.md`.
+    pub fn discover(repo_root: &Path, global: &GlobalSkills) -> Self {
         let home = std::env::var("HOME").ok().map(PathBuf::from);
-        Self::discover_in(repo_root, home.as_deref())
+        Self::discover_in(repo_root, home.as_deref(), global)
     }
 
     /// Discovery core with an injectable home dir (so tests stay hermetic — the
     /// real `discover` reads `$HOME`, whose global skill dirs would leak in).
-    fn discover_in(repo_root: &Path, home: Option<&Path>) -> Self {
+    fn discover_in(repo_root: &Path, home: Option<&Path>, global: &GlobalSkills) -> Self {
         let mut skills = Vec::new();
         let mut seen = HashSet::new();
-        for dir in search_dirs(repo_root, home) {
+        for (dir, origin) in search_dirs(repo_root, home, global) {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue; // dir absent -> skip
             };
@@ -71,6 +81,11 @@ impl SkillRegistry {
                 }
                 if name.is_empty() || !seen.insert(name.clone()) {
                     continue; // first-seen wins (precedence)
+                }
+                // A global skill belongs to no project until one says so. Project-local
+                // skills are admitted unconditionally — they ARE this project.
+                if origin == SkillOrigin::Global && !global.admits(&name) {
+                    continue;
                 }
                 skills.push(Skill {
                     name,
@@ -206,8 +221,13 @@ pub struct SkillContext {
 impl SkillContext {
     /// Discover skills + AGENTS.md, then embed the skill descriptions (if an
     /// embedding model is served) for relevance ranking.
-    pub async fn build(repo_root: &Path, client: &Client, embed_model: Option<String>) -> Self {
-        let registry = SkillRegistry::discover(repo_root);
+    pub async fn build(
+        repo_root: &Path,
+        client: &Client,
+        embed_model: Option<String>,
+        global: &GlobalSkills,
+    ) -> Self {
+        let registry = SkillRegistry::discover(repo_root, global);
         let index = match &embed_model {
             Some(m) => SkillIndex::build(&registry, client, m).await,
             None => SkillIndex::default(),
@@ -333,14 +353,20 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 /// The skill search dirs in precedence order (first-seen wins): project before
 /// global, Corrode-custom before standard.
-fn search_dirs(repo_root: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+fn search_dirs(
+    repo_root: &Path,
+    home: Option<&Path>,
+    global: &GlobalSkills,
+) -> Vec<(PathBuf, SkillOrigin)> {
     let mut dirs = vec![
-        repo_root.join(".corrode/skills"),
-        repo_root.join(".agents/skills"),
+        (repo_root.join(".corrode/skills"), SkillOrigin::Project),
+        (repo_root.join(".agents/skills"), SkillOrigin::Project),
     ];
-    if let Some(home) = home {
-        dirs.push(home.join(".corrode/skills"));
-        dirs.push(home.join(".agents/skills"));
+    // Skip `~/` entirely when the project admits nothing — the common case, and it
+    // keeps an unconfigured repo from even reading another codebase's skills.
+    if let (Some(home), true) = (home, global.any()) {
+        dirs.push((home.join(".corrode/skills"), SkillOrigin::Global));
+        dirs.push((home.join(".agents/skills"), SkillOrigin::Global));
     }
     dirs
 }
@@ -406,6 +432,62 @@ fn unquote(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The reported bug: a project with no skills of its own was handed every skill
+    /// installed in `~/` — a C++ library got 22 hipfire skills and its subagents
+    /// concluded they were working on hipfire. A populated home is the whole point
+    /// here, so this cannot reuse the empty-home fixture the other tests rely on.
+    #[test]
+    fn global_skills_enter_only_when_the_project_admits_them() {
+        let root = std::env::temp_dir().join(format!("corrode-skills-global-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let repo = root.join("repo");
+        let home = root.join("home");
+
+        let write = |p: std::path::PathBuf, body: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(
+            repo.join(".agents/skills/repo-audit/SKILL.md"),
+            "---\nname: repo-audit\ndescription: Audit this repo.\n---\nbody",
+        );
+        write(
+            home.join(".agents/skills/hipfire-diag/SKILL.md"),
+            "---\nname: hipfire-diag\ndescription: Diagnose hipfire GPUs.\n---\nbody",
+        );
+        write(
+            home.join(".agents/skills/helix-query-rust/SKILL.md"),
+            "---\nname: helix-query-rust\ndescription: HelixDB Rust queries.\n---\nbody",
+        );
+
+        let names = |reg: &SkillRegistry| {
+            let mut v: Vec<String> = reg.skills.iter().map(|s| s.name.clone()).collect();
+            v.sort();
+            v
+        };
+
+        // Default: the project said nothing, so it gets only its own.
+        let reg = SkillRegistry::discover_in(&repo, Some(&home), &GlobalSkills::default());
+        assert_eq!(names(&reg), vec!["repo-audit"]);
+
+        // Opt in to everything.
+        let reg = SkillRegistry::discover_in(&repo, Some(&home), &GlobalSkills::All(true));
+        assert_eq!(
+            names(&reg),
+            vec!["helix-query-rust", "hipfire-diag", "repo-audit"]
+        );
+
+        // Opt in to a named subset: the allow-list admits one, not the other.
+        let reg = SkillRegistry::discover_in(
+            &repo,
+            Some(&home),
+            &GlobalSkills::Named(vec!["helix-query-rust".to_string()]),
+        );
+        assert_eq!(names(&reg), vec!["helix-query-rust", "repo-audit"]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn discovers_standard_and_corrode_skills_and_agents_md() {
         let root = std::env::temp_dir().join(format!("corrode-skills-{}", std::process::id()));
@@ -435,7 +517,7 @@ mod tests {
 
         // Isolated (empty) home so the real ~/.agents,~/.corrode skills don't leak in.
         let empty_home = root.join("home");
-        let reg = SkillRegistry::discover_in(&root, Some(&empty_home));
+        let reg = SkillRegistry::discover_in(&root, Some(&empty_home), &GlobalSkills::default());
         assert_eq!(reg.len(), 2, "pdf-processing deduped, repo-audit kept");
 
         let manifest = reg.manifest();
@@ -513,7 +595,7 @@ mod tests {
         .unwrap();
 
         let empty_home = root.join("home");
-        let registry = SkillRegistry::discover_in(&root, Some(&empty_home));
+        let registry = SkillRegistry::discover_in(&root, Some(&empty_home), &GlobalSkills::default());
         let index = SkillIndex {
             entries: vec![
                 IndexedSkill {
