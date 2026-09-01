@@ -323,71 +323,122 @@ impl ToolBox {
         }
     }
 
-    /// Read-only grep: walk the repo (or `scope` subdir) and return `path:line: text`
-    /// for every line containing `query` (plain, case-sensitive substring). Bounded on
-    /// files scanned, matches returned, per-file size, and line length so a research/
-    /// architect agent — which has no `run_command` — can still locate code cheaply.
+    /// Read-only grep over the VFS's tracked corpus: `path:line: text` for every line
+    /// containing `query` (plain, case-sensitive substring). Bounded on files scanned,
+    /// matches returned, per-file size and line length, so a research/architect agent —
+    /// which has no `run_command` — can still locate code cheaply.
+    ///
+    /// The corpus comes from [`Vfs::tracked_files`], not a directory walk. A walk
+    /// returned tokenizer binaries, minified `xterm.js` and vendored submodule data to
+    /// a subagent, which re-ran the same search, got the same wall of noise, and burned
+    /// minutes of GPU before its turn errored out. Blacklisting those paths would
+    /// always be one new vendored directory behind; asking what the project tracks is
+    /// the root fix, and it self-maintains.
+    ///
+    /// Two filters remain, and they are properties rather than paths, because the
+    /// survivors of the corpus fix are committed-but-not-source files that no path list
+    /// predicts: a NUL sniff (binary) and a maximum line length (minified).
+    ///
+    /// Measured on this repo, searching "overview": corpus 3824 files -> 170, and the
+    /// filters then skip 22 binary + 7 minified, leaving 6 files. One of those six is
+    /// residual noise — `needle.vocab` is a token table that is genuinely plain text
+    /// (no NUL, longest line 22 chars) and matches because it contains the token
+    /// `overview`. No property distinguishes it from source; only a path rule would,
+    /// which is what this design rejects. Recorded rather than special-cased.
     async fn search_files(&self, query: &str, scope: Option<&str>) -> String {
         const MAX_FILES: usize = 4000;
         const MAX_MATCHES: usize = 60;
         const MAX_LINE: usize = 200;
-        const MAX_FILE_BYTES: u64 = 1_000_000; // skip blobs — not source
+        const MAX_FILE_BYTES: usize = 1_000_000; // skip blobs — not source
+        /// A line longer than this means minified/generated content, not something a
+        /// human reads — and one such "line" can be the entire file.
+        const MAX_SOURCE_LINE: usize = 1000;
+        /// Bytes sniffed for NUL before deciding a file is binary.
+        const SNIFF: usize = 8192;
+
         if query.is_empty() {
             return "error: search_files needs a non-empty query".to_string();
         }
-        let mut queue = std::collections::VecDeque::from([scope.unwrap_or("").to_string()]);
+        let files = match self.vfs.tracked_files().await {
+            Ok(f) => f,
+            Err(e) => return format!("error: could not determine the searchable file set: {e}"),
+        };
+        // `scope` narrows to a subtree; paths are repo-relative, so a prefix match is
+        // the whole of it. A trailing slash keeps `src` from matching `src-gen/`.
+        let prefix = scope
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != ".")
+            .map(|s| format!("{}/", s.trim_end_matches('/')));
+
         let mut files_scanned = 0usize;
         let mut matches: Vec<String> = Vec::new();
         let mut capped = false;
-        'walk: while let Some(dir) = queue.pop_front() {
-            let entries = match self.vfs.list(&dir).await {
-                Ok(e) => e,
-                Err(_) => continue,
+        let mut skipped_binary = 0usize;
+        let mut skipped_minified = 0usize;
+
+        'walk: for path in files {
+            if let Some(p) = &prefix {
+                if !path.starts_with(p.as_str()) {
+                    continue;
+                }
+            }
+            if files_scanned >= MAX_FILES {
+                capped = true;
+                break;
+            }
+            let Ok(bytes) = self.vfs.read(&path).await else {
+                continue; // raced deletion, or tracked-but-absent
             };
-            for e in entries {
-                // Prune noise the same way the path walk does.
-                if e.path.starts_with(".git")
-                    || e.path == "target"
-                    || e.path.starts_with("target/")
-                    || e.path.contains("/target/")
-                {
-                    continue;
+            if bytes.len() > MAX_FILE_BYTES {
+                continue;
+            }
+            // Binary: a NUL in the head. Cheaper and more reliable than extensions,
+            // and it catches the tokenizer blobs that started this.
+            if bytes.iter().take(SNIFF).any(|b| *b == 0) {
+                skipped_binary += 1;
+                continue;
+            }
+            files_scanned += 1;
+            let text = String::from_utf8_lossy(&bytes);
+            let mut minified = false;
+            for (n, line) in text.lines().enumerate() {
+                if line.len() > MAX_SOURCE_LINE {
+                    minified = true;
+                    break;
                 }
-                if e.is_dir {
-                    queue.push_back(e.path);
-                    continue;
-                }
-                if e.bytes > MAX_FILE_BYTES {
-                    continue;
-                }
-                if files_scanned >= MAX_FILES {
-                    capped = true;
-                    break 'walk;
-                }
-                files_scanned += 1;
-                let Ok(bytes) = self.vfs.read(&e.path).await else {
-                    continue;
-                };
-                let text = String::from_utf8_lossy(&bytes);
-                for (n, line) in text.lines().enumerate() {
-                    if line.contains(query) {
-                        let l = line.trim();
-                        let shown = &l[..floor_char_boundary(l, MAX_LINE)];
-                        matches.push(format!("{}:{}: {shown}", e.path, n + 1));
-                        if matches.len() >= MAX_MATCHES {
-                            capped = true;
-                            break 'walk;
-                        }
+                if line.contains(query) {
+                    let l = line.trim();
+                    let shown = &l[..floor_char_boundary(l, MAX_LINE)];
+                    matches.push(format!("{path}:{}: {shown}", n + 1));
+                    if matches.len() >= MAX_MATCHES {
+                        capped = true;
+                        break 'walk;
                     }
                 }
             }
+            if minified {
+                skipped_minified += 1;
+                // Drop this file's partial matches: a minified file's "lines" are not
+                // lines, so reporting some of them is worse than reporting none.
+                matches.retain(|m| !m.starts_with(&format!("{path}:")));
+            }
         }
+
         if matches.is_empty() {
-            return format!("no matches for {query:?}");
+            let mut msg = format!("no matches for {query:?}");
+            if let Some(p) = &prefix {
+                msg.push_str(&format!(" under {p}"));
+            }
+            return msg;
         }
         let mut out = matches.join("\n");
         if capped {
             out.push_str("\n… (results capped; refine the query or narrow the path)");
+        }
+        if skipped_binary + skipped_minified > 0 {
+            out.push_str(&format!(
+                "\n… (skipped {skipped_binary} binary, {skipped_minified} minified)"
+            ));
         }
         out
     }
@@ -752,33 +803,79 @@ mod tests {
     #[tokio::test]
     async fn search_files_finds_matches_and_reports_misses() {
         let dir = std::env::temp_dir().join(format!("corrode-search-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/a.rs"), "fn frobnicate() {}\nlet x = 1;\n").unwrap();
         std::fs::write(dir.join("src/b.rs"), "// calls frobnicate here\n").unwrap();
+        // Tracked but not source: a NUL-bearing blob and a minified one-liner. These
+        // are the shapes that survived the corpus fix, and they fall to property tests
+        // rather than to a path list.
+        std::fs::write(dir.join("blob.bin"), b"frobnicate\0\0binary").unwrap();
+        std::fs::write(
+            dir.join("min.js"),
+            format!("var a=1;{} frobnicate;\n", "x".repeat(2000)),
+        )
+        .unwrap();
+        // Untracked: present on disk, absent from the corpus, must never be searched.
+        std::fs::write(dir.join("untracked.rs"), "frobnicate untracked\n").unwrap();
+
+        // The corpus is git's answer, so the fixture has to be a repo. Staging is
+        // enough — `ls-files` reads the index, no commit (or identity) required.
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["add", "src/a.rs", "src/b.rs", "blob.bin", "min.js"]);
+
         let toolbox = ToolBox::new(
             Arc::new(PassthroughVfs::new(&dir)),
             dir.clone(),
             Arc::new(HashMap::new()),
         );
-        let run = |q: &str| {
+        let run = |q: &str, scope: Option<&str>| {
             let tb = toolbox.clone();
             let q = q.to_string();
+            let scope = scope.map(str::to_string);
             async move {
+                let args = match scope {
+                    Some(s) => json!({ "query": q, "path": s }),
+                    None => json!({ "query": q }),
+                };
                 tb.execute(&ToolCall {
                     name: "search_files".into(),
-                    arguments: json!({ "query": q }),
+                    arguments: args,
                 })
                 .await
             }
         };
-        let hit = run("frobnicate").await;
+
+        let hit = run("frobnicate", None).await;
         assert!(
             hit.contains("src/a.rs:1:") && hit.contains("src/b.rs:1:"),
-            "both files should match: {hit}"
+            "both tracked sources should match: {hit}"
         );
         assert!(!hit.contains("a.rs:2:"), "non-matching line excluded: {hit}");
-        let miss = run("nonexistent_zzz").await;
+        // The corpus fix: on disk and matching, but not tracked, so not searched.
+        assert!(!hit.contains("untracked.rs"), "untracked file searched: {hit}");
+        // The property filters: both are tracked and both contain the query.
+        assert!(!hit.contains("blob.bin"), "binary searched: {hit}");
+        assert!(!hit.contains("min.js"), "minified searched: {hit}");
+        assert!(hit.contains("skipped 1 binary, 1 minified"), "counts reported: {hit}");
+
+        // `path` narrows to a subtree.
+        let scoped = run("frobnicate", Some("src")).await;
+        assert!(scoped.contains("src/a.rs:1:"), "{scoped}");
+        let elsewhere = run("frobnicate", Some("docs")).await;
+        assert!(elsewhere.contains("no matches"), "{elsewhere}");
+
+        let miss = run("nonexistent_zzz", None).await;
         assert!(miss.contains("no matches"), "got: {miss}");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
