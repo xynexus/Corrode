@@ -4,8 +4,9 @@
 repository when several of them work at once, and what that implies for the
 graph, the VFS, and their builds.
 
-- **Status:** discussion only. No code written from this. One measured bug
-  (`search_files` corpus) is ready to fix independently.
+- **Status:** discussion only, except §1 — the `search_files` corpus fix is
+  **implemented** (`Vfs::tracked_files` + the two property filters). Everything
+  from §2 on remains undecided.
 - **Date:** 2026-08-29
 - **Scope:** VFS presentation, per-branch isolation, build artefact handling
 - **Guiding principle:** *an agent must see a standard filesystem.* Corrode
@@ -61,6 +62,15 @@ The five survivors are all vendored-but-committed: `xterm.js`, `xterm.css`,
 `needle.model`, `needle.vocab`, and a helix-skills doc. Two fall to *property*
 tests rather than path lists — a NUL sniff for binaries, a maximum line length
 for minified files. The helix-skills doc is arguably a legitimate hit.
+
+**Correction, measured after implementing (2026-09-01).** Only *one* of those two
+falls to a property test. `needle.model` is binary and is caught; `needle.vocab` is
+not — it is a token table in plain text, no NUL, longest line 22 characters, and it
+matches "overview" because it literally contains the token `▁overview`. It is
+indistinguishable from source by any property, and only a path rule would exclude
+it, which is what this section rejects. It is left as residual noise: one file,
+against ~120 junk hits before. Post-fix on this repo the corpus is 3824 files → 170,
+the filters skip 22 binary + 7 minified, and 6 files remain.
 
 ### Where it belongs
 
@@ -306,11 +316,12 @@ subagents; and it adds a second isolation mechanism. If containers are wanted,
 
 ## 7. Where this leaves things
 
-**Ready to do now, independent of everything else:** add `tracked_files()` to
-the `Vfs` trait with the git-backed implementation, rewire `search_files` onto
-it, and add the binary and long-line property filters. Root fix, no blacklist,
-and it is the first step of the branch-aware design — `ls-files` becomes
-`ls-tree <rev>` later, same call site.
+**~~Ready to do now~~ Done (2026-09-01):** `tracked_files()` is on the `Vfs` trait
+with the git-backed implementation, `search_files` is rewired onto it, and the binary
+and long-line property filters are in. Root fix, no blacklist, and the first step of
+the branch-aware design stands — `ls-files` becomes `ls-tree <rev>` later, same call
+site, and a graph-backed VFS answers from its file nodes without `search_files`
+changing at all.
 
 **Decided in principle:** the graph should be git-compatible, keyed by content
 (blob OID), with git owning content and history.
