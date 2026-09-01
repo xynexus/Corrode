@@ -400,7 +400,146 @@ it, and the system currently cannot name the repository it is working in.
 - **Autonomy ahead of auditability.** Any capability that cannot report what it did
   and why is not shipped, regardless of how well it demos.
 
-## 8. Open questions
+## 8. Load-bearing assumptions
+
+An open question costs a decision. A load-bearing assumption costs a *rewrite* — it is
+a claim that, if false, invalidates work already built on it. They are tracked
+separately for that reason, and each one names the cheapest experiment that would
+falsify it.
+
+**The rule: dependent work does not start while its assumption is UNTESTED.**
+
+| assumption | status | falsifying test | blocks |
+|---|---|---|---|
+| A shared prefix is prefilled once and reused | **FALSE today** | `cached_tokens > 0` on a repeated prefix | §3.2 entirely; all layering |
+| Item decomposition is total (necessary for composition) | **TRUE** — 99.6-99.9% item bytes, remainder pure whitespace, 92 files / 4 crates | `roundtrip.rs` census | graph-backed VFS; derived line numbers |
+| Regenerating an item by PRINTING its AST is byte-exact | **FALSE** — 0 of 91 files | `roundtrip::regen` census | rules out a printer-based composer |
+| Composing a repo from verbatim item nodes is byte-exact | **TRUE** — 1515 files, 31 MB, 3 repos | `roundtrip::compose` scan + regenerate | graph-backed VFS; derived line numbers |
+| A canonical-form repo would remove the need for verbatim text | **REJECTED on cost, not feasibility** — converges in 2 passes, but destroys 35k body comments | `roundtrip::canonical` viability | — |
+| The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
+| Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
+| The graph is the source of truth, files a projection | **aspiration** | — | bijective line numbers |
+
+Why this section exists, from the record of one session: every miss was a claim nobody
+executed. "Two of the five survivors fall to property tests" — `needle.vocab` is plain
+text and does not. "Shared prefix means shared KV" — the cross-session cache has never
+engaged, and `cached_tokens: 0` sat in a benchmark result hours before §3.2 was written
+asserting the economics of it. "Metadata latency will dominate a FUSE build" — metadata
+is 1.5x, bulk reads are 16x, so the hypothesis was not merely unproven but inverted.
+
+Two habits follow, and both are cheap:
+
+**A composed file stores its text; it does not reprint it — and then it is exact.**
+Printing an AST back is byte-exact for **0 of 91 files**, for two independent reasons:
+plain comments have no node in the AST and are simply gone, and the printer
+canonicalises (it adds a trailing comma when it breaks a parameter list — semantically
+null, textually divergent).
+
+Storing verbatim spans instead is byte-exact for **1515 of 1515 files, ~31 MB, across
+three repositories** — corrode, its demo-repo fixture, and hipfire, the last including
+macros, `unsafe`, and GPU dispatch. `syn` supplies the item boundaries and their kinds;
+each node keeps its own bytes; regeneration concatenates. Byte-exactness is a property
+of the decomposition rather than of a printer's manners.
+
+So `ProjectionMode::Composed` is reachable, and the route matters: structure from the
+parser, content from the source. The `FallbackReason` variants describe failure modes
+of the printer-based approach this rules out — a span-based composer has none of them,
+so they want revisiting rather than implementing.
+
+**The canonical-form alternative was measured, not argued away.** Rewriting the repo
+once into the printer's own form would remove the need for verbatim text entirely:
+nodes would hold structure, trivia nodes would vanish (half of all nodes today), and
+item order would become a property of the graph rather than the file. On feasibility it
+holds up — the printer is idempotent for 1510 of 1514 files, and the four exceptions
+converge to a fixed point in two passes (width oscillation: re-parsing changes the
+nesting context, so a call that fitted on one line no longer does). No cycles.
+
+It fails on cost. Canonicalisation deletes every plain comment, because `syn`'s AST has
+no node for one: **42,309 lines, 8.5% of hipfire's source.** Doc comments survive as
+attributes, and 5,827 of the losses sit between items so could be rewritten as `///`.
+The remaining **35,477 are inside function bodies, where `///` is not legal** — they are
+unrecoverable by any migration.
+
+That is the wrong 8.5% to lose. This codebase's comments carry the reasoning that the
+code cannot: why a gate exists, what a measurement cost, which approach was tried and
+abandoned. Trading them for a simpler VFS buys implementation convenience with
+institutional memory. The verbatim-span composer already delivers byte-exactness, so
+the simplification is not needed to make projection work — only to make it tidier.
+
+**Spans are an ingest-time artifact and must not survive into the store.** A byte
+offset is a fact about one source text. A dynamically generated VFS has no such text:
+it projects files from nodes that get reordered, inserted, edited, or drawn from a
+branch never materialised — so a stored offset or line number is stale or meaningless
+the moment the graph moves. Nodes carry content and order; **positions are an OUTPUT of
+projection**, recomputed per materialisation and never persisted. `compose::project`
+returns the text and where each node landed, and a test asserts that inserting a node
+shifts the reported line while the value captured at scan time goes wrong — which is
+what a stored position would have done silently.
+
+The same rule fixes comment binding. A comment attaches to `(node, line-within-node)`,
+which survives reordering, rather than to an absolute line, which does not.
+
+**Comments are lost in the lexer, not in `syn`.** Rust's grammar treats a plain
+comment as trivia and emits no token for it; a doc comment is desugared to
+`#[doc = "..."]`. Parsing `// plain\n/// doc\nfn f() { /* inner */ let x = 1; }` yields
+the token stream `# [doc = " doc"] fn f () { let x = 1 ; }` — both plain comments are
+simply absent. So `syn` cannot be asked to attach them: nothing built on the
+proc-macro token model can see one.
+
+It does not need to. `Span::byte_range()` locates every item in the ORIGINAL source, so
+the text between items is recoverable and attachment is a post-pass over positions we
+already hold: 2,187 comment blocks in hipfire bind to the item they introduce, and the
+file still regenerates byte-exactly because attachment is a view over the nodes rather
+than a transformation of them.
+
+**Position is not the useful relation; the edge is.** Graph search asks what a comment
+is *about*, and what commentary applies to a *region* — neither of which a coordinate
+answers. `describes` binds each comment to the syntax element it annotates, with the
+relation typed: `Precedes` (introduces the element below it), `Trailing` (annotates the
+code to its left, on the same line), `Encloses` (nothing follows in scope, so it belongs
+to its container).
+
+Sub-item granularity turned out not to need a CST after all, correcting an earlier note
+here: `syn` gives a byte range for *any* syntax node, so statements, match arms and
+struct fields are anchorable exactly like items. Measured over hipfire, **44,562 of
+44,574 plain comments bind to an element — 12 unbound**:
+
+| relation | | target kind | |
+|---|---|---|---|
+| precedes | 41,086 | stmt | 34,627 |
+| trailing | 3,421 | use | 3,205 |
+| encloses | 55 | match_arm | 1,568 |
+| | | fn | 1,564 |
+
+Statements dominate, which is the point: the 35,477 body comments that looked
+unreachable are the bulk of the corpus's reasoning, and they resolve to the statement
+they describe. `ra_ap_syntax` remains the tool if a comment ever has to bind *below*
+expression level, which nothing here needs.
+
+Line numbers fall out of the same mechanism. A node knows where it lands, so
+`path:line` is derived at projection time; an edit above a node shifts it, which is
+exactly why deriving beats persisting.
+
+The first two tiers of this measurement each tested a *proxy* — a hand-rolled byte
+census, then a printer nobody proposed — and the second produced a conclusion stated
+so badly it read as "composition is unachievable". Only building the composer settled
+it. That is the section's own rule applied late.
+
+**Measure the artifact, not a proxy.** The prefix defect was invisible until someone
+printed the literal prefix. A sibling-discrimination run produced a dramatic false
+negative because it measured `\brief` text that three of the four files did not have.
+
+**Record predictions so being wrong is cheap.** When a measurement contradicts a
+document, correct the document with a dated note rather than quietly working around it.
+Three lines of diff, and the next reader inherits the correction instead of the error.
+
+The counter-example worth imitating is already in this codebase:
+`FallbackReason::MacroExpansion` was written before any projector existed. Someone at
+design time asked what would break when composing Rust, and put the answer in the type
+system. That is the same failure — macros absent from an AST — that costs a comparable
+published system its worst score (0.58 versus 1.00; §10).
+
+## 9. Open questions
 
 - ~~**Does the embedding model discriminate?**~~ **Answered** (§2): yes — 0.250 mean
   top-8 spread on real code, versus 0.057 on an unmatched query. Retrieval was never
@@ -423,3 +562,47 @@ it, and the system currently cannot name the repository it is working in.
   task is clear; a hunk authored by one agent and revised by another is not.
 - **How much context is too much?** No measurement exists relating context size to
   success rate. Telemetry (step 4) is what turns this from taste into data.
+
+## 10. Related work
+
+**Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via
+MCP** (Vogel, Meyer-Eschenbach, Kohler, Grünewald, Balzer, arXiv 2603.27277). Parses
+66 languages with Tree-Sitter into a SQLite knowledge graph served over MCP. Linux
+kernel in ~3 minutes (2.1M nodes, 4.9M edges); sub-millisecond queries against 10-30s
+for a file-exploration agent; **10x fewer tokens and 2.1x fewer tool calls**.
+
+It independently reaches the architecture §6 step 7 is heading for: *"the optimal
+architecture is a hybrid: graph-based retrieval for structural queries, with fallback
+to file exploration for source-level tasks."* Their failure analysis names the same two
+categories the hybrid exists to cover — full source context (16/31 languages) and
+exhaustive call-site grep (10/31), *"queries requiring line-level code that the graph
+intentionally does not store."*
+
+Three divergences matter here, and each is a decision rather than an oversight:
+
+**They store no line numbers; we can derive them.** Their graph is an index *derived
+from* files, so line information is lost at parse time and they pay for it in exactly
+those two categories. Corrode inverts the direction — files are a projection *of* the
+graph — so a line number is a function of the projection rather than a fact to store.
+Deriving on a hit also costs nothing until something is found, and storing absolute
+lines would reintroduce staleness: one insertion at the top of a file invalidates every
+node below it. Store position relative to the node; resolve absolute lines at query
+time.
+
+**They use no embeddings at all** — Table 7 lists "No embed. model" as a design choice.
+That silently bounds what their benchmark can ask: their 12 categories are structural
+(who calls this, what does it return), and an AST index cannot serve an intent-shaped
+query. Measured here, embedding retrieval answered 4/4 queries with *zero* literal
+overlap where substring search returns nothing. So their 83% vs 92% is not a ceiling
+for a system with both; it is the score on a question set that excludes the capability.
+
+**Macros.** Their worst case is macro-heavy C at 0.58 versus 1.00, because *"macros are
+not represented in Tree-Sitter ASTs"*. Rust's `macro_rules!` and proc-macros are
+equally invisible, and this codebase uses them — but `FallbackReason::MacroExpansion`
+already exists to mark a node whose expansion the projector cannot reproduce, so the
+degradation is tracked per node instead of silently lowering answer quality.
+
+Two caveats on their evidence: answer quality was scored by the paper's first author
+against their own reference answers, not blind; and the hybrid they advocate has **no
+experimental evaluation** — it is the one part of the paper nobody has measured, which
+is precisely the part being adopted.

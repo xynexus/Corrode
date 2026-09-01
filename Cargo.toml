@@ -34,3 +34,12 @@ futures-util = "0.3"
 async-trait = "0.1"
 tokio-tungstenite = "0.26"
 corrode-core = { path = "crates/corrode-core" }
+# Rust-only, by design: `syn` parses Rust into a Rust AST and supports no other
+# language. graph-model.md's projectors are per-language for exactly this reason —
+# high-fidelity regeneration needs a real parser per language, and the alternative
+# (tree-sitter, 66 languages) is lossy where byte-exactness is the whole point.
+syn = { version = "2", features = ["full", "parsing", "printing", "visit"] }
+prettyplease = "0.2"
+# `span-locations` gives byte ranges for parsed items, which is what lets a node hold
+# VERBATIM source instead of regenerating it.
+proc-macro2 = { version = "1", features = ["span-locations"] }
