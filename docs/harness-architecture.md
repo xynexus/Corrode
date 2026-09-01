@@ -697,5 +697,35 @@ order stays a property.
 be almost entirely in-place body rewrites, a dense index would have sufficed. Ingest
 telemetry against a live store settles it.
 
+### Result: the Linux kernel, streamed from its tarball
+
+94,750 files / 1,615 MB, ingested in **107.9 s** (15.0 MB/s, 878 files/s) **without
+unpacking the archive** — the projection takes a path string and a content string, so a
+tar entry feeds it exactly as a file does.
+
+| backend | files | nodes | comments | bound |
+|---|---|---|---|---|
+| c-family | 81,386 | 81,355 | 2,494,696 | **0** |
+| hash | 12,761 | 12,752 | 114,648 | **0** |
+| markup | 130 | 130 | 2,007 | 0 |
+| rust | 473 | 18,474 | 53,674 | 53,669 |
+
+**Byte-exact: 94,750 of 94,750. Zero mismatches.** The prediction held — fidelity does
+not depend on having a grammar, because the fallback's single-node cover is total by
+construction. Non-UTF-8 files surfaced as predicted, though only 7 of them rather than
+the thousands expected.
+
+The finding that matters is the `bound` column. **C is 86% of the kernel and binds zero
+comments** — 2.5 million of them are captured, positioned, and attached to nothing,
+because the fallback has no grammar and reports no anchors rather than guessing. Across
+the whole tree 97.9% of comments are unbound. Rust binds 53,669 of 53,674 because it
+has a real backend.
+
+So a C backend is the single highest-value addition, and the benchmark says what it is
+worth: it would move 2.5 million comments from "stored" to "queryable". Throughput is
+not the constraint — 15 MB/s on the fallback against 1.5 MB/s for `syn` means a
+grammar-based C backend would be slower, and at under two minutes for the kernel there
+is room to spend it.
+
 **Not expected to break:** byte-exactness, in any language. If a mismatch appears, the
 span cover is wrong and that is a real defect rather than a missing backend.

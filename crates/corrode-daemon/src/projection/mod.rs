@@ -34,6 +34,7 @@
 //! byte-exact**. Absorbing an unfamiliar codebase is therefore never blocked, it is
 //! only less queryable.
 
+pub mod archive;
 pub mod rust;
 pub mod text;
 

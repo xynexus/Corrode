@@ -7,3 +7,10 @@ third_party/**/target
 
 # Deployment secrets (tokens live here)
 deploy/corrode.env
+
+# Test corpora for ingest benchmarking — downloaded, never committed. A kernel
+# tarball is 150+ MB and GitHub rejects it, which is how this rule got written.
+fixtures/*.tar
+fixtures/*.tar.*
+fixtures/*.tgz
+fixtures/*.zip

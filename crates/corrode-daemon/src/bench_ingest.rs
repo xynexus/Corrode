@@ -247,3 +247,72 @@ mod tests {
         assert!(agg.files > 0, "nothing ingested");
     }
 }
+
+#[cfg(test)]
+mod archive_tests {
+    use crate::projection::{self, archive, ingest};
+    use std::time::Instant;
+
+    /// Ingest an archive without unpacking it.
+    ///
+    /// ```text
+    /// CORRODE_SCAN_ARCHIVE=fixtures/linux-7.2.2.tar.xz \
+    ///   cargo test -p corrode-daemon ingest_archive -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "streams a whole archive; run explicitly with CORRODE_SCAN_ARCHIVE"]
+    fn ingest_archive() {
+        let Ok(path) = std::env::var("CORRODE_SCAN_ARCHIVE") else {
+            eprintln!("set CORRODE_SCAN_ARCHIVE=<path to .tar/.tar.xz/.tar.gz/.tar.zst>");
+            return;
+        };
+        let mut by: std::collections::BTreeMap<&'static str, (usize, usize, usize, usize)> =
+            Default::default();
+        let (mut exact, mut mismatched, mut failed) = (0usize, 0usize, 0usize);
+        let mut bytes = 0usize;
+        let wall = Instant::now();
+
+        let (seen, skipped) = archive::for_each_file(std::path::Path::new(&path), |e| {
+            let lang = projection::for_path(e.path);
+            let slot = by.entry(lang.name()).or_default();
+            slot.0 += 1;
+            bytes += e.text.len();
+            match ingest::file(lang.as_ref(), e.path, e.text) {
+                Err(_) => failed += 1,
+                Ok(fw) => {
+                    slot.1 += fw.code.len();
+                    slot.2 += fw.comments.len();
+                    slot.3 += fw.comments.iter().filter(|c| c.describes_kind.is_some()).count();
+                    // The invariant that must survive a different transport.
+                    if ingest::project(&fw) == e.text {
+                        exact += 1;
+                    } else {
+                        mismatched += 1;
+                        if mismatched <= 3 {
+                            eprintln!("  MISMATCH [{}] {}", lang.name(), e.path);
+                        }
+                    }
+                }
+            }
+        })
+        .expect("archive readable");
+
+        let secs = wall.elapsed().as_secs_f64();
+        eprintln!("=== archive ingest: {path} ===");
+        eprintln!("{:<12} {:>8} {:>9} {:>10} {:>9}", "backend", "files", "nodes", "comments", "bound");
+        for (name, (f, n, c, b)) in &by {
+            eprintln!("{name:<12} {f:>8} {n:>9} {c:>10} {b:>9}");
+        }
+        eprintln!(
+            "entries {seen}, byte-exact {exact}, mismatched {mismatched}, ingest errors {failed}, non-UTF-8 {skipped}"
+        );
+        eprintln!(
+            "{:.1} MB in {:.1}s ({:.1} MB/s, {:.0} files/s) — never unpacked",
+            bytes as f64 / 1e6,
+            secs,
+            (bytes as f64 / 1e6) / secs.max(1e-9),
+            seen as f64 / secs.max(1e-9),
+        );
+        assert_eq!(mismatched, 0, "projection was not byte-exact from the archive");
+    }
+}

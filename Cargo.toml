@@ -43,3 +43,6 @@ prettyplease = "0.2"
 # `span-locations` gives byte ranges for parsed items, which is what lets a node hold
 # VERBATIM source instead of regenerating it.
 proc-macro2 = { version = "1", features = ["span-locations"] }
+# Pure Rust, no C dependency. Decompression is delegated to a subprocess instead of a
+# codec crate, so `.xz`/`.gz`/`.zst` all work without linking liblzma.
+tar = "0.4"
