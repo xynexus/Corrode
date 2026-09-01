@@ -316,3 +316,105 @@ mod archive_tests {
         assert_eq!(mismatched, 0, "projection was not byte-exact from the archive");
     }
 }
+
+#[cfg(test)]
+mod sweep {
+    use crate::projection::{self, archive, ingest};
+
+    #[derive(Default, Clone)]
+    struct Ext {
+        files: usize,
+        bytes: usize,
+        comments: usize,
+        bound: usize,
+        backend: &'static str,
+        /// Files where the backend found no comments at all — the signal that the
+        /// marker guess is wrong for this type, as distinct from a file that genuinely
+        /// has none.
+        commentless: usize,
+    }
+
+    /// What file types is a tree actually made of, and what does each currently get?
+    ///
+    /// The point is the backend worklist: a type's weight is files and bytes, but its
+    /// VALUE is comments that could become queryable if it had a grammar. Sorted by
+    /// unbound comments, because that is what a backend would buy.
+    ///
+    /// ```text
+    /// CORRODE_SCAN_ARCHIVE=fixtures/linux-7.2.2.tar.xz \
+    ///   cargo test -p corrode-daemon file_type_sweep -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "streams a whole archive"]
+    fn file_type_sweep() {
+        let Ok(path) = std::env::var("CORRODE_SCAN_ARCHIVE") else {
+            eprintln!("set CORRODE_SCAN_ARCHIVE=<archive>");
+            return;
+        };
+        let mut by: std::collections::BTreeMap<String, Ext> = Default::default();
+        let (mut files, mut bytes) = (0usize, 0usize);
+
+        let (_, skipped) = archive::for_each_file(std::path::Path::new(&path), |e| {
+            let base = e.path.rsplit('/').next().unwrap_or(e.path);
+            // Group by extension, or by filename when there is none — `Makefile` and
+            // `Kconfig` are file *types* in a kernel tree, not oddities.
+            let key = match base.rsplit_once('.') {
+                Some((stem, ext)) if !stem.is_empty() => format!(".{ext}"),
+                _ => base.to_string(),
+            };
+            let lang = projection::for_path(e.path);
+            let slot = by.entry(key).or_default();
+            slot.backend = lang.name();
+            slot.files += 1;
+            slot.bytes += e.text.len();
+            files += 1;
+            bytes += e.text.len();
+            if let Ok(fw) = ingest::file(lang.as_ref(), e.path, e.text) {
+                slot.comments += fw.comments.len();
+                slot.bound += fw.comments.iter().filter(|c| c.describes_kind.is_some()).count();
+                if fw.comments.is_empty() {
+                    slot.commentless += 1;
+                }
+            }
+        })
+        .expect("archive readable");
+
+        let mut v: Vec<(&String, &Ext)> = by.iter().collect();
+
+        eprintln!("=== file types: {path} ===");
+        eprintln!("{files} files, {:.0} MB, {skipped} non-UTF-8\n", bytes as f64 / 1e6);
+
+        v.sort_by_key(|(_, e)| std::cmp::Reverse(e.files));
+        eprintln!("-- by file count --");
+        eprintln!("{:<16} {:>8} {:>8} {:>12} {:>10} {:>9}", "type", "files", "MB", "backend", "comments", "bound");
+        for (k, e) in v.iter().take(20) {
+            eprintln!(
+                "{:<16} {:>8} {:>8.1} {:>12} {:>10} {:>9}",
+                k, e.files, e.bytes as f64 / 1e6, e.backend, e.comments, e.bound
+            );
+        }
+
+        v.sort_by_key(|(_, e)| std::cmp::Reverse(e.comments - e.bound));
+        eprintln!("\n-- by UNBOUND comments (what a backend would buy) --");
+        eprintln!("{:<16} {:>8} {:>12} {:>12}", "type", "files", "backend", "unbound");
+        for (k, e) in v.iter().take(12) {
+            if e.comments == e.bound {
+                continue;
+            }
+            eprintln!("{:<16} {:>8} {:>12} {:>12}", k, e.files, e.backend, e.comments - e.bound);
+        }
+
+        // A type where most files yield NO comments is usually a wrong marker guess
+        // rather than an undocumented corpus.
+        v.sort_by_key(|(_, e)| std::cmp::Reverse(e.commentless));
+        eprintln!("\n-- types where the marker guess looks wrong (files with zero comments) --");
+        eprintln!("{:<16} {:>8} {:>12} {:>12}", "type", "files", "backend", "commentless");
+        for (k, e) in v.iter().take(10) {
+            if e.files < 20 || e.commentless * 2 < e.files {
+                continue;
+            }
+            eprintln!("{:<16} {:>8} {:>12} {:>12}", k, e.files, e.backend, e.commentless);
+        }
+        assert!(files > 0);
+    }
+}

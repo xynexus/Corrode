@@ -727,5 +727,40 @@ not the constraint — 15 MB/s on the fallback against 1.5 MB/s for `syn` means 
 grammar-based C backend would be slower, and at under two minutes for the kernel there
 is room to spend it.
 
+### File-type sweep: what the kernel is made of
+
+| type | files | MB | backend | comments | bound |
+|---|---|---|---|---|---|
+| `.c` | 36,922 | 728 | c-family | 1,259,966 | **0** |
+| `.h` | 26,871 | 704 | c-family | 1,097,444 | **0** |
+| `.yaml` | 5,665 | 17 | hash | 47,683 | 0 |
+| `.rst` | 4,011 | 31 | rst | 14,842 | 0 |
+| `.dts`/`.dtsi`/`.dtso` | 6,703 | 49 | c-family | 89,501 | 0 |
+| `Makefile` | 3,194 | 3 | hash | 13,306 | 0 |
+| `Kconfig` | 1,828 | 7 | hash | 5,062 | 0 |
+| `.S` | 1,337 | 9 | c-family | 28,764 | 0 |
+| `.rs` | 473 | 6 | rust | 53,674 | **53,669** |
+
+**`.c` + `.h` is 63,793 files and 2.36 million unbound comments** — 88% of the tree's
+commentary, captured and attached to nothing. That is the C backend's value stated as a
+number, and it dwarfs everything else on the list.
+
+The sweep also reports files where a backend found *no* comments at all, which
+distinguishes a wrong marker guess from a genuinely undocumented corpus. It found four,
+all now fixed:
+
+- **`.rst`** was on C-family markers, so its `..` comments were invisible and `//` inside
+  prose produced accidental hits. On the right markers it goes from 6,203 wrong hits to
+  **14,842 real ones**.
+- **`Kbuild`**, **`config`**, **`defconfig`** are Makefile- and config-shaped and were
+  landing on C-family — 440 files whose `#` comments were silently missed.
+- **`.json`**, **`.txt`** have no comment syntax at all. On C-family markers every `//`
+  in a string or URL was a false comment; they now map to a `none` family, because "this
+  format has no comments" is an answer rather than a guess to be improved later.
+
+Worth noting how those were found: not by reading the mapping table and thinking
+harder, but by measuring which types produced suspiciously zero comments. The signal
+came from the corpus.
+
 **Not expected to break:** byte-exactness, in any language. If a mismatch appears, the
 span cover is wrong and that is a real defect rather than a missing backend.

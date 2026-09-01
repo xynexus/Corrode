@@ -29,10 +29,14 @@ impl PlainText {
     /// to the C family would silently find no comments in thousands of files.
     pub fn for_filename(name: &str) -> Option<PlainText> {
         let base = name.rsplit('/').next().unwrap_or(name);
+        // `Kbuild`, `config` and `defconfig` were measured landing on the C family in a
+        // kernel sweep — 440 files whose `#` comments were invisible because the marker
+        // guess was wrong, reported as "commentless" rather than as a bug.
         matches!(
             base,
-            "Makefile" | "makefile" | "GNUmakefile" | "Kconfig" | "Dockerfile" | "Containerfile"
-                | "Vagrantfile" | "Rakefile" | "Gemfile" | "Justfile" | "justfile" | "CMakeLists.txt"
+            "Makefile" | "makefile" | "GNUmakefile" | "Kbuild" | "Kconfig" | "Dockerfile"
+                | "Containerfile" | "Vagrantfile" | "Rakefile" | "Gemfile" | "Justfile"
+                | "justfile" | "CMakeLists.txt" | "config" | "defconfig" | "Doxyfile"
         )
         .then(|| PlainText { name: "hash", line: &["#"], block: None })
     }
@@ -41,7 +45,7 @@ impl PlainText {
         match ext {
             "py" | "rb" | "sh" | "bash" | "toml" | "yaml" | "yml" | "cfg" | "conf" | "mk"
             | "pl" | "pm" | "r" | "jl" | "tf" | "gitignore" | "dockerignore" | "service"
-            | "ini" | "properties" | "env" => {
+            | "ini" | "properties" | "env" | "config" | "defconfig" | "kconfig" => {
                 PlainText { name: "hash", line: &["#"], block: None }
             }
             "sql" | "hs" | "lua" | "elm" | "vhd" | "vhdl" | "adb" | "ads" => {
@@ -52,6 +56,14 @@ impl PlainText {
             }
             "html" | "xml" | "svg" | "md" => {
                 PlainText { name: "markup", line: &[], block: Some(("<!--", "-->")) }
+            }
+            // reStructuredText comments are `..` at the line start.
+            "rst" => PlainText { name: "rst", line: &[".."], block: None },
+            // Formats with NO comment syntax. Mapping them to the C family made every
+            // `//` inside a string or URL a false comment; "no comments" is the correct
+            // answer, not a guess to be improved.
+            "json" | "txt" | "csv" | "tsv" | "lock" | "log" | "map" | "bin" | "dat" => {
+                PlainText { name: "none", line: &[], block: None }
             }
             // C family: c, h, cpp, hpp, js, ts, go, java, cs, swift, kt, scala, rs…
             _ => PlainText { name: "c-family", line: &["//"], block: Some(("/*", "*/")) },
