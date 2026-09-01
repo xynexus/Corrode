@@ -71,18 +71,10 @@ JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`),
 `CORRODE_NEEDLE_ASSETS` (Needle asset dir under `--features needle`; defaults to the
 vendored `crates/needle-toolcall-shim/assets/needle`, resolved at build time, so it
 works out of the box; absent -> tool-caller disabled, swarm falls back to
-<<<<<<< HEAD
 model-emitted calls), `CORRODE_SKILL_ACTIVATE_MIN` (cosine bar to inject a skill's full body,
-default 0.35), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -> tool-profile` file
-=======
-model-emitted calls), `CORRODE_SMALL_MODELS` (comma-separated substrings that
-force-classify a model as "small" -> uses the Needle tool loop) and
-`CORRODE_SMALL_MODEL_MAX_B` (billions-param cutoff below which a model counts as small,
-default 32), `CORRODE_SKILL_ACTIVATE_MIN` (cosine bar to inject a skill's full body,
 default 0.35), `CORRODE_SKILL_LIST_MIN` (cosine bar to list a skill at all, default
 0.30 — below it the skills section is omitted rather than filled with the
 least-irrelevant matches), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -> tool-profile` file
->>>>>>> 7ebc62a (Skills: a relevance floor for stage-1 listing)
 — per-model tool names/schema/parse; absent -> the built-in Needle default),
 `CORRODE_NEEDLE_MODEL_ID` (dialect key for the Needle caller, default `needle`),
 `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
