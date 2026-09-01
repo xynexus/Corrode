@@ -94,7 +94,16 @@ pub trait Language: Send + Sync {
 /// Pick a backend for a path. Unknown extensions fall back to [`text::PlainText`], so
 /// every file can be ingested — with less structure, never with less fidelity.
 pub fn for_path(path: &str) -> Box<dyn Language> {
-    let ext = path.rsplit('.').next().unwrap_or("");
+    let base = path.rsplit('/').next().unwrap_or(path);
+    // Filename first: `Makefile`, `Kconfig` and friends carry no extension, and an
+    // extension-only lookup would hand thousands of `#`-commented files to the C-family
+    // default and find nothing in them.
+    if let Some(named) = text::PlainText::for_filename(base) {
+        return Box::new(named);
+    }
+    // Only treat a trailing segment as an extension if the name actually has a dot;
+    // otherwise `rsplit` hands back the whole filename.
+    let ext = base.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
     if rust::Rust.extensions().contains(&ext) {
         return Box::new(rust::Rust);
     }

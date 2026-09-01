@@ -419,6 +419,7 @@ falsify it.
 | The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
 | Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
 | The graph is the source of truth, files a projection | **aspiration** — ingest built, projection direction unwired | — | bijective line numbers |
+| Ingest holds up on unfamiliar languages at scale | **UNTESTED** — predictions recorded below | `CORRODE_SCAN_REPO=<repo>` round trip | absorbing arbitrary codebases |
 | Re-ingest on write keeps the code index fresh | **UNTESTED** — wired, needs a live `--features helix` store | ingest a repo, edit a file, query the graph | trusting index-backed search |
 
 Why this section exists, from the record of one session: every miss was a claim nobody
@@ -607,3 +608,35 @@ Two caveats on their evidence: answer quality was scored by the paper's first au
 against their own reference answers, not blind; and the hybrid they advocate has **no
 experimental evaluation** — it is the one part of the paper nobody has measured, which
 is precisely the part being adopted.
+
+## 11. Predictions for the multi-language ingest test
+
+Recorded BEFORE running against Python, C, C++ and the Linux kernel, so being wrong is
+cheap and visible. Byte-exact projection should hold everywhere — it depends only on
+the span cover being total, which the fallback guarantees by using one node per file.
+What follows is where COMMENT recovery is expected to degrade.
+
+**Python.** `#` comments are found. **Docstrings are not**, and that is the big one:
+`"""..."""` is a string expression rather than a comment, so Python's primary
+documentation mechanism is invisible to a marker-based backend. Triple quotes also
+stress the coarse string skip, which understands only single-character quoting — a `#`
+inside a docstring may be misread as a comment. Expect recall to look fine and
+precision to be the problem.
+
+**C.** `//` and `/* */` are found. A **line-continued comment** (`// text \` then a
+newline) legally continues in C and this backend ends it at the newline, so the
+continuation is treated as code. `#if 0 … #endif` is not a comment and will not be
+reported as one, which is correct but means commented-out code is invisible.
+
+**C++.** As C, plus **raw string literals** (`R"delim(...)delim"`), which the coarse
+skip does not understand — a `//` inside one may be reported as a comment.
+
+**Linux kernel.** Scale first: tens of thousands of files, with **non-UTF-8 sources**
+that `read_to_string` rejects. Those are counted as `unreadable` rather than silently
+dropped, precisely so the totals cannot flatter themselves. `.S` assembly mixes C-style
+and `#`-style comments and will only get the former. Extensionless `Makefile`/`Kconfig`
+files are now routed by filename; before that fix they fell to the C family and would
+have found nothing in thousands of files.
+
+**Not expected to break:** byte-exactness, in any language. If a mismatch appears, the
+span cover is wrong and that is a real defect rather than a missing backend.

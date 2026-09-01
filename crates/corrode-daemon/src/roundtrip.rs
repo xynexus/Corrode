@@ -9,8 +9,25 @@ use crate::projection::{self, ingest, regenerate, scan, Language};
 
 /// The end-to-end claim: a repository decomposes into nodes and reassembles byte-for-
 /// byte. Runs whatever backend each path selects, so it covers the fallback too.
+/// Per-backend outcome for one repository.
 #[cfg(test)]
-fn scan_repo(repo: &str) -> (usize, usize, usize, usize) {
+#[derive(Default)]
+struct Census {
+    files: usize,
+    exact: usize,
+    mismatched: usize,
+    nodes: usize,
+    comments: usize,
+    bound: usize,
+}
+
+/// Ingest every tracked file and report what happened, by language.
+///
+/// The breakdown matters more than the total on a mixed repo: a fallback that quietly
+/// swallows half a tree looks identical to full coverage if you only count round trips.
+#[cfg(test)]
+fn scan_repo(repo: &str) -> (std::collections::BTreeMap<&'static str, Census>, usize, usize) {
+    use std::collections::BTreeMap;
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -24,25 +41,66 @@ fn scan_repo(repo: &str) -> (usize, usize, usize, usize) {
             matches!(m.split_whitespace().next()?, "100644" | "100755").then(|| p.to_string())
         })
         .collect();
-    let (mut ok, mut bad, mut nodes, mut comments) = (0usize, 0usize, 0usize, 0usize);
+
+    let mut by_lang: BTreeMap<&'static str, Census> = BTreeMap::new();
+    // Files skipped for reasons that are NOT the projection's fault, counted rather
+    // than silently dropped: a kernel tree has latin-1 sources and binaries, and
+    // "skipped 9000" reads very differently from "byte-exact 100%".
+    let (mut unreadable, mut ingest_failed) = (0usize, 0usize);
+
     for rel in &files {
-        let Ok(src) = std::fs::read_to_string(std::path::Path::new(repo).join(rel)) else {
+        let path = std::path::Path::new(repo).join(rel);
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            unreadable += 1; // binary, or not UTF-8
             continue;
         };
         let lang = projection::for_path(rel);
-        let Ok(fw) = ingest::file(lang.as_ref(), rel, &src) else {
-            continue;
-        };
-        if ingest::project(&fw) == src {
-            ok += 1;
-            nodes += fw.code.len();
-            comments += fw.comments.len();
-        } else {
-            bad += 1;
-            eprintln!("  MISMATCH {rel} ({})", lang.name());
+        let name = lang.name();
+        let e = by_lang.entry(name).or_default();
+        e.files += 1;
+        match ingest::file(lang.as_ref(), rel, &src) {
+            Err(_) => {
+                ingest_failed += 1;
+                e.files -= 1;
+            }
+            Ok(fw) => {
+                if ingest::project(&fw) == src {
+                    e.exact += 1;
+                } else {
+                    e.mismatched += 1;
+                    if e.mismatched <= 3 {
+                        eprintln!("  MISMATCH [{name}] {rel}");
+                    }
+                }
+                e.nodes += fw.code.len();
+                e.comments += fw.comments.len();
+                e.bound += fw.comments.iter().filter(|c| c.describes_kind.is_some()).count();
+            }
         }
     }
-    (ok, bad, nodes, comments)
+    (by_lang, unreadable, ingest_failed)
+}
+
+/// Which extensions are landing on the fallback, biggest first — the worklist for
+/// deciding which backend to write next.
+#[cfg(test)]
+fn fallback_extensions(repo: &str) -> Vec<(String, usize)> {
+    use std::collections::BTreeMap;
+    let out = std::process::Command::new("git")
+        .arg("-C").arg(repo).args(["ls-files", "-z"]).output().expect("git");
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for rel in String::from_utf8_lossy(&out.stdout).split('\0').filter(|s| !s.is_empty()) {
+        let lang = projection::for_path(rel);
+        if lang.name() == "rust" {
+            continue;
+        }
+        let ext = rel.rsplit('/').next().unwrap_or(rel);
+        let ext = ext.rsplit_once('.').map(|(_, e)| e.to_string()).unwrap_or_else(|| "(none)".into());
+        *counts.entry(ext).or_default() += 1;
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    v
 }
 
 #[cfg(test)]
@@ -50,6 +108,8 @@ mod tests {
     use super::*;
 
     /// Every tracked file in a repo, whatever its language, projects back exactly.
+    ///
+    /// `CORRODE_SCAN_REPO=/path/to/repo` points it at anything.
     #[test]
     fn a_repository_round_trips() {
         let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
@@ -58,12 +118,36 @@ mod tests {
                 .to_string_lossy()
                 .into_owned()
         });
-        let (ok, bad, nodes, comments) = scan_repo(&repo);
-        eprintln!("--- round trip over {repo} ---");
-        eprintln!("  byte-exact {ok}, mismatched {bad}");
-        eprintln!("  {nodes} code nodes, {comments} comments");
-        assert!(ok > 0, "nothing scanned");
-        assert_eq!(bad, 0, "projection was not byte-exact");
+        let (by_lang, unreadable, failed) = scan_repo(&repo);
+
+        eprintln!("--- ingest census: {repo} ---");
+        eprintln!(
+            "  {:<12} {:>7} {:>8} {:>7} {:>8} {:>9} {:>7}",
+            "backend", "files", "exact", "MISM", "nodes", "comments", "bound"
+        );
+        let (mut tf, mut te, mut tm) = (0usize, 0usize, 0usize);
+        for (name, c) in &by_lang {
+            eprintln!(
+                "  {:<12} {:>7} {:>8} {:>7} {:>8} {:>9} {:>7}",
+                name, c.files, c.exact, c.mismatched, c.nodes, c.comments, c.bound
+            );
+            tf += c.files;
+            te += c.exact;
+            tm += c.mismatched;
+        }
+        eprintln!("  {:<12} {:>7} {:>8} {:>7}", "TOTAL", tf, te, tm);
+        eprintln!("  skipped: {unreadable} unreadable/non-UTF-8, {failed} ingest errors");
+
+        let fb = fallback_extensions(&repo);
+        if !fb.is_empty() {
+            eprintln!("  top extensions without a backend:");
+            for (ext, n) in fb.iter().take(8) {
+                eprintln!("    .{ext:<10} {n}");
+            }
+        }
+
+        assert!(tf > 0, "nothing scanned");
+        assert_eq!(tm, 0, "projection was not byte-exact");
     }
 
     /// Positions are an OUTPUT of projection, never node state: a byte offset is a fact

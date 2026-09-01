@@ -23,12 +23,28 @@ impl PlainText {
     /// Marker set for an extension. Unknown extensions get the C-family defaults, which
     /// covers the majority of what a mixed repo contains; a file with no comments in
     /// that syntax simply yields none.
+    /// Marker set for a whole filename, for the many build and config files that
+    /// carry no extension. Getting these wrong is not cosmetic: a kernel tree is full
+    /// of `Makefile` and `Kconfig`, all of which comment with `#`, and defaulting them
+    /// to the C family would silently find no comments in thousands of files.
+    pub fn for_filename(name: &str) -> Option<PlainText> {
+        let base = name.rsplit('/').next().unwrap_or(name);
+        matches!(
+            base,
+            "Makefile" | "makefile" | "GNUmakefile" | "Kconfig" | "Dockerfile" | "Containerfile"
+                | "Vagrantfile" | "Rakefile" | "Gemfile" | "Justfile" | "justfile" | "CMakeLists.txt"
+        )
+        .then(|| PlainText { name: "hash", line: &["#"], block: None })
+    }
+
     pub fn for_extension(ext: &str) -> PlainText {
         match ext {
-            "py" | "rb" | "sh" | "bash" | "toml" | "yaml" | "yml" | "cfg" | "conf" | "mk" => {
+            "py" | "rb" | "sh" | "bash" | "toml" | "yaml" | "yml" | "cfg" | "conf" | "mk"
+            | "pl" | "pm" | "r" | "jl" | "tf" | "gitignore" | "dockerignore" | "service"
+            | "ini" | "properties" | "env" => {
                 PlainText { name: "hash", line: &["#"], block: None }
             }
-            "sql" | "hs" | "lua" | "elm" => {
+            "sql" | "hs" | "lua" | "elm" | "vhd" | "vhdl" | "adb" | "ads" => {
                 PlainText { name: "dashdash", line: &["--"], block: None }
             }
             "lisp" | "clj" | "el" | "scm" => {
@@ -116,5 +132,30 @@ impl Language for PlainText {
             i = step(src, i);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{for_path, ingest, Language};
+
+    /// Extensionless build files are the common case in a kernel tree, and defaulting
+    /// them to C-family markers finds no comments at all.
+    #[test]
+    fn extensionless_build_files_get_hash_comments() {
+        for name in ["Makefile", "drivers/net/Kconfig", "Dockerfile", "CMakeLists.txt"] {
+            let lang = for_path(name);
+            assert_eq!(lang.name(), "hash", "{name} should use # comments");
+            let src = "# a comment\nall:\n\techo hi\n";
+            assert_eq!(lang.comments(src).len(), 1, "{name}");
+        }
+    }
+
+    /// A dotted directory must not make the path look like an extension.
+    #[test]
+    fn a_dot_in_a_directory_is_not_an_extension() {
+        assert_eq!(for_path("some.dir/Makefile").name(), "hash");
+        assert_eq!(for_path("src/lib.rs").name(), "rust");
+        assert_eq!(for_path("noextension").name(), "c-family", "unknown -> default");
     }
 }
