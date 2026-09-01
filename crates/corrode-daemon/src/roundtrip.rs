@@ -693,10 +693,15 @@ pub mod compose {
         /// Verbatim source. NOT regenerated: tier 2 measured that regeneration loses
         /// comments and canonicalises punctuation, so content is stored, not printed.
         pub text: String,
-        /// 1-based, derived at scan time. Storing this is a convenience for the census;
-        /// a live store would derive it from the projection instead, so an edit above
-        /// does not invalidate every node below.
-        pub start_line: usize,
+        /// 1-based line at SCAN time only, and not authoritative.
+        ///
+        /// Kept because the ingest census reports it, but a projector must never read
+        /// it: a byte offset or line number is a fact about one source text, and a
+        /// dynamically generated VFS has no such text. Files are produced FROM nodes,
+        /// possibly reordered, edited, or drawn from a branch that was never
+        /// materialised — so a stored position is either stale or meaningless. Use
+        /// [`super::compose::project`], which computes positions as an OUTPUT.
+        pub scan_line: usize,
     }
 
     fn kind_of(item: &syn::Item) -> &'static str {
@@ -748,7 +753,7 @@ pub mod compose {
                 ordinal,
                 kind: kind_of(item),
                 text: src[start..r.end].to_string(),
-                start_line: line_of(src, start),
+                scan_line: line_of(src, start),
             });
             ordinal += 1;
             cursor = r.end;
@@ -772,7 +777,7 @@ pub mod compose {
             ordinal: *ordinal,
             kind: "trivia",
             text: src[from..to].to_string(),
-            start_line: line_of(src, from),
+            scan_line: line_of(src, from),
         });
         *ordinal += 1;
     }
@@ -845,6 +850,39 @@ pub mod compose {
             }
         }
         out
+    }
+
+    /// Where a node landed in a projection. Produced BY projection, never stored.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Placement {
+        pub ordinal: usize,
+        pub kind: &'static str,
+        /// 1-based line where this node starts in the projected file.
+        pub start_line: usize,
+        pub start_byte: usize,
+    }
+
+    /// Project nodes into a file AND report where each one landed.
+    ///
+    /// This is the operation a dynamic VFS actually performs. Positions come out of it;
+    /// they are never inputs. Reorder the nodes, insert one, edit one — the next
+    /// projection reports the new truth, and nothing had to be invalidated because
+    /// nothing had been stored.
+    pub fn project(nodes: &[Node]) -> (String, Vec<Placement>) {
+        let mut sorted: Vec<&Node> = nodes.iter().collect();
+        sorted.sort_by_key(|n| n.ordinal);
+        let mut text = String::new();
+        let mut places = Vec::with_capacity(sorted.len());
+        for n in sorted {
+            places.push(Placement {
+                ordinal: n.ordinal,
+                kind: n.kind,
+                start_line: text.bytes().filter(|b| *b == b'\n').count() + 1,
+                start_byte: text.len(),
+            });
+            text.push_str(&n.text);
+        }
+        (text, places)
     }
 
     /// Reassemble a file from its nodes. This is the whole composer.
@@ -956,38 +994,88 @@ mod compose_tests {
         assert_eq!(mismatched, 0, "regeneration was not byte-exact");
     }
 
-    /// The point of the exercise: a node knows where it lands, so `path:line` is
-    /// DERIVED rather than stored-and-invalidated. Checked against the real file.
+    /// Positions are an OUTPUT of projection, not node state.
+    ///
+    /// The distinction is not academic: a dynamically generated VFS projects files
+    /// that were never on disk, from nodes that get reordered, inserted and edited. A
+    /// byte offset or line number stored on a node is a fact about one source text,
+    /// so it is stale or meaningless the moment the graph moves. This asserts that
+    /// `project` reports the truth after a mutation that would invalidate any stored
+    /// position.
     #[test]
-    fn nodes_carry_correct_line_numbers() {
-        let path = "crates/corrode-daemon/src/roundtrip.rs";
-        let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/roundtrip.rs");
-        let src = std::fs::read_to_string(&full).unwrap();
-        let nodes = scan(path, &src).expect("parses");
+    fn positions_are_recomputed_not_stored() {
+        let src = "use a::b;\n\nfn one() {}\n\nfn two() {}\n";
+        let nodes = scan("t.rs", src).unwrap();
+        let (text, places) = project(&nodes);
+        assert_eq!(text, src, "projection reproduces the source");
 
-        for n in nodes.iter().filter(|n| n.kind != "trivia") {
-            // The node's first non-blank line must actually appear at start_line.
-            let first = n.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-            let actual = src.lines().nth(n.start_line - 1).unwrap_or("");
-            assert_eq!(
-                first.trim_end(),
-                actual.trim_end(),
-                "{path}:{} — node text does not begin at its derived line",
-                n.start_line
-            );
-        }
+        let line_of = |ord: usize| places.iter().find(|p| p.ordinal == ord).unwrap().start_line;
+        let two = nodes.iter().find(|n| n.text.contains("fn two")).unwrap();
+        assert_eq!(line_of(two.ordinal), 5, "fn two starts at line 5");
+        let stored_before = two.scan_line;
 
-        // And an edit ABOVE a node shifts its line, which is exactly why a live store
-        // derives this from the projection instead of persisting it.
-        let shifted = format!("// inserted\n{src}");
-        let after = scan(path, &shifted).expect("parses");
-        let before_first = nodes.iter().find(|n| n.kind != "trivia").unwrap().start_line;
-        let after_first = after.iter().find(|n| n.kind != "trivia").unwrap().start_line;
+        // Now do what a live graph does: insert a node ahead of it.
+        let mut mutated: Vec<Node> = nodes
+            .iter()
+            .cloned()
+            .map(|mut n| {
+                n.ordinal += 2;
+                n
+            })
+            .collect();
+        mutated.push(Node {
+            path: "t.rs".into(),
+            ordinal: 0,
+            kind: "use",
+            text: "use inserted::thing;".into(),
+            scan_line: 0,
+        });
+        mutated.push(Node {
+            path: "t.rs".into(),
+            ordinal: 1,
+            kind: "trivia",
+            text: "\n\n".into(),
+            scan_line: 0,
+        });
+
+        let (text2, places2) = project(&mutated);
+        assert!(text2.starts_with("use inserted::thing;"), "insert took effect");
+        let two_after = places2
+            .iter()
+            .find(|p| p.ordinal == two.ordinal + 2)
+            .expect("fn two still projected");
         assert_eq!(
-            after_first,
-            before_first + 1,
-            "one inserted line must shift every node below it by one"
+            two_after.start_line,
+            stored_before + 2,
+            "two inserted lines shifted it; projection reports the new line"
         );
+        // The node's own `scan_line` is now wrong — which is exactly why a projector
+        // must never read it.
+        assert_ne!(
+            stored_before, two_after.start_line,
+            "a stored position would have been stale here"
+        );
+    }
+
+    /// Comments bind to (node, line-within-node), so they survive the same mutation.
+    /// An absolute line would not.
+    #[test]
+    fn comment_attachment_survives_reordering() {
+        use super::comments::*;
+        let src = "fn f() {\n    // explains the loop\n    let x = 1;\n}\n";
+        let nodes = scan("t.rs", src).unwrap();
+        let refs = extract("t.rs", src, &nodes);
+        let c = refs.iter().find(|c| c.text.contains("explains")).expect("found");
+        assert_eq!(c.line_in_node, 2, "second line of its node");
+
+        // Shift the whole file down; the relative position is unchanged, the absolute
+        // one is not.
+        let shifted = format!("// header\n\n{src}");
+        let nodes2 = scan("t.rs", &shifted).unwrap();
+        let refs2 = extract("t.rs", &shifted, &nodes2);
+        let c2 = refs2.iter().find(|c| c.text.contains("explains")).expect("found");
+        assert_eq!(c2.line_in_node, 2, "line WITHIN the node is stable");
+        assert_ne!(c.abs_line, c2.abs_line, "the absolute line moved");
     }
 }
 
@@ -995,10 +1083,9 @@ mod compose_tests {
 /// repo ONCE into the projector's own form, after which regeneration is exact because
 /// the source is already what the printer emits.
 ///
-/// It would simplify a great deal — nodes hold structure with no verbatim text, no
-/// trivia nodes (half of them today), and item order becomes a property of the graph
-/// rather than of the file. Two things decide whether it is viable, and both are
-/// measurable rather than arguable.
+/// Measured and REJECTED ON COST, not feasibility: the printer reaches a fixed point in
+/// two passes, but canonicalising destroys 35,477 body comments that no migration can
+/// recover. Kept so the measurement can be re-run rather than re-argued.
 pub mod canonical {
     /// Does printing a canonical file reproduce it? If the printer is not idempotent
     /// there is no fixed point to converge on and the scheme has no foundation.
@@ -1207,5 +1294,148 @@ fn f() {}
         eprintln!("  {inside} plain-comment lines live INSIDE item bodies (kept verbatim in the node,");
         eprintln!("    attachable to a sub-item element only with a lossless CST)");
         assert!(!files.is_empty());
+    }
+}
+
+/// The comment-extraction pass.
+///
+/// Comments never reach the AST — Rust's lexer discards them — so recovering them is a
+/// SEPARATE pass over the source, run alongside the parse rather than derived from it.
+/// This is that pass: find every comment lexically, then bind it to the node that
+/// contains it and to a line within that node.
+///
+/// Granularity worth being precise about. Byte offsets resolve a comment to a *line*
+/// inside a node, which is what a reader needs and what `path:line` reporting wants.
+/// They do not resolve it to a syntactic *element* — "the comment on this match arm" —
+/// because item spans stop at item boundaries. That needs a lossless CST
+/// (`ra_ap_syntax`). Line-level does not.
+pub mod comments {
+    use super::compose::Node;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
+        /// `// ...`
+        Line,
+        /// `/* ... */`
+        Block,
+        /// `/// ...` or `/** ... */` — survives into the AST as `#[doc]`.
+        Doc,
+        /// `//! ...` — inner doc.
+        InnerDoc,
+    }
+
+    /// One comment, bound to where it lives.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct CommentRef {
+        pub path: String,
+        /// Which node contains it. `None` only if it precedes every node.
+        pub node_ordinal: Option<usize>,
+        /// 1-based line WITHIN that node — stable under edits elsewhere in the file.
+        pub line_in_node: usize,
+        /// 1-based line in the file as it currently projects. Derived, not stored.
+        pub abs_line: usize,
+        pub kind: Kind,
+        pub text: String,
+    }
+
+    /// Find every comment in `src`, skipping string, raw-string and char literals so a
+    /// `//` inside a string is never mistaken for one.
+    pub fn extract(path: &str, src: &str, nodes: &[Node]) -> Vec<CommentRef> {
+        let b = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+
+        // Byte ranges of each node, in ordinal order, so a comment can be located.
+        let mut ranges: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, ordinal)
+        let mut at = 0usize;
+        let mut sorted: Vec<&Node> = nodes.iter().collect();
+        sorted.sort_by_key(|n| n.ordinal);
+        for n in &sorted {
+            ranges.push((at, at + n.text.len(), n.ordinal));
+            at += n.text.len();
+        }
+
+        while i < b.len() {
+            if let Some((body, hashes)) = super::raw_string_start(b, i) {
+                if let Some(e) = super::raw_string_end(b, body, hashes) {
+                    i = e;
+                    continue;
+                }
+            }
+            if b[i] == b'"' {
+                if let Some(e) = super::plain_string_end(b, i) {
+                    i = e;
+                    continue;
+                }
+            }
+            if b[i] == b'\'' {
+                i = super::char_or_lifetime_end(b, i);
+                continue;
+            }
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                let kind = match b.get(i + 2) {
+                    Some(b'/') => Kind::Doc,
+                    Some(b'!') => Kind::InnerDoc,
+                    _ => Kind::Line,
+                };
+                let start = i;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                out.push(make_ref(path, src, &ranges, start, i, kind));
+                continue;
+            }
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                let kind = match b.get(i + 2) {
+                    Some(b'*') => Kind::Doc,
+                    Some(b'!') => Kind::InnerDoc,
+                    _ => Kind::Block,
+                };
+                let start = i;
+                let mut nest = 1;
+                i += 2;
+                while i + 1 < b.len() && nest > 0 {
+                    if b[i] == b'/' && b[i + 1] == b'*' {
+                        nest += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b[i + 1] == b'/' {
+                        nest -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                out.push(make_ref(path, src, &ranges, start, i, kind));
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn make_ref(
+        path: &str,
+        src: &str,
+        ranges: &[(usize, usize, usize)],
+        start: usize,
+        end: usize,
+        kind: Kind,
+    ) -> CommentRef {
+        let owner = ranges
+            .iter()
+            .find(|(s, e, _)| start >= *s && start < *e)
+            .map(|(s, _, ord)| (*s, *ord));
+        let (node_start, node_ordinal) = match owner {
+            Some((s, o)) => (s, Some(o)),
+            None => (0, None),
+        };
+        CommentRef {
+            path: path.to_string(),
+            node_ordinal,
+            line_in_node: src[node_start..start].bytes().filter(|c| *c == b'\n').count() + 1,
+            abs_line: src[..start].bytes().filter(|c| *c == b'\n').count() + 1,
+            kind,
+            text: src[start..end].to_string(),
+        }
     }
 }

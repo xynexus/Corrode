@@ -466,6 +466,19 @@ abandoned. Trading them for a simpler VFS buys implementation convenience with
 institutional memory. The verbatim-span composer already delivers byte-exactness, so
 the simplification is not needed to make projection work — only to make it tidier.
 
+**Spans are an ingest-time artifact and must not survive into the store.** A byte
+offset is a fact about one source text. A dynamically generated VFS has no such text:
+it projects files from nodes that get reordered, inserted, edited, or drawn from a
+branch never materialised — so a stored offset or line number is stale or meaningless
+the moment the graph moves. Nodes carry content and order; **positions are an OUTPUT of
+projection**, recomputed per materialisation and never persisted. `compose::project`
+returns the text and where each node landed, and a test asserts that inserting a node
+shifts the reported line while the value captured at scan time goes wrong — which is
+what a stored position would have done silently.
+
+The same rule fixes comment binding. A comment attaches to `(node, line-within-node)`,
+which survives reordering, rather than to an absolute line, which does not.
+
 **Comments are lost in the lexer, not in `syn`.** Rust's grammar treats a plain
 comment as trivia and emits no token for it; a doc comment is desugared to
 `#[doc = "..."]`. Parsing `// plain\n/// doc\nfn f() { /* inner */ let x = 1; }` yields
