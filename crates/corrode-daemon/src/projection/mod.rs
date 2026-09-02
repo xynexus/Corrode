@@ -387,3 +387,135 @@ pub fn comments_for<'a>(edges: &'a [Edge], from: usize, to: usize) -> Vec<&'a Ed
 }
 
 pub mod ingest;
+
+/// Split a query into the independent things it asks for.
+///
+/// Retrieval that blends a whole query into one score cannot express "matches on two
+/// axes at once": a document matching one axis strongly outranks one matching two axes
+/// weakly. Measured on four near-identical C++ queue headers, nine document
+/// representations all plateaued at 2/4 under blended scoring — and which file failed
+/// was predicted by attribute uniqueness, not by text. Scoring each axis separately and
+/// rank-combining reached 3/4 with the same retrieval and the same documents.
+///
+/// The split is deliberately dumb: clause separators only, no parsing and no model.
+/// Extracting real axes from arbitrary prose is unsolved, and a heuristic that
+/// over-splits costs a little precision, whereas one that invents structure would put
+/// the wrong constraint on every search. A query with nothing to split on comes back as
+/// itself, so single-axis queries behave exactly as before.
+pub fn query_axes(query: &str) -> Vec<&str> {
+    const SEPARATORS: &[&str] = &[",", " and ", " but ", " while ", " with ", " that also "];
+    let mut parts = vec![query.trim()];
+    for sep in SEPARATORS {
+        parts = parts
+            .into_iter()
+            .flat_map(|p| p.split(sep))
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+    }
+    // A fragment too short to constrain anything is noise, not an axis — and if the
+    // split leaves nothing usable, fall back to the whole query rather than searching
+    // for scraps.
+    let axes: Vec<&str> = parts.into_iter().filter(|p| p.split_whitespace().count() >= 2).collect();
+    if axes.len() < 2 {
+        vec![query.trim()]
+    } else {
+        axes
+    }
+}
+
+/// Combine per-axis rankings by summing ranks, best first.
+///
+/// Rank-combining rather than score-combining, because axes are not on a common scale:
+/// comparing raw scores across them penalises whichever axis happens to sit lower, and
+/// the obvious `min` combiner measured no better than blending. Ranking within each axis
+/// removes the scale first, so the question becomes "is this near the top for EVERY
+/// axis" without requiring the numbers to be comparable. That distinction was the whole
+/// difference between 2/4 and 3/4.
+///
+/// A document absent from an axis's results is charged `penalty` — it ranked below
+/// everything that axis returned, which is information, not a missing value.
+pub fn rank_combine(per_axis: &[Vec<String>], penalty: usize) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut points: HashMap<&str, usize> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
+    for axis in per_axis {
+        for key in axis {
+            if !points.contains_key(key.as_str()) {
+                points.insert(key.as_str(), 0);
+                order.push(key.as_str());
+            }
+        }
+    }
+    for key in &order {
+        for axis in per_axis {
+            let rank = axis.iter().position(|k| k == key).unwrap_or(penalty);
+            *points.get_mut(key).unwrap() += rank;
+        }
+    }
+    // Stable on ties: first-seen order, so an axis's own ordering breaks ties rather
+    // than hash iteration order making results non-deterministic between runs.
+    let mut out: Vec<&str> = order.clone();
+    out.sort_by_key(|k| (points[k], order.iter().position(|o| o == k).unwrap()));
+    out.into_iter().map(str::to_string).collect()
+}
+
+#[cfg(test)]
+mod axis_tests {
+    use super::*;
+
+    #[test]
+    fn a_single_axis_query_is_unchanged() {
+        assert_eq!(query_axes("lock free queue"), vec!["lock free queue"]);
+        // Splitting into fragments too short to constrain anything is worse than not
+        // splitting, so it falls back to the whole query.
+        assert_eq!(query_axes("a, b"), vec!["a, b"]);
+    }
+
+    #[test]
+    fn clause_separators_become_axes() {
+        assert_eq!(
+            query_axes("many producer threads and exactly one consumer"),
+            vec!["many producer threads", "exactly one consumer"]
+        );
+        assert_eq!(
+            query_axes("bounded steps per operation, many consumer threads"),
+            vec!["bounded steps per operation", "many consumer threads"]
+        );
+    }
+
+    #[test]
+    fn rank_combining_prefers_the_document_good_on_every_axis() {
+        // `a` tops the first axis and comes last on the second — the winner-take-all
+        // document a blended score rewards. `b` is second then first: never the best on
+        // either axis, and the best overall. Rank-combining picks `b`.
+        let axes = vec![
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            vec!["b".to_string(), "c".to_string(), "a".to_string()],
+        ];
+        assert_eq!(rank_combine(&axes, 8)[0], "b");
+    }
+
+    #[test]
+    fn a_perfect_reversal_is_a_tie_and_stays_deterministic() {
+        // Worth pinning because it looks like a bug: when one axis ranks the documents
+        // in exactly the reverse order of another, every document scores identically —
+        // that is Borda being correct, not the combiner failing. First-seen order breaks
+        // the tie so results do not vary between runs.
+        let axes = vec![
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            vec!["c".to_string(), "b".to_string(), "a".to_string()],
+        ];
+        assert_eq!(rank_combine(&axes, 8), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn absence_from_an_axis_is_charged_not_ignored() {
+        // `x` tops one axis and is absent from the other; `y` is present in both.
+        let axes = vec![
+            vec!["x".to_string(), "y".to_string()],
+            vec!["y".to_string()],
+        ];
+        assert_eq!(rank_combine(&axes, 8)[0], "y", "a missing axis must cost, not be free");
+    }
+}

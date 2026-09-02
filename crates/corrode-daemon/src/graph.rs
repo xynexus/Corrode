@@ -495,65 +495,35 @@ pub mod embedded {
         }
 
         fn code_search(&self, query: &str, k: usize) -> anyhow::Result<Vec<(String, String)>> {
-            let arena = Bump::new();
-            let txn = self.storage.graph_env.read_txn()?;
-            // Over-fetch and post-filter, like `doc_search`: one BM25 corpus holds docs,
-            // provenance and now source. ponytail: with source ingested the corpus is
-            // genuinely crowded — millions of code nodes against thousands of chunks —
-            // so the doc side is the one that will lose recall first. The upgrade is a
-            // per-corpus label rather than a bigger over-fetch; do it when doc recall
-            // measurably drops.
-            let fetch = (k * 8).max(64);
-            let bm: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
-                .search_bm25(LABEL, query, fetch)
-                .map_err(|e| anyhow::anyhow!("bm25 search: {e:?}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("bm25 collect: {e:?}"))?;
-            let mut out = Vec::new();
-            for h in &bm {
-                if out.len() >= k {
-                    break;
-                }
-                let key = prop_str(h, "key");
-                // Trivia is whitespace between items: it can match a query only by
-                // accident, and a hit on it points at nothing a reader wants.
-                if prop_str(h, "kind") == "trivia" {
-                    continue;
-                }
-                if !(key.starts_with("code:") || key.starts_with("comment:")) {
-                    continue;
-                }
-                let text = prop_str(h, "label");
-                // Drop hits that matched on IDENTITY rather than content.
-                //
-                // helix BM25-indexes every property (`bm25::term_counts_for_node`
-                // iterates the whole map), and our key is `code:{path}#{order}` — so a
-                // query naming any path fragment matches every node in every file
-                // beneath it, whatever those nodes say. Measured: "frobnicator" hits
-                // both nodes of `drivers/frobnicator/widget.c` although the word appears
-                // nowhere in the source. On a kernel-sized tree "drm" would return
-                // millions of nodes on identity alone.
-                //
-                // The real fix is field-selective indexing, which means forking the
-                // vendored engine. This filter costs nothing and removes the false hits;
-                // it does not recover the write time or the storage they cost.
-                let lower = text.to_lowercase();
-                let terms: Vec<String> = query
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .filter(|t| t.len() > 2)
-                    .map(|t| t.to_lowercase())
-                    .collect();
-                // With no term long enough to check against, the filter cannot tell an
-                // identity match from a content one — so it must pass the hit through
-                // rather than discard it. `.any()` over an empty iterator is false, and
-                // the first version of this returned NOTHING for every query made only
-                // of short tokens: `fd`, `mm`, `sk`, `nr`, `rq` are ordinary C
-                // identifiers, so that silently broke a whole class of searches.
-                if terms.is_empty() || terms.iter().any(|t| lower.contains(t)) {
-                    out.push((key, text));
-                }
+            // Decompose first. BM25 sums per-term contributions, which IS blending: a
+            // document matching one clause emphatically outranks one matching every
+            // clause moderately. Measured on near-identical siblings, blended scoring
+            // plateaued where per-axis scoring rank-combined did not, so each axis gets
+            // its own search and the rankings are combined.
+            //
+            // `query_axes` returns the whole query when there is nothing to split, so a
+            // single-clause search runs exactly one pass — unchanged from before.
+            let axes = crate::projection::query_axes(query);
+            if axes.len() < 2 {
+                return self.code_search_one(query, k);
             }
-            Ok(out)
+            // Over-fetch per axis: a document mid-table on one axis and top on another
+            // must still reach the combiner, and `k` alone would cut it first.
+            let fetch = k * 4;
+            let mut per_axis: Vec<Vec<String>> = Vec::with_capacity(axes.len());
+            let mut text_of: std::collections::HashMap<String, String> = Default::default();
+            for axis in &axes {
+                let hits = self.code_search_one(axis, fetch)?;
+                per_axis.push(hits.iter().map(|(key, _)| key.clone()).collect());
+                text_of.extend(hits);
+            }
+            // A document absent from an axis ranked below everything that axis returned.
+            // Charge it rather than treating a missing value as free.
+            Ok(crate::projection::rank_combine(&per_axis, fetch + 1)
+                .into_iter()
+                .take(k)
+                .filter_map(|key| text_of.remove(&key).map(|t| (key, t)))
+                .collect())
         }
 
         /// Every code node of one file, as projection nodes in order.
@@ -767,6 +737,69 @@ pub mod embedded {
         /// ponytail: drop_node does NOT remove the node's BM25 doc at helix v2.3.5,
         /// so a pruned chunk lingers in BM25 text search until the index is rebuilt;
         /// the vector + node are gone, so vector search and graph walks are clean.
+        /// One BM25 pass. `code_search` runs this once per query axis.
+        fn code_search_one(&self, query: &str, k: usize) -> anyhow::Result<Vec<(String, String)>> {
+            let arena = Bump::new();
+            let txn = self.storage.graph_env.read_txn()?;
+            // Over-fetch and post-filter, like `doc_search`: one BM25 corpus holds docs,
+            // provenance and now source. ponytail: with source ingested the corpus is
+            // genuinely crowded — millions of code nodes against thousands of chunks —
+            // so the doc side is the one that will lose recall first. The upgrade is a
+            // per-corpus label rather than a bigger over-fetch; do it when doc recall
+            // measurably drops.
+            let fetch = (k * 8).max(64);
+            let bm: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
+                .search_bm25(LABEL, query, fetch)
+                .map_err(|e| anyhow::anyhow!("bm25 search: {e:?}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("bm25 collect: {e:?}"))?;
+            let mut out = Vec::new();
+            for h in &bm {
+                if out.len() >= k {
+                    break;
+                }
+                let key = prop_str(h, "key");
+                // Trivia is whitespace between items: it can match a query only by
+                // accident, and a hit on it points at nothing a reader wants.
+                if prop_str(h, "kind") == "trivia" {
+                    continue;
+                }
+                if !(key.starts_with("code:") || key.starts_with("comment:")) {
+                    continue;
+                }
+                let text = prop_str(h, "label");
+                // Drop hits that matched on IDENTITY rather than content.
+                //
+                // helix BM25-indexes every property (`bm25::term_counts_for_node`
+                // iterates the whole map), and our key is `code:{path}#{order}` — so a
+                // query naming any path fragment matches every node in every file
+                // beneath it, whatever those nodes say. Measured: "frobnicator" hits
+                // both nodes of `drivers/frobnicator/widget.c` although the word appears
+                // nowhere in the source. On a kernel-sized tree "drm" would return
+                // millions of nodes on identity alone.
+                //
+                // The real fix is field-selective indexing, which means forking the
+                // vendored engine. This filter costs nothing and removes the false hits;
+                // it does not recover the write time or the storage they cost.
+                let lower = text.to_lowercase();
+                let terms: Vec<String> = query
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|t| t.len() > 2)
+                    .map(|t| t.to_lowercase())
+                    .collect();
+                // With no term long enough to check against, the filter cannot tell an
+                // identity match from a content one — so it must pass the hit through
+                // rather than discard it. `.any()` over an empty iterator is false, and
+                // the first version of this returned NOTHING for every query made only
+                // of short tokens: `fd`, `mm`, `sk`, `nr`, `rq` are ordinary C
+                // identifiers, so that silently broke a whole class of searches.
+                if terms.is_empty() || terms.iter().any(|t| lower.contains(t)) {
+                    out.push((key, text));
+                }
+            }
+            Ok(out)
+        }
+
         /// A duplicate-tolerant edge write inside an open txn.
         ///
         /// `is_unique=true` makes helix refuse a second `(from, rel, to)`, which is
@@ -1097,6 +1130,56 @@ pub mod embedded {
             assert!(after.len() > before.len(), "the new item should have been added");
             // And the store still composes the edited file byte-exactly.
             assert_eq!(projection::project(&store.file_nodes(path).unwrap()).0, v2);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A multi-clause query must not be won by a document that nails one clause.
+        ///
+        /// This is the blended-scoring failure, reproduced against the real store: one
+        /// file is emphatic about producers and silent about progress guarantees, one is
+        /// emphatic about wait-freedom and silent about producers, and one covers both
+        /// moderately. BM25 sums per-term contributions, so a single pass rewards the
+        /// emphatic file; per-axis search rank-combined rewards the file that answers
+        /// the whole question.
+        #[test]
+        fn a_multi_clause_query_prefers_the_file_answering_every_clause() {
+            use crate::projection::{self, ingest};
+            let dir = scratch_dir("axes");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let files = [
+                // Emphatic on producers only.
+                ("src/many.rs", "// many producer threads producer threads producer threads enqueue here\nfn a() { }\n"),
+                // Emphatic on progress only.
+                ("src/wait.rs", "// waitfree progress waitfree progress bounded steps guaranteed\nfn b() { }\n"),
+                // Moderate on both — the correct answer to a query asking for both.
+                ("src/both.rs", "// many producer threads with waitfree progress\nfn c() { }\n"),
+            ];
+            for (path, src) in files {
+                let lang = projection::for_path(path);
+                store.replace_file(&ingest::file(lang.as_ref(), path, src).unwrap()).unwrap();
+            }
+
+            let hits = store
+                .code_search("many producer threads and waitfree progress", 8)
+                .unwrap();
+            assert!(!hits.is_empty(), "expected hits for a two-clause query");
+            // Assert on the FILE, not the node kind: the text lives in a comment here,
+            // so `comment:src/both.rs#0` winning is the right answer and `code:` would
+            // be the wrong thing to require.
+            let top = &hits[0].0;
+            assert!(
+                top.contains("src/both.rs"),
+                "a two-clause query should be won by the file answering both clauses, got {top}"
+            );
+
+            // And the decomposition must not have broken single-clause search.
+            let single = store.code_search("waitfree progress", 8).unwrap();
+            assert!(
+                single.iter().any(|(k, _)| k.contains("src/wait.rs")),
+                "single-clause search must still find the emphatic file: {single:?}"
+            );
             std::fs::remove_dir_all(&dir).ok();
         }
 

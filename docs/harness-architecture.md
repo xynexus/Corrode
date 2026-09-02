@@ -1075,6 +1075,13 @@ actually works.
 7e's conclusion predicted that the ceiling was single-vector composition, not
 description. That prediction is testable, and it holds.
 
+**A reranker exists on this host but cannot be served.** `/srv/hipfire/models/` holds
+`Qwen3-Reranker-0.6B/-4B/-8B` as `.hfa`, while everything the daemon serves is `.hfq`;
+and `reranker` matches nothing in `hipfire-model` or `hipfire-serving-core` beyond the
+scoring primitive itself. So the models are downloaded, the scorer
+(`pooling::rerank_yes_no`) is written and unit-tested with zero production callers, and
+the loading path is the missing piece. Filed as hipfire PR #407.
+
 **There is no reranker to test with.** hipfire's `/v1/rerank` is
 `rank_by_cosine(query_embedding, doc_embeddings)` over the same bi-encoder
 (`hipfire-daemon/src/lib.rs`), so calling it would reproduce the numbers above *by
@@ -1116,6 +1123,34 @@ documents is coarse.
 What it does establish is a direction that needs no cross-encoder, no larger model and no
 generated prose: **retrieval decomposes the query, scores axes independently, and
 rank-combines.** Every piece of that is available today.
+
+#### Shipped in `code_search`
+
+`projection::query_axes` splits a query on clause separators and `rank_combine` sums
+per-axis ranks; `code_search` runs one BM25 pass per axis and combines them. BM25 sums
+per-term contributions, which *is* blending — a document matching one clause emphatically
+outranks one matching every clause moderately — so the same fix applies to it as to
+cosine.
+
+Four decisions worth keeping:
+
+- **A query with nothing to split comes back whole**, so single-clause search runs one
+  pass and behaves exactly as before. The change can only affect multi-clause queries.
+- **The splitter is deliberately dumb** — clause separators, no parsing, no model.
+  Extracting real axes from arbitrary prose is the load-bearing unknown here; a
+  heuristic that over-splits costs a little precision, while one that invents structure
+  would put a wrong constraint on every search.
+- **Rank-combine, not score-combine.** Axes are not on a common scale, and the obvious
+  `min` combiner measured no better than blending. Ranking within each axis first is the
+  whole difference between 2/4 and 3/4.
+- **Absence from an axis is charged, not ignored.** A document missing from one axis's
+  results ranked below everything that axis returned, which is information.
+
+Two things a test pins because they look like bugs and are not: a perfect reversal
+between two axes ties every document (Borda being right, with first-seen order keeping it
+deterministic), and a multi-clause query can be won by a *comment* node — the text lives
+where it lives, and requiring a `code:` node would be the wrong assertion rather than the
+right result.
 
 ### Per-directory prose: what is actually there
 
