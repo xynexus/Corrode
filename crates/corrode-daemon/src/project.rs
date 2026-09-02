@@ -12,7 +12,46 @@
 //! vendor-specific one. Every field is optional; absent file = defaults.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// How exactly a project's source must survive the graph round trip.
+///
+/// `Verbatim` (the default) keeps every byte, which is what makes projection
+/// byte-exact on source nobody has normalised — and what forces a growing tail of
+/// corner cases as nodes get more specific.
+///
+/// `Normalized` is the deliberate trade: run the language's own formatter over the repo
+/// once, commit that, and the quirks stop existing rather than being handled. It does
+/// NOT make ingest lossy — normalised source round-trips byte-exactly through the same
+/// verbatim pipeline. It is a claim about the repo, and `normalize --check` enforces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Fidelity {
+    #[default]
+    Verbatim,
+    Normalized,
+}
+
+/// Formatters by [`Language::name`](crate::projection::Language::name). Each is argv
+/// with a stdin -> stdout contract; `{path}` is replaced with the file's repo-relative
+/// path, which is how `clang-format` picks C from C++ and finds the right `.clang-format`.
+///
+/// Defaults cover the two backends that have a real parser. A language with no entry is
+/// left alone rather than guessed at — normalising a file with the wrong tool is worse
+/// than not normalising it.
+fn default_formatters() -> HashMap<String, Vec<String>> {
+    let mut m = HashMap::new();
+    m.insert(
+        "rust".to_string(),
+        ["rustfmt", "--emit", "stdout", "--edition", "2021"].iter().map(|s| s.to_string()).collect(),
+    );
+    m.insert(
+        "c".to_string(),
+        ["clang-format", "--assume-filename={path}"].iter().map(|s| s.to_string()).collect(),
+    );
+    m
+}
 
 /// Which global (`~/`) skills a project admits.
 ///
@@ -56,6 +95,10 @@ impl GlobalSkills {
 struct ProjectFile {
     name: Option<String>,
     global_skills: Option<GlobalSkills>,
+    fidelity: Option<Fidelity>,
+    /// Merged over the defaults, so a project overrides one language without
+    /// restating the rest. An empty argv removes a default.
+    formatters: Option<HashMap<String, Vec<String>>>,
 }
 
 /// The repository this daemon serves.
@@ -65,6 +108,8 @@ pub struct Project {
     pub name: String,
     pub root: PathBuf,
     pub global_skills: GlobalSkills,
+    pub fidelity: Fidelity,
+    pub formatters: HashMap<String, Vec<String>>,
 }
 
 impl Project {
@@ -84,6 +129,18 @@ impl Project {
                 .unwrap_or_else(|| dir_name(root)),
             root: root.to_path_buf(),
             global_skills: file.global_skills.unwrap_or_default(),
+            fidelity: file.fidelity.unwrap_or_default(),
+            formatters: {
+                let mut m = default_formatters();
+                for (lang, argv) in file.formatters.unwrap_or_default() {
+                    if argv.is_empty() {
+                        m.remove(&lang);
+                    } else {
+                        m.insert(lang, argv);
+                    }
+                }
+                m
+            },
         }
     }
 
@@ -147,6 +204,24 @@ mod tests {
         assert!(listed.global_skills.admits("helix-query-rust"));
         assert!(!listed.global_skills.admits("hipfire-diag"));
         assert!(listed.global_skills.any());
+    }
+
+    #[test]
+    fn fidelity_defaults_to_verbatim_and_formatters_merge_over_defaults() {
+        let root = scratch("fidelity");
+        let plain = Project::load(&root);
+        // Absent config must not silently opt a repo into being rewritten.
+        assert_eq!(plain.fidelity, Fidelity::Verbatim);
+        assert!(plain.formatters.contains_key("rust"));
+
+        write_config(
+            &root,
+            r#"{"fidelity":"normalized","formatters":{"c":["my-fmt","{path}"],"rust":[]}}"#,
+        );
+        let p = Project::load(&root);
+        assert_eq!(p.fidelity, Fidelity::Normalized);
+        assert_eq!(p.formatters["c"], vec!["my-fmt", "{path}"]);
+        assert!(!p.formatters.contains_key("rust"), "empty argv removes a default");
     }
 
     #[test]

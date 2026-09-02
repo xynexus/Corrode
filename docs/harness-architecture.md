@@ -416,6 +416,7 @@ falsify it.
 | Regenerating an item by PRINTING its AST is byte-exact | **FALSE** — 0 of 91 files | `roundtrip::regen` census | rules out a printer-based composer |
 | Composing a repo from verbatim item nodes is byte-exact | **TRUE** — 1515 files, 31 MB, 3 repos | `roundtrip::compose` scan + regenerate | graph-backed VFS; derived line numbers |
 | A canonical-form repo would remove the need for verbatim text | **REJECTED on cost, not feasibility** — converges in 2 passes, but destroys 35k body comments | `roundtrip::canonical` viability | — |
+| Normalising with the language's own formatter removes the corner cases | **FALSE** — census identical before and after `rustfmt` (0/34 exact either way) | `normalize::normalising_shrinks_the_divergence_census` | `fidelity: normalized` paying off |
 | The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
 | Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
 | The graph is the source of truth, files a projection | **aspiration** — ingest built, projection direction unwired | — | bijective line numbers |
@@ -750,6 +751,48 @@ provenance: "which task produced this node" is answered at item granularity, so 
 that edited one line claims credit for the whole function. Sub-item nodes would sharpen
 it at the cost of many more nodes per file. Not acted on; recorded because the number
 was there.
+
+### Fidelity as project policy
+
+Verbatim storage is exact today and its bill grows: every increase in node specificity
+adds corner cases that keep projection byte-exact — `rustfmt::skip`, raw strings, macro
+bodies, attribute placement, and whatever the next language brings. `.corrode/project.json`
+therefore carries a `fidelity` field, `verbatim` (default) or `normalized`, with
+`corrode-daemon normalize [--write]` to bring a repo to normal form in one reviewable
+commit and to check that a repo claiming `normalized` actually is one.
+
+Two things are deliberate. The formatter contract is stdin -> stdout with `{path}`
+substitution, so `--check` never touches a file; and `--write` refuses on a dirty tree,
+because rewriting every tracked file is only safe when `git checkout .` can undo it
+without taking the user's own work.
+
+**The measured result is that this does not yet buy what it was meant to buy.** The
+premise was that regular source has fewer quirks to special-case, so a normalised repo
+could drop verbatim text and generate its own. Running every tracked Rust file through
+`rustfmt` and re-running the AST-regeneration census on the output:
+
+```
+34 Rust files
+  as committed: 0 regenerate exactly, {UnknownDivergence: 32, MacroExpansion: 1, RustfmtSkip: 1}
+  normalised:   0 regenerate exactly, {UnknownDivergence: 32, MacroExpansion: 1, RustfmtSkip: 1}
+```
+
+Identical. Not smaller — *identical*. The divergence was never caused by irregular
+source; it is caused by two printers disagreeing about style. Normalising to `rustfmt`
+cannot make `prettyplease` output match, because `rustfmt` is not the printer we would
+generate from.
+
+That sharpens what normalisation has to mean. A normal form only removes the corner
+cases if it is **our own projection's output** — then source equals what we generate by
+construction. Normalising to `prettyplease` would do it and is already rejected: it
+destroys 35,477 body comments, because a `syn` AST has no node for them. So the trade
+is not verbatim-versus-formatter; it is verbatim-versus-*a comment-aware printer of our
+own*, which the comment nodes and their binding edges now make reachable and which does
+not exist yet.
+
+`fidelity` stays, because the seam is right and the check is useful now. What it does
+not do is let anyone delete the fidelity machinery — and it would have been easy to
+ship it believing otherwise.
 
 ### Result: the Linux kernel, streamed from its tarball
 

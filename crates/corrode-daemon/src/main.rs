@@ -18,6 +18,7 @@ mod doctor;
 mod fuse;
 mod graph;
 mod hipfire;
+mod normalize;
 #[cfg(feature = "docling")]
 mod ingest;
 mod plan_graph;
@@ -54,6 +55,16 @@ async fn main() -> anyhow::Result<()> {
     // `corrode-daemon doctor` — host readiness checks, then exit (no server).
     if std::env::args().nth(1).as_deref() == Some("doctor") {
         let ok = doctor::run().await;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
+    // `corrode-daemon normalize [--write]` — bring the repo to its formatters' normal
+    // form, or report what would change. Checking is the default: the writing form
+    // rewrites every tracked file.
+    if std::env::args().nth(1).as_deref() == Some("normalize") {
+        let write = std::env::args().any(|a| a == "--write");
+        let root = std::env::var("CORRODE_REPO").unwrap_or_else(|_| ".".to_string());
+        let ok = normalize::main(&project::Project::load(std::path::Path::new(&root)), write);
         std::process::exit(if ok { 0 } else { 1 });
     }
 
