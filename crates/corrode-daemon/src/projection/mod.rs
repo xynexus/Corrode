@@ -350,7 +350,18 @@ pub fn bind(src: &str, comments: &[CommentSpan], anchors: &[Span], nodes: &[Node
             } else {
                 (Relation::Encloses, innermost(c.end))
             };
-            let owner = extents.iter().find(|(s, e, _)| c.start >= *s && c.start < *e);
+            // Binary search, not a scan. `extents` is built in projection order and
+            // therefore ascending, so the owner is the last one starting at or before
+            // the comment. Scanning was O(comments x nodes) — measured quadratic at
+            // 1/5/21 ms for 2k/4k/8k commented items — and it is the THIRD instance of
+            // that same defect in this file after `bind`'s line arithmetic and
+            // `project`'s newline count. It had not bitten yet only because the files
+            // with the most nodes happen to have the fewest comments.
+            let owner = extents
+                .partition_point(|(s, _, _)| *s <= c.start)
+                .checked_sub(1)
+                .map(|i| &extents[i])
+                .filter(|(_, e, _)| c.start < *e);
             Edge {
                 kind: c.kind,
                 text: src[c.start..c.end].to_string(),

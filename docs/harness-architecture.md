@@ -706,6 +706,14 @@ line arithmetic: computing a comment's line by scanning from the start of the fi
 per comment, which is O(comments x filesize). A line index computed once per file took
 bind from 43% to 9%. The first fix was correct and nearly irrelevant.
 
+A **third** instance of the same defect was found later, by a branch sweep rather than a
+profile: `bind`'s owner lookup scanned every node extent per comment, O(comments x
+nodes). Measured on synthetic files of 2k/4k/8k commented items it was 1/5/21 ms —
+quadratic — and a binary search makes it 0/1/1. It had never bitten because the files
+with the most nodes happen to have the fewest comments, which is the reason a profile
+would not have found it. Three times now, in one file, the defect has been a lookup that
+walks from the beginning; that is a pattern, not three accidents.
+
 Extrapolated to a kernel-sized tree (~80k files, ~1.3 GB, overwhelmingly C and
 therefore on the fast fallback path) this is single-digit minutes, not hours. Rust is
 the slow backend at ~1.5 MB/s against ~25 MB/s for the fallback, because `syn` parses;
