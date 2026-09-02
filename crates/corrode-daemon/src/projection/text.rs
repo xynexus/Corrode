@@ -178,6 +178,26 @@ mod tests {
     /// in the kernel are shell fragments, so the C backend's claim on `.inc` was wrong
     /// 15 times out of 15 — and `normalize` turns a wrong claim into clang-format
     /// rewriting a file whose recipe lines are distinguished by a leading TAB.
+    /// The fallback skips quoted strings, so a marker inside one is not a comment —
+    /// and that skip has its own trap: an apostrophe in ordinary prose.
+    ///
+    /// `# don't do this` opens a quote that runs to the next apostrophe or to EOF,
+    /// which can swallow every comment after it. Makefiles and Kconfig are full of
+    /// English prose comments, so this is not a contrived input.
+    #[test]
+    fn an_apostrophe_in_prose_does_not_swallow_later_comments() {
+        let lang = crate::projection::for_path("Makefile");
+        assert_eq!(lang.name(), "hash");
+        let src = "# don't do this\n# but DO find me\nall:\n\techo hi\n";
+        let fw = crate::projection::ingest::file(lang.as_ref(), "Makefile", src).unwrap();
+        assert_eq!(crate::projection::ingest::project(&fw), src, "must stay byte-exact");
+        let texts: Vec<&str> = fw.comments.iter().map(|c| c.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("DO find me")),
+            "an apostrophe in the first comment swallowed the second: {texts:?}"
+        );
+    }
+
     #[test]
     fn make_fragments_route_to_hash_not_to_c() {
         for name in [

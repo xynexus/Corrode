@@ -320,6 +320,46 @@ mod tests {
 
     /// The critical gotcha, measured as real in the kernel: a directive that opens a
     /// brace it never closes. Depth-counting it corrupts every boundary after it.
+    /// Constructs the lexer does not model must still round-trip byte-exactly.
+    ///
+    /// The lexer is deliberately shallow — it tracks regions, not C++ grammar — so
+    /// several real constructs mis-lex: a raw string `R"(…)"` is read as an ordinary
+    /// string and ends at the first inner quote, and a C++14 digit separator (`1'000`)
+    /// opens a char literal that runs to the next apostrophe. Both corrupt item
+    /// BOUNDARIES.
+    ///
+    /// What must never happen is corrupted BYTES. Nodes store verbatim text and the node
+    /// cover partitions the file, so a mis-lex costs structure and never fidelity — that
+    /// is the property the whole projection rests on, and it is the one worth pinning
+    /// against inputs chosen to break the lexer.
+    #[test]
+    fn pathological_c_still_projects_byte_exactly() {
+        let cases: &[(&str, &str)] = &[
+            ("raw string", "const char *s = R\"(he said \"hi\" and / * )\";\nvoid f(void) { }\n"),
+            ("digit separator", "int big = 1'000'000;\nvoid g(void) { }\n"),
+            ("url in a string", "const char *u = \"http://example.com/*not a comment*/\";\n"),
+            ("escaped quote", "const char *q = \"say \\\" now\";\nvoid h(void) { }\n"),
+            ("char literal quote", "char c = \'\\\'\';\nvoid i(void) { }\n"),
+            ("unterminated string", "const char *bad = \"never closed\n"),
+            ("unterminated block comment", "void j(void) { }\n/* never closed\n"),
+            ("directive with brace", "#define OPEN struct {\nvoid k(void) { }\n"),
+            ("backslash-continued line comment", "// keeps going \\\nstill comment\nvoid l(void) { }\n"),
+            ("empty file", ""),
+        ];
+        for (name, src) in cases {
+            let fw = crate::projection::ingest::file(&C, "t.cpp", src)
+                .unwrap_or_else(|e| panic!("{name}: ingest failed: {e}"));
+            assert_eq!(
+                crate::projection::ingest::project(&fw),
+                *src,
+                "{name}: projection was not byte-exact"
+            );
+            // The node cover must also partition the file with no gap or overlap.
+            let total: usize = fw.code.iter().map(|c| c.text.len()).sum();
+            assert_eq!(total, src.len(), "{name}: nodes do not cover the file exactly");
+        }
+    }
+
     #[test]
     fn a_directive_with_an_unbalanced_brace_does_not_break_depth() {
         let src = "\
