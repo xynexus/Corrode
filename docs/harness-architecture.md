@@ -419,6 +419,7 @@ falsify it.
 | The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
 | Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
 | The graph is the source of truth, files a projection | **aspiration** — ingest built, projection direction unwired | — | bijective line numbers |
+| A sparse order key beats a dense index on real edits | **TRUE** — 19% of mutations are inserts; 0 rebalances in 28,881 re-ingests | `bench_history::replay_history` over 5,000 curl commits | node identity; provenance stability |
 | Ingest holds up on unfamiliar languages at scale | **UNTESTED** — predictions recorded below | `CORRODE_SCAN_REPO=<repo>` round trip | absorbing arbitrary codebases |
 | Re-ingest on write keeps the code index fresh | **UNTESTED** — wired, needs a live `--features helix` store | ingest a repo, edit a file, query the graph | trusting index-backed search |
 
@@ -693,9 +694,62 @@ VFS read path and runs on every materialisation, while inserts are occasional. A
 link also truncates a file silently and a cycle hangs it. Containment stays an edge;
 order stays a property.
 
-**Unmeasured:** the insert-versus-update ratio in practice. If agent edits turn out to
-be almost entirely in-place body rewrites, a dense index would have sufficed. Ingest
-telemetry against a live store settles it.
+#### Result: replaying 5,000 real commits
+
+Until this was measured the sparse key was decoration, because nothing reconciled
+against what was already stored: `ingest::file` assigned every node a fresh
+`initial_order(i)`, so re-ingesting an edited file renumbered it end to end and — since
+ids derive from the key — re-addressed the whole file for a one-line change. That is
+precisely the churn the key exists to avoid. `projection::update::reconcile` is the
+missing half: a sequence diff over node fingerprints (common prefix/suffix trimmed,
+LCS on the remainder) that lets surviving nodes keep their keys, treats a rewritten
+body as the *same slot with new text* rather than a death and a birth, and mints keys
+only for genuinely new nodes.
+
+Replayed over the last 5,000 first-parent commits of curl (`bench_history.rs`), which
+is a real C edit stream rather than a synthetic one:
+
+| | |
+|---|---|
+| re-ingests | 28,881 |
+| nodes kept | 1,604,569 |
+| updated in place | 42,184 (81.2% of mutations) |
+| inserted | 9,743 (18.8% of mutations) |
+| deleted | 12,614 |
+| **rebalances** | **0** |
+
+**Inserts are 19% of mutations — not the rounding error that would have justified a
+dense index, and not the majority either.** A dense index would have renumbered a file
+9,743 times over this history where the sparse key renumbered it zero times. That
+settles the row in favour of the sparse key on evidence rather than on the argument
+from churn.
+
+The gap never ran out. Runs of inserts are spaced evenly across their gap rather than
+bisected toward the upper bound, so k inserts at one point spend the gap once instead of
+k times; across 9,743 inserts nothing exhausted 2^32. `rebalance` stays in the code as
+the recovery path, but it is now known to be cold.
+
+Two guards make the numbers trustworthy rather than merely printed. Every one of the
+28,881 reconciles asserts that the resulting nodes still project **byte-exactly** back
+to the file git holds and that keys stay strictly increasing — so a key-assignment bug
+fails the replay instead of quietly reporting a nice ratio. And the LCS has a cell
+budget with a cheap positional fallback; the replay counts how often a file could have
+hit it, and the answer is **0 of 28,881** (max 1,283 nodes/file), so every alignment
+reported here was a true diff and not a budget artifact.
+
+**What this does not settle.** These are human commits — a proxy for agent edits, not
+the same distribution. If Corrode's agents turn out to rewrite whole function bodies
+almost exclusively, the ratio moves toward update and the argument weakens. What the
+replay does settle, and what no argument could, is that a real edit stream at this
+volume never exhausts the gap.
+
+**Incidental finding: the node grain is coarse.** A median re-ingest touches **16%** of
+its file's nodes, because a node is a top-level item — changing one function in a
+six-function file is a sixth of it. That is fine for projection and poor for
+provenance: "which task produced this node" is answered at item granularity, so a task
+that edited one line claims credit for the whole function. Sub-item nodes would sharpen
+it at the cost of many more nodes per file. Not acted on; recorded because the number
+was there.
 
 ### Result: the Linux kernel, streamed from its tarball
 

@@ -38,6 +38,7 @@ pub mod archive;
 pub mod c;
 pub mod rust;
 pub mod text;
+pub mod update;
 
 /// A byte range in the source, with what kind of thing it is.
 #[derive(Debug, Clone, PartialEq)]

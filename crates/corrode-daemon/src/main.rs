@@ -25,6 +25,8 @@ mod project;
 mod planner;
 mod roles;
 mod bench_ingest;
+#[cfg(test)]
+mod bench_history;
 mod projection;
 // Projection-fidelity checks. Test-only: these MEASURE the projection rather than
 // performing it, and their corpora are whole repositories.
