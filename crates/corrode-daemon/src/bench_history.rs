@@ -199,3 +199,67 @@ fn replay_history() -> anyhow::Result<()> {
     eprintln!("insert:update = 1:{:.1}", t.updated as f64 / t.inserted.max(1) as f64);
     Ok(())
 }
+
+/// Is the round trip bijective for a whole git tree, not just for a file's bytes?
+///
+/// Byte-exactness per file is already measured. What a per-file census cannot see is
+/// everything git tracks that a text projection does not store: the executable bit,
+/// symlinks, and blobs that are not UTF-8 at all. A repo that round-trips every file
+/// perfectly and loses its modes is not bijective, it is merely accurate.
+#[test]
+#[ignore = "needs a local git clone; set HISTORY_REPO"]
+fn tree_round_trip_at_head() -> anyhow::Result<()> {
+    let repo = std::env::var("HISTORY_REPO")
+        .unwrap_or_else(|_| format!("{}/.cache/corrode-fixtures/curl", std::env::var("HOME").unwrap()));
+    let repo = Path::new(&repo);
+
+    let tree = git(repo, &["ls-tree", "-r", "HEAD"])?;
+    let tree = String::from_utf8(tree)?;
+    let (mut exact, mut mismatch, mut non_utf8, mut symlinks, mut execs, mut gitlinks) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut c_exact, mut c_total) = (0usize, 0usize);
+    let mut examples: Vec<String> = Vec::new();
+
+    for line in tree.lines() {
+        // "<mode> <type> <sha>\t<path>"
+        let (meta, path) = match line.split_once('\t') {
+            Some(v) => v,
+            None => continue,
+        };
+        let mut m = meta.split_whitespace();
+        let (mode, kind, sha) = (m.next().unwrap_or(""), m.next().unwrap_or(""), m.next().unwrap_or(""));
+        match mode {
+            "120000" => { symlinks += 1; continue }
+            "160000" => { gitlinks += 1; continue }
+            "100755" => execs += 1,
+            _ => {}
+        }
+        if kind != "blob" { continue }
+
+        let blob = git(repo, &["cat-file", "blob", sha])?;
+        let Ok(src) = String::from_utf8(blob) else { non_utf8 += 1; continue };
+        let lang = projection::for_path(path);
+        let is_c = lang.name() == "c";
+        if is_c { c_total += 1 }
+        let fw = projection::ingest::file(&*lang, path, &src)?;
+        if projection::ingest::project(&fw) == src {
+            exact += 1;
+            if is_c { c_exact += 1 }
+        } else {
+            mismatch += 1;
+            if examples.len() < 5 { examples.push(path.to_string()) }
+        }
+    }
+
+    eprintln!("\ntree round trip at HEAD — {}", repo.display());
+    eprintln!("  byte-exact      {exact}");
+    eprintln!("  mismatched      {mismatch} {examples:?}");
+    eprintln!("  C files         {c_exact}/{c_total} exact");
+    eprintln!("\nnot representable as text nodes (bijectivity gaps):");
+    eprintln!("  non-UTF-8 blobs {non_utf8}");
+    eprintln!("  symlinks        {symlinks}");
+    eprintln!("  gitlinks        {gitlinks}");
+    eprintln!("  exec-bit blobs  {execs}  (round-tripped as content, mode NOT stored)");
+    assert_eq!(mismatch, 0, "projection was not byte-exact for every tracked blob");
+    Ok(())
+}
