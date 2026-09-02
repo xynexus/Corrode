@@ -341,9 +341,17 @@ predecessor byte for byte.
 Derived from §2. Each rung is cheap relative to the one after it, and each removes a
 class of confident failure.
 
-**Status, 2026-08-30.** Steps 1–4 and 6 are implemented and in review; step 5 is
-deliberately unstarted (its policy questions — network access above all — want a
-decision, not a default); step 7's gating measurement is taken. Marked below.
+**Status, 2026-09-02.** Steps 1–4 and 6 are implemented; step 5 shipped its sandbox
+half and not its capability-tier half; step 7 has been the whole of the work since
+2026-08-30 and has turned out to be a sub-project rather than a rung — it is broken out
+below. Marked per step.
+
+One caveat that the earlier status hid: **step 1 is shipped and its stated payoff is
+not.** Its justification is that layered grounding "is amortized across hundreds of
+turns once the prefix cache engages", and §8 records that assumption as **FALSE today** —
+`cached_tokens` has never been observed above zero. The layering is built and correct;
+what it was supposed to buy is still unavailable, and that is a hipfire investigation,
+not a corrode one.
 
 1. **[shipped]** **Ground the prefix, and layer it.** README digest, a repository tree deeper than
    one level, provenance/authority labels (§3.1) — emitted as ordered layers with
@@ -371,13 +379,43 @@ decision, not a default); step 7's gating measurement is taken. Marked below.
    declares a wall-clock ceiling; past it nothing new launches, emissions are
    dropped, and a tool loop stops at its next step boundary. Not preemption — a task
    inside one long model call still finishes, so a turn can overrun by one call.
-7. **[unblocked]** **The graph.** The gating measurement has been taken (§2): the embedder separates
+7. **[in progress]** **The graph.** The gating measurement has been taken (§2): the embedder separates
    real matches by 0.250 on average, so graph retrieval does **not** inherit the
    failure that sank skill ranking. Step 7 is retrieval-structure work, not embedding
    work. What remains unproven is representation — the one real miss was between
    near-identical variants in a family, which is precisely the shape a code graph is
    full of (`foo` vs `foo_batched`, `spsc` vs `mpmc`). Structure is what disambiguates
    those; a description alone does not.
+
+   Written as one rung it read as one session's work. It is not, and pretending
+   otherwise is how the plan stopped describing the work. Its actual parts:
+
+   - **7a [shipped] Ingest.** Source becomes nodes, language-agnostically: a
+     `Language` seam with Rust (`syn`), C/C++ (lexer) and a marker-family text
+     fallback, comments extracted as a separate pass and bound to what they describe
+     by edge, a sparse `u64` order key, and tar-stream ingest that never unpacks. The
+     kernel: 94,750 files, 1.6 GB, 7.2 s, byte-exact.
+   - **7b [shipped] Reconcile.** A re-ingest diffs against stored nodes so survivors
+     keep their keys, rather than renumbering the file. Measured over 5,000 curl
+     commits: 19% of mutations are inserts, 0 rebalances.
+   - **7c [shipped] Persist.** `replace_file` writes the file/code/comment nodes and
+     their edges atomically, with pruning. Until this landed the whole pipeline wrote
+     to nothing.
+   - **7d [first cut] Retrieve.** `code_search` (BM25 over source) with line numbers
+     *derived* from the node cover, appended to `search_files`' literal scan.
+   - **7e [untested] Represent.** Whether graph structure separates near-identical
+     siblings — the one thing §9 calls the actual risk in step 7, and still the only
+     part of it nobody has measured. Everything above is plumbing to make this
+     answerable.
+   - **7f [unwired] Project.** The VFS reading files *from* the graph rather than the
+     disk. Composition is proven byte-exact in both directions; nothing calls it yet.
+
+8. **[blocking 7 at scale]** **Store throughput.** Not in the original ordering because
+   nothing had measured it. curl ingests at 2,847 nodes/s warm with 14.3x on-disk
+   amplification, rising with store size — the in-memory pipeline is ~100x faster.
+   Extrapolated to the kernel that is over an hour and ~23 GB, so large-tree ingest is
+   not viable as written. Also unfixed: a single token over LMDB's 511-byte max key
+   (base64, minified JS) rejects a whole node write.
 
 What steps 1-4 and 6 cost, for calibration: roughly one working session each,
 several of them under an hour, and every one of them removed a failure that had
