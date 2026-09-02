@@ -1574,6 +1574,10 @@ async fn run_tool_loop(
     // tool returned. `trace::extract` needs no parsing of the scratchpad because the two
     // are never merged here in the first place.
     let mut steps: Vec<crate::trace::Step> = Vec::new();
+    // Paths the task touched, taken from the STRUCTURED call rather than parsed out of
+    // the model's prose — a note bound to a path guessed from English would attach real
+    // findings to the wrong file.
+    let mut touched: Vec<String> = Vec::new();
     let mut last = String::new();
     for _ in 0..MAX_TOOL_STEPS {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
@@ -1601,7 +1605,7 @@ async fn run_tool_loop(
         let Some(intent) = crate::tools::parse_tool_intent(&text) else {
             // Final turn: it called nothing, so it contributes claims only.
             steps.push(crate::trace::Step { said: text.clone(), intent: None, observation: None });
-            record_trace(task, &steps);
+            record_trace(&toolbox, task, &steps, &touched);
             return Ok(text); // no TOOL: line -> this turn is the final answer
         };
 
@@ -1615,6 +1619,11 @@ async fn run_tool_loop(
         let observation = match raw.map(|r| r.and_then(|raw| dialect.parse(&raw))) {
             Ok(Ok(calls)) => match calls.first() {
                 Some(c) => {
+                    if let Some(p) = crate::tools::arg_str(c, "path") {
+                        if !touched.iter().any(|t| t == p) {
+                            touched.push(p.to_string());
+                        }
+                    }
                     gate_and_execute(
                         c, &toolbox, approvals, events, id, written, seen, read_only,
                     )
@@ -1633,30 +1642,69 @@ async fn run_tool_loop(
         scratchpad.push_str(&format!("\nTOOL: {intent}\nRESULT: {observation}\n"));
     }
     // Step budget spent: hand back the last turn as the answer.
-    record_trace(task, &steps);
+    record_trace(&toolbox, task, &steps, &touched);
     Ok(last)
 }
 
-/// Extract and report a task's notes.
+/// Extract a task's notes and persist them.
 ///
-/// ponytail: reported, not yet persisted. The graph write is `upsert_node` + `add_edge`
-/// over `trace::note_edges`, which needs the session's store threaded into the tool loop;
-/// until then the extraction runs on every real trace and is visible, which is what tells
-/// us whether the filter keeps anything worth keeping before anything depends on it.
-fn record_trace(task: &str, steps: &[crate::trace::Step]) {
+/// No new store method: a note is `upsert_node` and each edge is `add_edge`, both already
+/// on `GraphStore`. Notes are append-only — a correction arrives as a new note plus a
+/// `supersedes` edge, never as an edit — so nothing here removes or rewrites what an
+/// earlier task recorded, however wrong it turns out to be.
+fn record_trace(toolbox: &ToolBox, task: &str, steps: &[crate::trace::Step], touched: &[String]) {
+    use crate::trace::NoteKind;
     let notes = crate::trace::extract(task, steps);
     if notes.is_empty() {
         return;
     }
-    let observed = notes.iter().filter(|n| n.kind == crate::trace::NoteKind::Observed).count();
+    let observed = notes.iter().filter(|n| n.kind == NoteKind::Observed).count();
     eprintln!(
-        "trace: {} note(s) from {} step(s) — {observed} observed, {} asserted",
+        "trace: {} note(s) from {} step(s) — {observed} observed, {} asserted, {} path(s)",
         notes.len(),
         steps.len(),
-        notes.len() - observed
+        notes.len() - observed,
+        touched.len()
     );
-    for n in notes.iter().take(4) {
-        eprintln!("  [{}] {}", n.kind.as_str(), n.text.lines().next().unwrap_or(""));
+
+    let Some(store) = toolbox.graph() else {
+        return; // no store (base build): extraction still runs and reports.
+    };
+    // The task must exist as a node before an edge can name it.
+    if let Err(e) = store.upsert_node(task, "task", task) {
+        eprintln!("trace: cannot record task node ({e}); notes not persisted");
+        return;
+    }
+    for n in &notes {
+        // `kind` carries the provenance, so a reader can weigh a tool result against a
+        // claim rather than the store flattening both into "a note".
+        if let Err(e) = store.upsert_node(&n.id(), n.kind.as_str(), &n.text) {
+            eprintln!("trace: note {} failed ({e})", n.id());
+            continue;
+        }
+        let _ = store.add_edge(&n.id(), "noted_by", task);
+        for path in touched {
+            // Bound to the file, not to a node inside it: a finding like "this loader is
+            // never called" is about the file's role, and binding it to whichever node
+            // happened to be read would be a precision the trace does not have.
+            let _ = store.add_edge(&n.id(), "about", &format!("file:{path}"));
+        }
+    }
+
+    // Supersede prior notes on the same files. The claim is ordering — this note was
+    // written with more of the trace behind it — not correctness.
+    let prior: Vec<String> = touched
+        .iter()
+        .filter_map(|p| store.neighbors(&format!("file:{p}")).ok())
+        .flatten()
+        .filter(|n| n.kind == "observed" || n.kind == "asserted")
+        .map(|n| n.id)
+        .filter(|id| !id.starts_with(&format!("note:{task}#")))
+        .collect();
+    for (from, rel, to) in crate::trace::note_edges(&notes, task, &prior) {
+        if rel == "supersedes" {
+            let _ = store.add_edge(&from, rel, &to);
+        }
     }
 }
 

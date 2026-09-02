@@ -1231,10 +1231,24 @@ have kept all three, since each read perfectly plausible. So instead:
 
 The filter keeps lines that state an outcome and drops narration, the same shape that made
 commit-message binding concentrate signal (19% of commits carry a rationale word, 38% of
-bindings do). Extraction runs on every real tool-loop trace and reports what it found;
-persisting to the graph is `upsert_node` + `add_edge` over `note_edges` and needs the
-session store threaded into the loop. Reporting first is deliberate — it shows whether the
-filter keeps anything worth keeping before anything depends on it.
+bindings do).
+
+**Persisted.** A note is `upsert_node` and each edge is `add_edge` — no new store method.
+The note's `kind` *is* its node kind (`observed` / `asserted`), so provenance is not a
+property a query has to remember to ask for. Edges: `noted_by` to the task that wrote it,
+`about` to each file the task touched, and `supersedes` to prior notes on those files.
+
+Two decisions worth stating. Paths come from the **structured tool call**, not from the
+model's prose — a note bound to a path guessed out of English would attach real findings to
+the wrong file. And notes bind to the **file**, not to a node inside it: "this loader is
+never called" is about the file's role, and binding it to whichever node happened to be
+read would claim a precision the trace does not have.
+
+The test that carries the design asserts the uncomfortable half. After a correction, the
+**wrong note is still there** — still saying what it said, still naming the task that wrote
+it, with a `supersedes` edge pointing at it and the correction reachable from it. Deleting
+it would destroy the evidence that a claim was ever contested, which is the one thing an
+append-only store buys over an editable one.
 
 ### Per-directory prose: what is actually there
 

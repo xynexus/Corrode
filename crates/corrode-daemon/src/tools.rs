@@ -247,6 +247,12 @@ impl ToolBox {
     }
 
     /// The per-user hipfire bearer for `respond` calls in the tool loops.
+    /// The session's graph store, for callers that need to write alongside a tool run
+    /// (trace notes) rather than through a tool.
+    pub fn graph(&self) -> Option<&Arc<dyn crate::graph::GraphStore>> {
+        self.graph.as_ref()
+    }
+
     pub fn owner_token(&self) -> Option<&str> {
         self.owner_token.as_deref()
     }
@@ -720,7 +726,7 @@ impl ToolBox {
 
 /// The string value of a call argument, trimmed. `None` only if the key is missing or
 /// not a string — an empty string is a valid path (the repo root for `list_dir`).
-fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
+pub(crate) fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
     call.arguments.get(key)?.as_str().map(str::trim)
 }
 

@@ -186,7 +186,7 @@ pub mod embedded {
     /// Relations `neighbors` walks (out-edge scans are per-label in helix).
     const NEIGHBOR_RELS: &[&str] =
         &["part_of", "emitted_from", "produced_by", "has_chunk", "has_code", "has_comment",
-          "in_node", "in_dir", "describes"];
+          "in_node", "in_dir", "describes", "about", "noted_by", "supersedes"];
 
     /// insert_v/search_v want a filter type even when unused (helix's own tests
     /// pass this fn-pointer turbofish).
@@ -1180,6 +1180,66 @@ pub mod embedded {
                 single.iter().any(|(k, _)| k.contains("src/wait.rs")),
                 "single-clause search must still find the emphatic file: {single:?}"
             );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A corrected note stays in the store, attributed, alongside what corrected it.
+        ///
+        /// The design bet is that wrong notes are unavoidable and what matters is what
+        /// happens to them. So this asserts the uncomfortable half: after a correction,
+        /// the WRONG note is still there, still says what it said, and still names the
+        /// task that wrote it — with a `supersedes` edge pointing at it. Deleting it
+        /// would destroy the evidence that a claim was ever contested.
+        #[test]
+        fn a_corrected_note_survives_with_its_supersession() {
+            let dir = scratch_dir("notes");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let file = "file:src/graph.rs";
+            store.upsert_node(file, "source_file", "src/graph.rs").unwrap();
+
+            // Task 1 asserts something false — the shape of a real mistake: plausible,
+            // and wrong. No filter on the way in could have caught it.
+            store.upsert_node("task-1", "task", "task-1").unwrap();
+            store.upsert_node("note:task-1#0", "asserted", "replace_file is not implemented").unwrap();
+            store.add_edge("note:task-1#0", "noted_by", "task-1").unwrap();
+            store.add_edge("note:task-1#0", "about", file).unwrap();
+
+            // Task 2 observes the opposite and supersedes it.
+            store.upsert_node("task-2", "task", "task-2").unwrap();
+            store.upsert_node("note:task-2#0", "observed", "run tests\n1 passed replace_file writes").unwrap();
+            store.add_edge("note:task-2#0", "noted_by", "task-2").unwrap();
+            store.add_edge("note:task-2#0", "about", file).unwrap();
+            store.add_edge("note:task-2#0", "supersedes", "note:task-1#0").unwrap();
+
+            // Both notes hang off the file: the correction did not remove the claim.
+            let around = store.neighbors(file).unwrap();
+            let ids: Vec<&str> = around.iter().map(|n| n.id.as_str()).collect();
+            assert!(ids.contains(&"note:task-1#0"), "the superseded note must remain: {ids:?}");
+            assert!(ids.contains(&"note:task-2#0"), "the correcting note must be present: {ids:?}");
+
+            // The wrong note keeps its text and its provenance, so a reader can see both
+            // that it was a claim and who made it.
+            let wrong = around.iter().find(|n| n.id == "note:task-1#0").unwrap();
+            assert_eq!(wrong.kind, "asserted");
+            assert!(wrong.label.contains("not implemented"));
+            let from_wrong = store.neighbors("note:task-1#0").unwrap();
+            assert!(
+                from_wrong.iter().any(|n| n.id == "task-1"),
+                "attribution must survive correction: {:?}",
+                from_wrong.iter().map(|n| &n.id).collect::<Vec<_>>()
+            );
+            // And the supersession is reachable from the note it corrects.
+            assert!(
+                from_wrong.iter().any(|n| n.id == "note:task-2#0"),
+                "the correction must be reachable from the claim it corrects"
+            );
+
+            // Provenance distinguishes them, which is the whole point: one is a tool
+            // result, the other an agent's sentence.
+            let right = around.iter().find(|n| n.id == "note:task-2#0").unwrap();
+            assert_eq!(right.kind, "observed");
             std::fs::remove_dir_all(&dir).ok();
         }
 
