@@ -223,6 +223,99 @@ mod tests {
         }
     }
 
+    /// The C-side version of the same question: does normalising make the parts we would
+    /// have to GENERATE regular enough to stop storing?
+    ///
+    /// Verbatim trivia (the bytes between items) is what makes projection byte-exact. If
+    /// normalised source draws its trivia from a handful of distinct strings, a
+    /// normalised project could generate them and drop the stored text — that, and not
+    /// printer agreement, is what would actually delete the fidelity machinery for C.
+    /// Also checks idempotence, because `fidelity: normalized` is a claim that has to
+    /// stay true across a second run.
+    #[test]
+    #[ignore = "probe: needs clang-format and a C repo"]
+    fn c_trivia_regularity_before_and_after() {
+        use std::collections::HashMap;
+        let root = std::path::PathBuf::from(std::env::var("CORRODE_REPO").unwrap());
+        let p = crate::project::Project::load(&root);
+        let cmd = &p.formatters["c"];
+        let mut census: Vec<(&str, HashMap<String, usize>, usize)> =
+            vec![("as committed", HashMap::new(), 0), ("normalised", HashMap::new(), 0)];
+        let (mut files, mut non_idempotent, mut not_exact) = (0, 0, 0);
+        let mut indents: Vec<HashMap<String, usize>> = vec![HashMap::new(), HashMap::new()];
+
+        for rel in tracked_files(&root).unwrap() {
+            let lang = crate::projection::for_path(&rel);
+            if lang.name() != "c" { continue }
+            let Ok(src) = std::fs::read_to_string(root.join(&rel)) else { continue };
+            let Ok(fmt) = format_with(cmd, &rel, &src) else { continue };
+            files += 1;
+            // A normal form that moves on a second pass is not a normal form.
+            if format_with(cmd, &rel, &fmt).map(|f| f != fmt).unwrap_or(true) {
+                non_idempotent += 1;
+            }
+            // Finer nodes need finer separators, so the premise is really about
+            // sub-item trivia: line indentation. Measured as a proxy for the deep
+            // granularity we do not have nodes for yet.
+            for (i, text) in [&src, &fmt].into_iter().enumerate() {
+                for line in text.lines() {
+                    let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+                    if !indent.is_empty() {
+                        *indents[i].entry(indent).or_default() += 1;
+                    }
+                }
+            }
+            for (i, text) in [&src, &fmt].into_iter().enumerate() {
+                let Ok((items, _)) = lang.spans(text) else { continue };
+                let nodes = crate::projection::nodes_from_items(&rel, text, &items);
+                // Normalised source must still round-trip, or nothing above matters.
+                if i == 1 && crate::projection::project(&nodes).0 != *text { not_exact += 1 }
+                for n in nodes.iter().filter(|n| n.kind == "trivia") {
+                    census[i].2 += n.text.len();
+                    // Split whitespace trivia from trivia carrying a comment. They are
+                    // different problems: whitespace could be GENERATED if it is
+                    // regular, while comment text is unique by nature and no formatter
+                    // makes it otherwise. Lumping them hides which one is irregular.
+                    let key = if n.text.trim().is_empty() { n.text.clone() } else { "<comment>".into() };
+                    *census[i].1.entry(key).or_default() += 1;
+                }
+            }
+        }
+
+        eprintln!("\n{files} C files — {non_idempotent} not idempotent, {not_exact} not byte-exact after normalising");
+        for (label, counts, bytes) in &census {
+            let mut top: Vec<_> = counts.iter().collect();
+            top.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+            let total: usize = counts.values().sum();
+            let top5: usize = top.iter().take(5).map(|(_, c)| **c).sum();
+            let with_comment = counts.get("<comment>").copied().unwrap_or(0);
+            eprintln!(
+                "  {label:<14} {total} trivia nodes, {bytes} bytes",
+            );
+            eprintln!(
+                "      whitespace-only {} in {} distinct forms; top 5 cover {:.1}% of all trivia",
+                total - with_comment, counts.len() - 1, 100.0 * top5 as f64 / total.max(1) as f64
+            );
+            eprintln!("      carrying a comment {with_comment} ({:.1}%)", 100.0 * with_comment as f64 / total.max(1) as f64);
+            for (text, n) in top.iter().take(3) {
+                eprintln!("      {n:>7}x {:?}", text.chars().take(24).collect::<String>());
+            }
+        }
+        for (label, m) in ["as committed", "normalised"].iter().zip(&indents) {
+            let total: usize = m.values().sum();
+            let tabs: usize = m.iter().filter(|(k, _)| k.contains('\t')).map(|(_, v)| v).sum();
+            let mut top: Vec<_> = m.iter().collect();
+            top.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+            let top8: usize = top.iter().take(8).map(|(_, c)| **c).sum();
+            eprintln!(
+                "  {label:<14} line indents: {total} indented lines, {} distinct forms; \
+                 top 8 cover {:.1}%; tab-containing {:.1}%",
+                m.len(), 100.0 * top8 as f64 / total.max(1) as f64,
+                100.0 * tabs as f64 / total.max(1) as f64
+            );
+        }
+    }
+
     #[test]
     fn formatter_runs_over_stdin_and_substitutes_the_path() {
         let cmd: Vec<String> = ["sh", "-c", "printf '%s' \"$(cat)\"; printf '|{path}'"]

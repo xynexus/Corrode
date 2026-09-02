@@ -829,6 +829,43 @@ Worth noting how they surfaced: not from reading the routing table, but from a
 per-backend breakdown printed by a tool built for something else. A bare total said
 "1,038 C files" and looked right.
 
+#### C: normalisation changes nothing either, for a different reason
+
+Rust's census was unmoved because two printers disagree about style. C has no printer at
+all — the backend is a lexer emitting spans and nothing regenerates C — so that
+explanation cannot apply, and the question becomes whether normalised C is regular
+enough to GENERATE the parts we currently store. Measured over curl's 1,026 C files with
+`clang-format` 18.1.3:
+
+```
+1026 C files — 5 not idempotent, 0 not byte-exact after normalising
+  as committed   whitespace-only trivia: 12,591 in 16 distinct forms; top 5 cover 99.8%
+  normalised     whitespace-only trivia: 12,586 in 13 distinct forms; top 5 cover 99.9%
+  trivia carrying a comment: 13.2% -> 13.1%
+```
+
+**The whitespace was already regular.** 87% of trivia nodes are pure whitespace drawn
+from 16 forms, five of which cover 99.8% — before normalising. Normalisation removes
+three rare forms and adds a tenth of a percentage point. Whatever makes generated trivia
+possible for C, it is available today on unmodified source; `fidelity: normalized` is
+not what unlocks it. The other 13% carries a comment, which no formatter removes and
+which is already stored a second time as a comment node.
+
+Two facts that bear on adopting it anyway. **5 of 1,026 files are not idempotent under
+clang-format**, so a repo containing them can never make `normalize --check` go green —
+the `normalized` claim would flap. And curl has no `.clang-format`, so normalising it
+means rewriting **959 of 1,026 files** into LLVM style: adopting a formatter's defaults
+wholesale is the real cost, not the projection change.
+
+**What this does not settle.** The premise was about *finer* nodes, and every number
+above is at today's item granularity. A proxy — distinct line-indent forms, standing in
+for the sub-item separators finer nodes would need — was also unmoved (63 -> 65 forms,
+top 8 covering 91.4% -> 92.1%). But that metric measures whether separators are
+*enumerable*, and a formatter's indent is a function of nesting depth and paren
+alignment: computable without being enumerable. So it is evidence against enumerating
+them and no evidence either way about deriving them. Settling that means building the
+printer, which is the same conclusion the Rust census reached from the other direction.
+
 ### Result: the Linux kernel, streamed from its tarball
 
 94,750 files / 1,615 MB, ingested in **107.9 s** (15.0 MB/s, 878 files/s) **without
