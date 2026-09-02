@@ -465,6 +465,7 @@ falsify it.
 | The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
 | Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
 | **Graph structure** is what separates them | **FALSE** — comments 1/4, code 1/4, filename 1/4, all at chance | `bench_siblings::structure_versus_description` | step 7e; the case for graph retrieval |
+| Generated notes fix sibling separation | **FALSE so far** — isolated 2/4, contrastive 1/4 and factually wrong | same benchmark | note-generation pass |
 | The graph is the source of truth, files a projection | **aspiration** — ingest built, projection direction unwired | — | bijective line numbers |
 | A sparse order key beats a dense index on real edits | **TRUE** — 19% of mutations are inserts; 0 rebalances in 28,881 re-ingests | `bench_history::replay_history` over 5,000 curl commits | node identity; provenance stability |
 | Ingest holds up on unfamiliar languages at scale | **UNTESTED** — predictions recorded below | `CORRODE_SCAN_REPO=<repo>` round trip | absorbing arbitrary codebases |
@@ -960,6 +961,51 @@ So commit notes are a **gotcha index, not a disambiguator** — they answer "wha
 know before touching this" and not "which of these four is the one I want". Those are
 different jobs and the earlier finding stands: only generated description separates
 siblings.
+
+### The note-generation pass, measured
+
+7e ended pointing at generated description as the only thing that beat chance. Running
+that as an actual pass, with the same 9B and the same benchmark:
+
+| representation | bytes/doc | top-1 | mean winner margin |
+|---|---|---|---|
+| isolated note | 386 | **2/4** | +0.0084 |
+| **contrastive note** (shown its siblings' names) | 431 | **1/4** | +0.0277 |
+
+**Adding context made it worse.** The contrastive prompt was the direct fix for 7e's
+observed failure — the summaries got producer-count right and progress-guarantee wrong,
+so the model was shown its near-identical siblings and asked what distinguishes *this*
+file. It lost a point, and the margins went **up** while accuracy went **down**: it
+became confidently wrong, which is the worst failure shape retrieval can have.
+
+The mechanism is visible in the output rather than inferred. For
+`queue_mpsc_waitfree.h` — whose source it was given, and whose class is literally
+`Waitfree_MPSC_Queue` — the contrastive note reads:
+
+> This file implements a **Multi-Producer Multi-Consumer (MPMC)** queue…
+
+It copied a sibling's classification onto the file. Naming the neighbours contaminated
+the description of the thing itself.
+
+**And the deeper result is that the isolated notes are wrong too, on precisely the axis
+that matters.** `queue_mpmc_waitfree.h` is `Waitfree_MPMC_Queue`, and its isolated note
+calls it "lock-free". So the lockfree/waitfree confusion 7e measured as a *retrieval*
+failure is upstream of retrieval: **the embedder is separating notes that are factually
+incorrect.** No amount of retrieval work fixes that, and it explains why every
+description-based representation plateaus at 2/4 — two of the four notes assert the
+wrong progress guarantee.
+
+That redirects the remedy. Free-form generation is not reliable enough at this size to
+be the disambiguator, and enriching its context made it less reliable, not more. What
+the model *did* consistently get right is the identifier it was reading —
+`Waitfree_MPSC_Queue`, `Waitfree_MPMC_Queue` — which suggests extracting and expanding
+declared names rather than asking for prose about them. That is closer to the
+alias-expansion that scored 2/4 without a model at all, and it is mechanical rather than
+generative. Untested; recorded as the next thing to try rather than claimed.
+
+**Caveat unchanged:** n = 4, one family, one corpus, one embedder, one model size. What
+this rules out is "generate notes and the problem goes away", which was the standing
+assumption after 7e.
 
 ### Per-directory prose: what is actually there
 

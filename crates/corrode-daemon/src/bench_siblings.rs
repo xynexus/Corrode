@@ -88,6 +88,12 @@ async fn structure_versus_description_on_near_identical_siblings() -> anyhow::Re
     // source of "why", per `bench_history::bind_commit_messages_to_changed_nodes`.
     // Whether rich in general means discriminating HERE is the question.
     let mut commit_notes: Vec<String> = Vec::new();
+    // The note-generation pass proper. 7e's summaries were written in ISOLATION and
+    // failed on exactly one axis — lockfree vs waitfree — so the hypothesis is that a
+    // note written knowing its siblings separates where an isolated one cannot. Same
+    // model, same file, one extra sentence of context: the cheapest thing that could
+    // fix the observed failure.
+    let mut contrastive: Vec<String> = Vec::new();
     let mut briefs_found = 0;
 
     for name in &names {
@@ -150,6 +156,26 @@ async fn structure_versus_description_on_near_identical_siblings() -> anyhow::Re
         };
         eprintln!("  summary[{name}] {}", summary.trim().chars().take(140).collect::<String>());
         summarised.push(format!("{name}: {}", summary.trim()));
+
+        let siblings: Vec<&str> = names.iter().filter(|n| **n != *name).copied().collect();
+        let cprompt = format!(
+            "Here is a C++ header file named {name}:\n\n{code}\n\n\
+             This file sits alongside these near-identical siblings: {}.\n\
+             In two sentences, state what distinguishes THIS file from those specific \
+             siblings — the exact concurrency conditions it is for and its progress \
+             guarantee. Expand every acronym. Do not mention the siblings by filename. \
+             Answer with the description only.",
+            siblings.join(", ")
+        );
+        let cs = match client
+            .respond(SUMMARY_MODEL, &cprompt, corrode_core::Priority::Default, None)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => anyhow::bail!("contrastive summarise {name}: {e}"),
+        };
+        eprintln!("  contrastive[{name}] {}", cs.trim().chars().take(150).collect::<String>());
+        contrastive.push(format!("{name}: {}", cs.trim()));
     }
 
     eprintln!("\n{}/{} files have a \\brief", briefs_found, names.len());
@@ -167,6 +193,7 @@ async fn structure_versus_description_on_near_identical_siblings() -> anyhow::Re
         ("code only", &code_only),
         ("model summary", &summarised),
         ("commit notes", &commit_notes),
+        ("contrastive note", &contrastive),
     ] {
         let vecs = client.embed_batch(EMBED_MODEL, docs, false).await?;
         let mut correct = 0;
