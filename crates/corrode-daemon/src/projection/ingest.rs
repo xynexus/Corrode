@@ -55,11 +55,31 @@ pub struct FileWrite {
 /// Trivia nodes are kept: they carry the whitespace that makes projection
 /// byte-exact. They are marked as such so a query can ignore them.
 pub fn file(lang: &dyn Language, path: &str, src: &str) -> anyhow::Result<FileWrite> {
+    Ok(file_against(lang, path, src, &[])?.0)
+}
+
+/// Ingest `src` reconciled against the nodes the store already holds for `path`.
+///
+/// This is what a RE-ingest must call. [`file`] assigns every node a fresh
+/// `initial_order`, which renumbers the file end to end — and since ids derive from the
+/// key, that re-addresses every node for a one-line change, the exact churn the sparse
+/// key exists to prevent. Reconciling first lets surviving nodes keep their keys.
+///
+/// Returns the write plus the [`Update`](super::update::Update), whose `changed` names
+/// the nodes this edit actually touched — the handle a commit message or an agent trace
+/// is bound to.
+pub fn file_against(
+    lang: &dyn Language,
+    path: &str,
+    src: &str,
+    stored: &[super::Node],
+) -> anyhow::Result<(FileWrite, super::update::Update)> {
     // One call so a backend with an expensive parser parses once (see `Language::spans`).
     // A backend with no grammar returns no anchors; comments then bind to nothing,
     // which is reported rather than guessed.
     let (items, anchors) = lang.spans(src)?;
-    let nodes = super::nodes_from_items(path, src, &items);
+    let fresh = super::nodes_from_items(path, src, &items);
+    let (nodes, update) = super::update::reconcile(stored, &fresh);
     let edges = bind(src, &lang.comments(src), &anchors, &nodes);
 
     let code = nodes
@@ -90,13 +110,16 @@ pub fn file(lang: &dyn Language, path: &str, src: &str) -> anyhow::Result<FileWr
         })
         .collect();
 
-    Ok(FileWrite {
-        file_id: format!("file:{path}"),
-        path: path.to_string(),
-        language: lang.name(),
-        code,
-        comments,
-    })
+    Ok((
+        FileWrite {
+            file_id: format!("file:{path}"),
+            path: path.to_string(),
+            language: lang.name(),
+            code,
+            comments,
+        },
+        update,
+    ))
 }
 
 /// Project a file back from its code nodes — the inverse of [`file`].

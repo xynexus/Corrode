@@ -397,7 +397,10 @@ not a corrode one.
      kernel: 94,750 files, 1.6 GB, 7.2 s, byte-exact.
    - **7b [shipped] Reconcile.** A re-ingest diffs against stored nodes so survivors
      keep their keys, rather than renumbering the file. Measured over 5,000 curl
-     commits: 19% of mutations are inserts, 0 rebalances.
+     commits: 19% of mutations are inserts, 0 rebalances. Wired into the daemon's
+     ingest path via `ingest::file_against`, which reads the stored nodes back before
+     writing — without that read-back `reconcile` was correct, tested and never
+     called, and the sparse key bought nothing in production.
    - **7c [shipped] Persist.** `replace_file` writes the file/code/comment nodes and
      their edges atomically, with pruning. Until this landed the whole pipeline wrote
      to nothing.

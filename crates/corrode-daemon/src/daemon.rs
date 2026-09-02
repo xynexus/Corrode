@@ -815,9 +815,24 @@ impl Daemon {
             // plain-text projector, which still ingests and projects byte-exactly with
             // less structure. Absorbing an unfamiliar codebase is never blocked.
             let lang = crate::projection::for_path(path);
-            let Ok(fw) = crate::projection::ingest::file(lang.as_ref(), path, &src) else {
+            // Reconcile against what the store already holds, rather than re-scanning
+            // from scratch. A fresh scan renumbers the file end to end, and since ids
+            // derive from the order key that re-addresses every node for a one-line
+            // change — the churn the sparse key exists to prevent. `stored` is empty for
+            // a file the graph has not seen, which is exactly a first ingest.
+            let stored = store.file_nodes(path).unwrap_or_default();
+            let Ok((fw, update)) = crate::projection::ingest::file_against(lang.as_ref(), path, &src, &stored)
+            else {
                 continue; // unparseable mid-edit: leave the previous nodes in place
             };
+            if !update.changed.is_empty() || update.rebalanced {
+                eprintln!(
+                    "code ingest {path}: {} changed, {} cosmetic{}",
+                    update.changed.len(),
+                    update.cosmetic,
+                    if update.rebalanced { ", rebalanced" } else { "" }
+                );
+            }
             if let Err(e) = store.replace_file(&fw) {
                 // Continue, do not abort the turn. One unwritable file must not stop
                 // every later file from being indexed: measured on curl, 5 of 2,995

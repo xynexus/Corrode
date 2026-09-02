@@ -214,7 +214,7 @@ fn align(
     // not one node dying and another being born.
     let (mut i, mut j) = (0, 0);
     let (mut del, mut ins) = (Vec::new(), Vec::new());
-    let mut flush = |del: &mut Vec<usize>, ins: &mut Vec<usize>, slots: &mut Vec<Slot>, st: &mut Update| {
+    let flush = |del: &mut Vec<usize>, ins: &mut Vec<usize>, slots: &mut Vec<Slot>, st: &mut Update| {
         let common = del.len().min(ins.len());
         for k in 0..common {
             slots.push(Slot::Update(del[k], ins[k]));

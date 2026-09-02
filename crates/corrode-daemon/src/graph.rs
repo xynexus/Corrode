@@ -1039,6 +1039,46 @@ pub mod embedded {
             std::fs::remove_dir_all(&dir).ok();
         }
 
+        /// A re-ingest through the store must PRESERVE keys, not renumber the file.
+        ///
+        /// This is the end-to-end version of what `reconcile` proves in isolation: read
+        /// the stored nodes back, reconcile the new source against them, write. If the
+        /// daemon skips the read-back it re-addresses every node for a one-line change,
+        /// and the sparse key buys nothing in production however well it tests.
+        #[test]
+        fn reingest_through_the_store_preserves_order_keys() {
+            use crate::projection::{self, ingest};
+            let dir = scratch_dir("keypreserve");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let path = "src/lib.rs";
+            let lang = projection::for_path(path);
+            let v1 = "fn a() { 1 }\n\nfn b() { 2 }\n";
+            let (fw1, _) = ingest::file_against(lang.as_ref(), path, v1, &[]).unwrap();
+            store.replace_file(&fw1).unwrap();
+            let before: Vec<u64> = store.file_nodes(path).unwrap().iter().map(|n| n.order).collect();
+
+            // Insert a leading item: every EXISTING node must keep its key.
+            let v2 = "use std::io;\n\nfn a() { 1 }\n\nfn b() { 2 }\n";
+            let stored = store.file_nodes(path).unwrap();
+            let (fw2, update) = ingest::file_against(lang.as_ref(), path, v2, &stored).unwrap();
+            store.replace_file(&fw2).unwrap();
+
+            let after: Vec<u64> = store.file_nodes(path).unwrap().iter().map(|n| n.order).collect();
+            assert!(!update.rebalanced, "an insert at the top must not force a rebalance");
+            for key in &before {
+                assert!(
+                    after.contains(key),
+                    "existing node {key} was renumbered; keys before {before:?} after {after:?}"
+                );
+            }
+            assert!(after.len() > before.len(), "the new item should have been added");
+            // And the store still composes the edited file byte-exactly.
+            assert_eq!(projection::project(&store.file_nodes(path).unwrap()).0, v2);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
         #[test]
         fn provenance_round_trip_upserts_edges_and_neighbors() {
             let dir = scratch_dir("prov");

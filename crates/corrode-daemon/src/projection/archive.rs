@@ -12,6 +12,12 @@
 //! than a codec crate, so `.tar.xz` works without linking liblzma and a new compression
 //! format is a table entry rather than a dependency.
 
+// Archive ingest is driven by the measurement harnesses (`bench_ingest`), which are
+// `#[cfg(test)]`, so the base build sees no caller. Kept out of `cfg(test)` because a
+// tar stream is an ingest SOURCE, not a test fixture — the daemon will call it when
+// bulk ingest is wired.
+#![allow(dead_code)]
+
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
