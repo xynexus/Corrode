@@ -512,3 +512,68 @@ mod one_file {
         eprintln!("project {:>7}ms (exact: {ok})", t.elapsed().as_millis());
     }
 }
+
+/// Does the store actually take a real repo, and at what rate?
+///
+/// Everything measured before this landed in memory. LMDB write throughput, on-disk
+/// amplification, and whether a 24 MB single-node file is even writable are the first
+/// things likely to break, and none of them are visible from an in-memory census.
+#[cfg(all(test, feature = "helix"))]
+mod store_scale {
+    use crate::graph::GraphStore;
+    use crate::projection::{self, ingest};
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "probe: needs a repo and --features helix"]
+    fn ingest_a_repo_into_a_live_store() {
+        let repo = std::path::PathBuf::from(std::env::var("CORRODE_REPO").unwrap());
+        let dir = std::env::temp_dir().join(format!("corrode-scale-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = crate::graph::embedded::HelixStore::open(dir.to_str().unwrap()).unwrap();
+        let limit: usize = std::env::var("SCALE_FILES").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+
+        let out = std::process::Command::new("git")
+            .arg("-C").arg(&repo).args(["ls-files", "-z"]).output().unwrap();
+        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split('\0').filter(|s| !s.is_empty()).map(str::to_owned).collect();
+
+        let (mut ok, mut failed, mut nodes, mut comments, mut bytes) = (0, 0, 0, 0, 0usize);
+        let t = Instant::now();
+        for rel in files.iter().take(limit) {
+            let Ok(src) = std::fs::read_to_string(repo.join(rel)) else { continue };
+            let lang = projection::for_path(rel);
+            let Ok(fw) = ingest::file(lang.as_ref(), rel, &src) else { continue };
+            nodes += fw.code.len();
+            comments += fw.comments.len();
+            bytes += src.len();
+            match store.replace_file(&fw) {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    if failed == 0 { eprintln!("first write failure on {rel}: {e}") }
+                    failed += 1;
+                }
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        let on_disk: u64 = std::fs::read_dir(&dir).into_iter().flatten().flatten()
+            .filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
+        eprintln!(
+            "\n{ok} files written ({failed} failed), {nodes} code + {comments} comment nodes, \
+             {:.1} MB source in {secs:.1}s ({:.0} nodes/s)",
+            bytes as f64 / 1e6, (nodes + comments) as f64 / secs.max(0.001)
+        );
+        eprintln!("  store on disk {:.1} MB — {:.1}x the source", on_disk as f64 / 1e6, on_disk as f64 / bytes.max(1) as f64);
+
+        // Re-read one file back and check the graph still composes it byte-exactly.
+        let sample = files.iter().take(limit)
+            .find(|r| std::fs::read_to_string(repo.join(r)).is_ok_and(|s| s.len() > 200));
+        if let Some(rel) = sample {
+            let src = std::fs::read_to_string(repo.join(rel)).unwrap();
+            let back = projection::project(&store.file_nodes(rel).unwrap()).0;
+            assert_eq!(back, src, "{rel} did not compose back byte-exactly from the store");
+            eprintln!("  round trip from store: {rel} byte-exact");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

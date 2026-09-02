@@ -422,7 +422,8 @@ falsify it.
 | The graph is the source of truth, files a projection | **aspiration** — ingest built, projection direction unwired | — | bijective line numbers |
 | A sparse order key beats a dense index on real edits | **TRUE** — 19% of mutations are inserts; 0 rebalances in 28,881 re-ingests | `bench_history::replay_history` over 5,000 curl commits | node identity; provenance stability |
 | Ingest holds up on unfamiliar languages at scale | **UNTESTED** — predictions recorded below | `CORRODE_SCAN_REPO=<repo>` round trip | absorbing arbitrary codebases |
-| Re-ingest on write keeps the code index fresh | **UNTESTED** — wired, needs a live `--features helix` store | ingest a repo, edit a file, query the graph | trusting index-backed search |
+| Re-ingest on write keeps the code index fresh | **TRUE** — edit prunes stale nodes, store still composes byte-exactly | `graph::reingest_after_an_edit_leaves_no_stale_nodes` | trusting index-backed search |
+| The store takes an ingested repo at usable rate/size | **FALSE at kernel scale** — 2,847 nodes/s warm, 14.3x on disk | `bench_ingest::store_scale` | ingesting large trees |
 
 Why this section exists, from the record of one session: every miss was a claim nobody
 executed. "Two of the five survivors fall to property tests" — `needle.vocab` is plain
@@ -751,6 +752,60 @@ provenance: "which task produced this node" is answered at item granularity, so 
 that edited one line claims credit for the whole function. Sub-item nodes would sharpen
 it at the cost of many more nodes per file. Not acted on; recorded because the number
 was there.
+
+### The pipeline lands: store, freshness, and derived line numbers
+
+For most of this work `replace_file` had no implementation. `HelixStore` implemented
+`upsert_node`, `add_edge` and `replace_doc`, so `replace_file` fell through to the trait
+default, which bails — and `ingest_written` handled that by logging and returning. Every
+number above it, including the kernel's 11.5M nodes, had been measured on a pipeline that
+wrote to nothing.
+
+It now writes. A file becomes a `source_file` node owning its code nodes (`has_code`) and
+comment nodes (`has_comment`), with `in_node` binding a comment to the item it sits in —
+so "what does this comment describe" is an edge traversal. Replacement is atomic and
+prunes, for the same reason `replace_doc` does: an index that answers with deleted code
+is worse than one that answers nothing.
+
+Two consequences are now measured rather than asserted:
+
+- **Re-ingest keeps the index fresh.** Edit a file so one item changes and one is
+  removed, re-ingest: the store serves the new text, the deleted item and its comment are
+  gone, and what remains still composes byte-exactly.
+- **A search hit carries a line number the graph derived.** Nothing stores a line.
+  `file_nodes` returns the file's code nodes in order, `project` replays them and reports
+  where each landed, and the hit's order key selects its placement. A line written at
+  ingest time is wrong after the next edit above it; this is right by construction — the
+  reason the sparse key and byte-exact composition were worth building. `search_files`
+  now appends these BM25 hits to its literal scan rather than replacing it: grep answers
+  "where is this exact string", which BM25 does not.
+
+**And the store is now the bottleneck.** Ingesting curl into a live store:
+
+```
+2,995 files, 34,428 code + 24,193 comment nodes, 13.7 MB source
+  cold  80.6s   (727 nodes/s)
+  warm  20.6s (2,847 nodes/s)
+  store on disk 195.9 MB — 14.3x the source
+```
+
+The in-memory pipeline does 225 MB/s. The store does roughly a hundredth of that, and
+amplification rose with store size (9.8x at 400 files, 14.3x at 3,000). Extrapolated to
+the kernel's 13.8M nodes that is over an hour and ~23 GB, so **large-tree ingest is not
+viable against this store as written** — the next real piece of work, and worth knowing
+before anything is built on top of it.
+
+**A precise failure found on the way.** 5 of 2,995 curl files failed to write with
+`MDB_BAD_VALSIZE`. Not a size limit on the node — the file is 1,934 bytes. It is a
+**1,011-byte single token** (a base64 blob on one line): LMDB's max key is 511 bytes and
+BM25 indexes every term as a key, so one long token rejects the whole node write. Any
+tree with base64, minified JS, long hex or data URIs hits this.
+
+Worse than the failure was the handling: `ingest_written` logged and `return`ed, so one
+such file cost the entire turn's code ingest. That was correct when the only possible
+error was "not implemented" and wrong the moment real per-file errors existed. It now
+counts and continues. The underlying limit is unfixed and needs either a helix-side
+change or the verbatim text moving to a property BM25 does not index.
 
 ### Fidelity as project policy
 

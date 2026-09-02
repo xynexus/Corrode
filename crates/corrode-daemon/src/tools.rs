@@ -192,6 +192,10 @@ pub struct ToolBox {
     /// uses the daemon's shared key. Carried here so the tool loops (which already
     /// hold the ToolBox) can attribute their `respond` calls without extra params.
     owner_token: Option<String>,
+    /// The session's graph store, when one is open. Gives `search_files` a SOFT half:
+    /// BM25 over ingested code and comments, on top of the literal scan. `None` in the
+    /// base build, where search stays literal-only.
+    graph: Option<Arc<dyn crate::graph::GraphStore>>,
 }
 
 impl ToolBox {
@@ -206,6 +210,7 @@ impl ToolBox {
             skill_scripts,
             sandbox: crate::sandbox::Sandbox::disabled(),
             owner_token: None,
+            graph: None,
         }
     }
 
@@ -217,6 +222,11 @@ impl ToolBox {
 
     /// Attribute this session's hipfire calls to a per-user token (builder;
     /// default `None` = the daemon's shared key).
+    pub fn with_graph(mut self, graph: Option<Arc<dyn crate::graph::GraphStore>>) -> Self {
+        self.graph = graph;
+        self
+    }
+
     pub fn with_owner_token(mut self, owner_token: Option<String>) -> Self {
         self.owner_token = owner_token;
         self
@@ -345,6 +355,65 @@ impl ToolBox {
     /// (no NUL, longest line 22 chars) and matches because it contains the token
     /// `overview`. No property distinguishes it from source; only a path rule would,
     /// which is what this design rejects. Recorded rather than special-cased.
+    /// BM25 hits from the ingested graph, as `path:line: text`, excluding anything the
+    /// literal scan already reported.
+    ///
+    /// The line number is DERIVED, not stored: the file's code nodes come back from the
+    /// store in order, `project` replays them and reports where each landed, and the
+    /// hit's order key selects its placement. A line written at ingest time would be
+    /// wrong after the next edit above it; this is right by construction, which is what
+    /// the sparse order key and byte-exact composition were for.
+    fn graph_matches(&self, query: &str, prefix: Option<&str>, already: &[String]) -> Vec<String> {
+        const MAX_SOFT: usize = 12;
+        let Some(store) = &self.graph else {
+            return Vec::new();
+        };
+        let Ok(hits) = store.code_search(query, MAX_SOFT * 4) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        let mut placements: HashMap<String, Vec<crate::projection::Placement>> = HashMap::new();
+        for (key, text) in hits {
+            if out.len() >= MAX_SOFT {
+                break;
+            }
+            // `code:{path}#{order}` / `comment:{path}#{n}`.
+            let Some((kind, rest)) = key.split_once(':') else { continue };
+            let Some((path, tail)) = rest.rsplit_once('#') else { continue };
+            if prefix.is_some_and(|p| !path.starts_with(p)) {
+                continue;
+            }
+            let places = placements.entry(path.to_string()).or_insert_with(|| {
+                store
+                    .file_nodes(path)
+                    .map(|nodes| crate::projection::project(&nodes).1)
+                    .unwrap_or_default()
+            });
+            // A comment's id counts comments, not order keys, so only a code hit can
+            // select a placement directly. A comment reports its file rather than
+            // guessing a line — the `in_node` edge is the honest way to place it, and
+            // that is a traversal this does not yet do.
+            let line = (kind == "code")
+                .then(|| tail.parse::<u64>().ok())
+                .flatten()
+                .and_then(|order| places.iter().find(|p| p.order == order))
+                .map(|p| p.start_line);
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let shown = &flat[..floor_char_boundary(&flat, 120)];
+            let entry = match line {
+                Some(l) => format!("{path}:{l}: {shown}"),
+                None => format!("{path}: {shown}"),
+            };
+            // Don't repeat what the literal scan already found.
+            if already.iter().any(|m| m.starts_with(&format!("{path}:"))) {
+                continue;
+            }
+            out.push(entry);
+        }
+        out
+    }
+
     async fn search_files(&self, query: &str, scope: Option<&str>) -> String {
         const MAX_FILES: usize = 4000;
         const MAX_MATCHES: usize = 60;
@@ -424,7 +493,12 @@ impl ToolBox {
             }
         }
 
-        if matches.is_empty() {
+        // The graph's half. Appended, never substituted: a literal scan answers "where
+        // is this exact string", which BM25 does not, and losing that would be a
+        // regression dressed up as an upgrade.
+        let soft = self.graph_matches(query, prefix.as_deref(), &matches);
+
+        if matches.is_empty() && soft.is_empty() {
             let mut msg = format!("no matches for {query:?}");
             if let Some(p) = &prefix {
                 msg.push_str(&format!(" under {p}"));
@@ -432,6 +506,13 @@ impl ToolBox {
             return msg;
         }
         let mut out = matches.join("\n");
+        if !soft.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("related (from the code graph):\n");
+            out.push_str(&soft.join("\n"));
+        }
         if capped {
             out.push_str("\n… (results capped; refine the query or narrow the path)");
         }

@@ -381,6 +381,9 @@ impl Daemon {
                     let skill_scripts = Arc::clone(&session.skill_scripts);
                     let owner_token = session.owner_token.clone();
                     let sandbox = self.sandbox.clone();
+                    // The store gives `search_files` its soft half. `None` in the base
+                    // build, where search stays literal-only.
+                    let graph = session.graph.clone();
                     let dialects = Arc::clone(&self.dialects);
                     let telemetry = Arc::clone(&self.telemetry);
                     let telemetry_plan = plan_id.clone();
@@ -404,6 +407,7 @@ impl Daemon {
                         let mut artifacts = Vec::new();
                         let toolbox = ToolBox::new(vfs, root, skill_scripts)
                             .with_sandbox(sandbox)
+                            .with_graph(graph)
                             .with_owner_token(owner_token);
                         let started = std::time::Instant::now();
                         let output = if role == Role::Coder && fanout > 1 {
@@ -769,6 +773,7 @@ impl Daemon {
             return;
         };
         let mut seen: std::collections::BTreeSet<&str> = Default::default();
+        let mut failed = 0usize;
         for node in &graph.provenance().nodes {
             // Code nodes are `{plan}:code:{path}`; match on the kind rather than
             // reaching for the plan id, which the graph keeps private.
@@ -795,9 +800,20 @@ impl Daemon {
                 continue; // unparseable mid-edit: leave the previous nodes in place
             };
             if let Err(e) = store.replace_file(&fw) {
-                eprintln!("code ingest unavailable ({e}); skipping");
-                return;
+                // Continue, do not abort the turn. One unwritable file must not stop
+                // every later file from being indexed: measured on curl, 5 of 2,995
+                // files contain a token longer than LMDB's 511-byte max key, which the
+                // BM25 index rejects (`MDB_BAD_VALSIZE`) — a base64 blob on one line is
+                // enough. Returning here let one such file silently cost the whole
+                // turn's code ingest.
+                failed += 1;
+                if failed <= 3 {
+                    eprintln!("code ingest failed for {path}: {e}");
+                }
             }
+        }
+        if failed > 3 {
+            eprintln!("code ingest: {failed} files failed in total");
         }
     }
 
