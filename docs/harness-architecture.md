@@ -411,8 +411,10 @@ not a corrode one.
      file's own bytes scores 1/4 — chance. What works, partially, is a generated
      description, which is a generation problem at ingest time rather than a graph
      one.
-   - **7f [unwired] Project.** The VFS reading files *from* the graph rather than the
-     disk. Composition is proven byte-exact in both directions; nothing calls it yet.
+   - **7f [first cut] Project.** `graphvfs::GraphVfs` composes reads from graph nodes
+     and falls through to the filesystem for anything the graph does not hold, behind
+     `CORRODE_VFS_GRAPH` (off by default). Enumeration deliberately stays on the inner
+     VFS. The staleness risk is pinned by a test rather than papered over.
 
 8. **[diagnosed]** **Store throughput.** Not in the original ordering because nothing
    had measured it. Profiled below: **the cost is text, not nodes** — writing the same
@@ -1101,6 +1103,47 @@ seconds, which is fine. Only whole-tree ingest of something kernel-sized is out 
 and that was a stress test rather than a use case. Step 8 is therefore diagnosed rather
 than urgent — but it is diagnosed, and the number that matters (7.4x, in the text) points
 at one specific upstream behaviour rather than at "the store is slow".
+
+### 7f: serving files from the graph
+
+Everything until now ran one direction — source into nodes. `graph-model.md` makes files
+a projection of the graph, and `graphvfs::GraphVfs` is the return trip: `file_nodes`
+hands back a file's code nodes in order, `project` composes them, and the bytes are the
+file.
+
+Fidelity was never the risk here — composition is already exact in both directions
+(94,750 of 94,750 kernel entries, 28,881 reconciles across 5,000 curl commits). **The
+risk is staleness.** A graph that has not seen an edit serves confidently wrong bytes,
+and an agent editing against them produces a patch that does not apply — worse than any
+error this replaces, and invisible unless someone looks.
+
+So the wrapper is built to be honest about not knowing:
+
+- It serves the graph **only** for files the graph actually holds, and falls through
+  otherwise. No nodes means "not ingested", not "empty file".
+- `stat` reports the size of the **composed** bytes, not the file on disk. A stat that
+  disagrees with the following read is worse than either answer alone, and FUSE will
+  truncate a read to the size stat promised.
+- `list` and `tracked_files` stay on the inner VFS. The graph knows only what has been
+  ingested, so answering enumeration from it would make directories look emptier than
+  they are — and `tracked_files` defines the search corpus, where under-reporting
+  silently loses results. Reading is per-path and can fall through honestly;
+  enumeration cannot.
+- `CORRODE_VFS_VERIFY` compares every graph-served read against the filesystem and
+  **reports** divergence rather than resolving it. Silently preferring either side is
+  how an agent ends up editing text that does not exist, and which side is right
+  depends on why they differ.
+- Setting `CORRODE_VFS_GRAPH` with no store open says so instead of quietly staying a
+  passthrough.
+
+The end-to-end test pins the failure mode rather than hiding it: ingest a file (doc
+comment, raw string, nested braces), read it back byte-exactly through the VFS, then
+edit it on disk **without** re-ingesting and assert the VFS still serves the old bytes.
+That is the staleness risk, written down as a test so it cannot be forgotten, and it is
+the argument for `ingest_written` running on every write.
+
+Off by default, like `CORRODE_SANDBOX`, so the passthrough remains the behaviour nobody
+opted out of.
 
 ### Fidelity as project policy
 

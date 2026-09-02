@@ -125,6 +125,23 @@ impl Daemon {
         let default_repo = canonical(&repo_root.to_string_lossy());
         // The default repo's resources come pre-built from `main` (or a test); seed
         // the registry so anonymous/default connections reuse them without reopening.
+        // Step 7f: with a store open and `CORRODE_VFS_GRAPH` set, reads are composed
+        // from graph nodes and fall through to the filesystem for anything the graph
+        // does not hold. Off by default, so the passthrough stays the behaviour nobody
+        // opted out of.
+        let vfs: Arc<dyn Vfs> = match (&graph, crate::graphvfs::enabled()) {
+            (Some(store), true) => {
+                eprintln!("vfs: graph-backed reads enabled (CORRODE_VFS_GRAPH)");
+                Arc::new(crate::graphvfs::GraphVfs::new(Arc::clone(store), vfs))
+            }
+            (None, true) => {
+                // Asking for it and silently not getting it is the failure mode worth
+                // avoiding: without a store there is nothing to compose from.
+                eprintln!("vfs: CORRODE_VFS_GRAPH set but no graph store is open; using the filesystem");
+                vfs
+            }
+            _ => vfs,
+        };
         let default_res = RepoResources {
             repo_root: default_repo.clone(),
             project: Arc::new(project),

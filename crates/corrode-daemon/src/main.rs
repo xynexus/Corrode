@@ -17,6 +17,7 @@ mod doctor;
 #[cfg(feature = "fuse")]
 mod fuse;
 mod graph;
+mod graphvfs;
 mod hipfire;
 mod normalize;
 #[cfg(feature = "docling")]
