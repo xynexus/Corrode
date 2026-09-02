@@ -1578,6 +1578,9 @@ async fn run_tool_loop(
     // the model's prose — a note bound to a path guessed from English would attach real
     // findings to the wrong file.
     let mut touched: Vec<String> = Vec::new();
+    // Canonical tool name of the turn's call, so extraction can tell an outcome from
+    // content without re-reading the model's prose.
+    let mut called: Option<String> = None;
     let mut last = String::new();
     for _ in 0..MAX_TOOL_STEPS {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
@@ -1604,7 +1607,12 @@ async fn run_tool_loop(
 
         let Some(intent) = crate::tools::parse_tool_intent(&text) else {
             // Final turn: it called nothing, so it contributes claims only.
-            steps.push(crate::trace::Step { said: text.clone(), intent: None, observation: None });
+            steps.push(crate::trace::Step {
+                said: text.clone(),
+                intent: None,
+                tool: None,
+                observation: None,
+            });
             record_trace(&toolbox, task, &steps, &touched);
             return Ok(text); // no TOOL: line -> this turn is the final answer
         };
@@ -1619,6 +1627,7 @@ async fn run_tool_loop(
         let observation = match raw.map(|r| r.and_then(|raw| dialect.parse(&raw))) {
             Ok(Ok(calls)) => match calls.first() {
                 Some(c) => {
+                    called = Some(c.name.clone());
                     if let Some(p) = crate::tools::arg_str(c, "path") {
                         if !touched.iter().any(|t| t == p) {
                             touched.push(p.to_string());
@@ -1637,6 +1646,7 @@ async fn run_tool_loop(
         steps.push(crate::trace::Step {
             said: text.clone(),
             intent: Some(intent.clone()),
+            tool: called.clone(),
             observation: Some(observation.clone()),
         });
         scratchpad.push_str(&format!("\nTOOL: {intent}\nRESULT: {observation}\n"));

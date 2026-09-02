@@ -1244,6 +1244,31 @@ the wrong file. And notes bind to the **file**, not to a node inside it: "this l
 never called" is about the file's role, and binding it to whichever node happened to be
 read would claim a precision the trace does not have.
 
+**Measured on a real trace, and the filter is loose.** Run over a full session
+transcript — 1,761 turns of actual tool calls and results:
+
+```
+notes        845   (466 observed, 379 asserted)
+yield        48% of steps produced a note
+compression  766 KB of tool output -> 214 KB of notes (28%)
+```
+
+48% and 28% is a trim, not a summary, and the samples show why: a file that merely
+*contains* the word "error" became a note about its own contents. So `extract` now
+distinguishes tools that produce an **outcome** from tools that return **content** —
+`read_file`, `list_dir` and `search_files` hand back what is already there, while running
+a command makes something happen, and only the second can yield an observed finding.
+(Unknown tools count as outcome-producing, so a new mutating tool is not silently dropped
+by an out-of-date list.)
+
+**That fix is unvalidated, and the corpus is why.** The session used a shell for
+everything — 1,139 of 1,761 steps map to `run_command`, including greps and file reads —
+so the split has almost nothing to separate here and the numbers are unchanged. In
+corrode's own toolset `read_file` and `search_files` are distinct tools and it would bite,
+but that is an argument, not a measurement. Tuning the filter harder against a corpus that
+misrepresents the tool mix would be fitting to the wrong distribution, so the numbers stand
+as recorded and the real yield question waits for a trace from the swarm's own loop.
+
 The test that carries the design asserts the uncomfortable half. After a correction, the
 **wrong note is still there** — still saying what it said, still naming the task that wrote
 it, with a `supersedes` edge pointing at it and the correction reachable from it. Deleting

@@ -79,6 +79,9 @@ pub struct Step {
     pub said: String,
     /// The plain-English intent it produced, if it called a tool.
     pub intent: Option<String>,
+    /// The canonical tool name, from the structured call. Decides whether the result is
+    /// an OUTCOME or just content — see [`produces_outcome`].
+    pub tool: Option<String>,
     /// What the tool returned. `None` on the final turn, which calls nothing.
     pub observation: Option<String>,
 }
@@ -99,6 +102,20 @@ const FINDING: &[&str] = &[
     "because", "so that", "beware", "gotcha", "note that", "test result", "assert",
 ];
 
+/// Does this tool produce an outcome, or return content?
+///
+/// `read_file`, `list_dir` and `search_files` hand back what is already there; running a
+/// command or writing a file makes something happen. Only the second kind can yield an
+/// observed FINDING — measured on a real session, treating reads as findings meant a
+/// source file that merely CONTAINED the word "error" became a 600-byte note about its
+/// own contents, which is not something the agent learned.
+///
+/// Unknown tools count as outcome-producing: a new mutating tool should not silently stop
+/// being recorded because this list was not updated.
+fn produces_outcome(tool: Option<&str>) -> bool {
+    !matches!(tool, Some("read_file") | Some("list_dir") | Some("search_files"))
+}
+
 fn is_finding(line: &str) -> bool {
     let l = line.to_lowercase();
     FINDING.iter().any(|w| l.contains(w))
@@ -114,7 +131,7 @@ pub fn extract(task: &str, steps: &[Step]) -> Vec<Note> {
     let mut out = Vec::new();
     let mut seq = 0usize;
     for step in steps {
-        if let Some(obs) = step.observation.as_deref() {
+        if let Some(obs) = step.observation.as_deref().filter(|_| produces_outcome(step.tool.as_deref())) {
             // Keep the lines that report an outcome. A successful `list_dir` is not a
             // finding; an error, a failing assert or a "not found" is.
             let kept: Vec<&str> = obs
@@ -213,10 +230,21 @@ mod tests {
     use super::*;
 
     fn step(said: &str, intent: Option<&str>, obs: Option<&str>) -> Step {
+        // Fixtures default to an outcome-producing tool; `read_step` covers the other side.
         Step {
             said: said.to_string(),
             intent: intent.map(str::to_string),
+            tool: Some("run_command".to_string()),
             observation: obs.map(str::to_string),
+        }
+    }
+
+    fn read_step(obs: &str) -> Step {
+        Step {
+            said: String::new(),
+            intent: Some("read the file".to_string()),
+            tool: Some("read_file".to_string()),
+            observation: Some(obs.to_string()),
         }
     }
 
@@ -250,6 +278,18 @@ mod tests {
         let notes = extract("task-2", &[step("The store does not implement replace_file.", None, None)]);
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].kind, NoteKind::Asserted);
+    }
+
+    #[test]
+    fn reading_a_file_that_contains_trigger_words_is_not_a_finding() {
+        // Measured on a real session: a source file containing the word "error" became a
+        // note about its own contents. Content is not something the agent learned.
+        let notes = extract("task-6", &[read_step("fn f() {\n  // error handling below\n}")]);
+        assert!(notes.is_empty(), "a read must not yield an observed finding: {notes:?}");
+        // The same text from a command IS an outcome.
+        let ran = extract("task-7", &[step("", Some("run it"), Some("error handling below"))]);
+        assert_eq!(ran.len(), 1);
+        assert_eq!(ran[0].kind, NoteKind::Observed);
     }
 
     #[test]
@@ -320,5 +360,57 @@ mod tests {
         // Truncating mid-character would panic on the slice; this is the same UTF-8
         // hazard the text fallback hit on a real repository.
         assert!(notes[0].text.chars().count() > 0);
+    }
+}
+
+#[cfg(test)]
+mod real_trace {
+    use super::*;
+
+    /// Run the filter over a REAL agent trace, not a fixture.
+    ///
+    /// The open question when extraction was built was whether the finding filter keeps
+    /// anything worth keeping at volume, or whether it is either so loose that every line
+    /// becomes a note or so tight that nothing does. A session transcript is the honest
+    /// corpus: thousands of turns of actual tool calls and results.
+    #[test]
+    #[ignore = "probe: needs TRACE_STEPS pointing at a converted transcript"]
+    fn filter_yield_on_a_real_session() {
+        let path = std::env::var("TRACE_STEPS").expect("set TRACE_STEPS");
+        let raw = std::fs::read_to_string(path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let steps: Vec<Step> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| Step {
+                said: s["said"].as_str().unwrap_or("").to_string(),
+                intent: s["intent"].as_str().map(str::to_string),
+                tool: s["tool"].as_str().map(str::to_string),
+                observation: s["observation"].as_str().filter(|o| !o.is_empty()).map(str::to_string),
+            })
+            .collect();
+
+        let notes = extract("session", &steps);
+        let observed = notes.iter().filter(|n| n.kind == NoteKind::Observed).count();
+        let obs_bytes: usize = steps.iter().filter_map(|s| s.observation.as_ref()).map(|o| o.len()).sum();
+        let note_bytes: usize = notes.iter().map(|n| n.text.len()).sum();
+
+        eprintln!("\n{} steps ({} with a tool result)", steps.len(),
+            steps.iter().filter(|s| s.observation.is_some()).count());
+        eprintln!("  notes           {}", notes.len());
+        eprintln!("    observed      {observed}");
+        eprintln!("    asserted      {}", notes.len() - observed);
+        eprintln!("  yield           {:.1}% of steps produced a note",
+            100.0 * notes.len() as f64 / steps.len().max(1) as f64);
+        eprintln!("  compression     {} KB of tool output -> {} KB of notes ({:.1}%)",
+            obs_bytes / 1024, note_bytes / 1024,
+            100.0 * note_bytes as f64 / obs_bytes.max(1) as f64);
+        for n in notes.iter().filter(|n| n.kind == NoteKind::Observed).take(3) {
+            eprintln!("  [observed] {}", n.text.lines().take(2).collect::<Vec<_>>().join(" / "));
+        }
+        for n in notes.iter().filter(|n| n.kind == NoteKind::Asserted).take(3) {
+            eprintln!("  [asserted] {}", n.text.chars().take(110).collect::<String>());
+        }
     }
 }
