@@ -465,7 +465,8 @@ falsify it.
 | The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
 | Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
 | **Graph structure** is what separates them | **FALSE** — comments 1/4, code 1/4, filename 1/4, all at chance | `bench_siblings::structure_versus_description` | step 7e; the case for graph retrieval |
-| Generated notes fix sibling separation | **FALSE so far** — isolated 2/4, contrastive 1/4 and factually wrong | same benchmark | note-generation pass |
+| Generated notes fix sibling separation | **FALSE** — isolated 2/4, contrastive 1/4 and factually wrong | same benchmark | note-generation pass |
+| A better DESCRIPTION can separate siblings | **FALSE** — 9 representations, none above 2/4; failures predicted by attribute uniqueness, not by text | `bench_siblings` full table | rules out description work; points at reranking |
 | The graph is the source of truth, files a projection | **aspiration** — ingest built, projection direction unwired | — | bijective line numbers |
 | A sparse order key beats a dense index on real edits | **TRUE** — 19% of mutations are inserts; 0 rebalances in 28,881 re-ingests | `bench_history::replay_history` over 5,000 curl commits | node identity; provenance stability |
 | Ingest holds up on unfamiliar languages at scale | **UNTESTED** — predictions recorded below | `CORRODE_SCAN_REPO=<repo>` round trip | absorbing arbitrary codebases |
@@ -1006,6 +1007,67 @@ generative. Untested; recorded as the next thing to try rather than claimed.
 **Caveat unchanged:** n = 4, one family, one corpus, one embedder, one model size. What
 this rules out is "generate notes and the problem goes away", which was the standing
 assumption after 7e.
+
+### 7e closed: it is not a description problem
+
+Identifier extraction was the last description-shaped idea, and it worked mechanically —
+no model, no hand-written acronym table. Take the type a file DECLARES
+(`Waitfree_MPSC_Queue`), then find where the repository's own prose explains that
+identifier. stitch's `doc/pages/main.md` spells out every variant — "Wait-free
+multi-producer-single-consumer bounded-size queue" — keyed by **class name**, which is
+why nothing keyed on paths ever found it.
+
+(An earlier note in this document said stitch's docs describe the library and not the
+variants. That was wrong, and wrong in a specific way worth recording: it came from a
+`grep … | head -8` whose output was filled by README hits before reaching `doc/pages/`.
+A truncated command, again.)
+
+It scores **2/4 at 192 bytes** — matching the 9B's isolated note (2/4, 386 bytes) and the
+hand-written alias table (2/4, 179 bytes), for free. But the interesting thing is the
+plateau, not the tie. Nine representations now, and **none exceeds 2/4**:
+
+| representation | bytes/doc | top-1 |
+|---|---|---|
+| filename only | 21 | 1/4 |
+| filename + `\brief` | 119 | 1/4 |
+| commit notes | 168 | 1/4 |
+| alias-expanded (hand table) | 179 | 2/4 |
+| **identifier gloss** (mechanical) | 192 | **2/4** |
+| model note, isolated | 386 | 2/4 |
+| model note, contrastive | 431 | 1/4 |
+| graph structure (comments) | 1,198 | 1/4 |
+| code only | 3,363 | 1/4 |
+
+**Which file fails is predicted by attribute uniqueness, not by representation.**
+
+| target | fails |
+|---|---|
+| `queue_mpmc_waitfree.h` | **9 of 9** |
+| `queue_mpsc_waitfree.h` | 7 of 9 |
+| `queue_spsc_waitfree.h` | 4 of 9 |
+| `queue_mpmc_lockfree.h` | 4 of 9 |
+
+`spsc_waitfree` is the only single-producer file; `mpmc_lockfree` is the only lock-free
+one. Each has an attribute no sibling shares, and each is found about half the time. The
+two that fail — `mpsc_waitfree` and `mpmc_waitfree` — have **no unique attribute
+whatever**: every property they have is shared with some sibling, and identifying them
+requires matching two axes *at once*. `mpmc_waitfree` is found by nothing, in nine tries.
+
+That is a mechanical prediction rather than a statistic, and it closes the question. A
+single embedding is a blended bag of features, so a document that matches one axis
+strongly outranks the document that matches two axes weakly — no description, however
+accurate, changes that. **7e is not a description problem; it is a composition problem in
+single-vector retrieval.**
+
+The remedy therefore is not more text. It is matching on decomposed attributes — a
+reranker scoring axes separately, or structured filtering on extracted properties. §9
+listed "or whether it needs a reranker" as the alternative hypothesis; this measurement
+discriminates between them, and hipfire already serves `/v1/rerank`.
+
+**What still holds:** identifier→gloss is worth building regardless. It is mechanical,
+192 bytes, ties the model at half the size and none of the cost, and it links prose to
+code by identifier — the same derivation `docmap` does for directories, on the key that
+actually works.
 
 ### Per-directory prose: what is actually there
 

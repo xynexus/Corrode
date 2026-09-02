@@ -94,6 +94,12 @@ async fn structure_versus_description_on_near_identical_siblings() -> anyhow::Re
     // model, same file, one extra sentence of context: the cheapest thing that could
     // fix the observed failure.
     let mut contrastive: Vec<String> = Vec::new();
+    // Identifier -> gloss. Mechanical, no model and no hand-written acronym table:
+    // take the type the file DECLARES, then find where the repository's own prose
+    // explains that identifier. stitch's `doc/pages/main.md` spells out every variant
+    // ("Wait-free multi-producer-single-consumer bounded-size queue"), keyed by class
+    // name rather than by filename — which is why nothing keyed on paths ever found it.
+    let mut glossed: Vec<String> = Vec::new();
     let mut briefs_found = 0;
 
     for name in &names {
@@ -127,6 +133,35 @@ async fn structure_versus_description_on_near_identical_siblings() -> anyhow::Re
         structure.push(format!("{name}\n{}", comments.join("\n")));
 
         filename_only.push(name.to_string());
+
+        // Declared types, in declaration order.
+        let idents: Vec<String> = src
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim_start();
+                let rest = t.strip_prefix("class ").or_else(|| t.strip_prefix("struct "))?;
+                let id: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                (id.len() > 2).then_some(id)
+            })
+            .collect();
+        // Every prose line in the repo that mentions one of them.
+        let mut gloss: Vec<String> = Vec::new();
+        for id in &idents {
+            let out = std::process::Command::new("grep")
+                .arg("-rhI").arg("--include=*.md").arg("--include=*.rst").arg("--include=*.txt")
+                .arg(id.as_str()).arg(&root)
+                .output()?;
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let l = line.trim();
+                // A mention is not a gloss: keep lines that say something beyond the
+                // name itself, and cap so one verbose page cannot dominate.
+                if l.len() > id.len() + 20 && gloss.len() < 6 && !gloss.iter().any(|g| g == l) {
+                    gloss.push(l.to_string());
+                }
+            }
+        }
+        eprintln!("  gloss[{name}] idents={idents:?} lines={}", gloss.len());
+        glossed.push(format!("{name} {}\n{}", idents.join(" "), gloss.join("\n")));
 
         let log = std::process::Command::new("git")
             .arg("-C").arg(&root)
@@ -194,6 +229,7 @@ async fn structure_versus_description_on_near_identical_siblings() -> anyhow::Re
         ("model summary", &summarised),
         ("commit notes", &commit_notes),
         ("contrastive note", &contrastive),
+        ("identifier gloss", &glossed),
     ] {
         let vecs = client.embed_batch(EMBED_MODEL, docs, false).await?;
         let mut correct = 0;
