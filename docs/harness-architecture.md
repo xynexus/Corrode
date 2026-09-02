@@ -403,10 +403,11 @@ not a corrode one.
      to nothing.
    - **7d [first cut] Retrieve.** `code_search` (BM25 over source) with line numbers
      *derived* from the node cover, appended to `search_files`' literal scan.
-   - **7e [untested] Represent.** Whether graph structure separates near-identical
-     siblings — the one thing §9 calls the actual risk in step 7, and still the only
-     part of it nobody has measured. Everything above is plumbing to make this
-     answerable.
+   - **7e [measured, negative] Represent.** Graph structure does **not** separate
+     near-identical siblings. Measured below: every representation drawn from the
+     file's own bytes scores 1/4 — chance. What works, partially, is a generated
+     description, which is a generation problem at ingest time rather than a graph
+     one.
    - **7f [unwired] Project.** The VFS reading files *from* the graph rather than the
      disk. Composition is proven byte-exact in both directions; nothing calls it yet.
 
@@ -457,6 +458,7 @@ falsify it.
 | Normalising with the language's own formatter removes the corner cases | **FALSE** — census identical before and after `rustfmt` (0/34 exact either way) | `normalize::normalising_shrinks_the_divergence_census` | `fidelity: normalized` paying off |
 | The embedder discriminates well enough to retrieve | **TRUE**, with alias text | done (§2) | step 7 |
 | Near-identical siblings are separable | **TRUE**, needs alias expansion | done — 4/4 with expansion, 1/4 without | code retrieval |
+| **Graph structure** is what separates them | **FALSE** — comments 1/4, code 1/4, filename 1/4, all at chance | `bench_siblings::structure_versus_description` | step 7e; the case for graph retrieval |
 | The graph is the source of truth, files a projection | **aspiration** — ingest built, projection direction unwired | — | bijective line numbers |
 | A sparse order key beats a dense index on real edits | **TRUE** — 19% of mutations are inserts; 0 rebalances in 28,881 re-ingests | `bench_history::replay_history` over 5,000 curl commits | node identity; provenance stability |
 | Ingest holds up on unfamiliar languages at scale | **UNTESTED** — predictions recorded below | `CORRODE_SCAN_REPO=<repo>` round trip | absorbing arbitrary codebases |
@@ -844,6 +846,56 @@ such file cost the entire turn's code ingest. That was correct when the only pos
 error was "not implemented" and wrong the moment real per-file errors existed. It now
 counts and continues. The underlying limit is unfixed and needs either a helix-side
 change or the verbatim text moving to a property BM25 does not index.
+
+### 7e: structure does not separate near-identical siblings
+
+§6 asserted "Structure is what disambiguates those; a description alone does not." That
+was the load-bearing claim under step 7 and it is wrong, at least for the structure the
+graph actually holds.
+
+The corpus is stitch's queue family — four headers differing by three letters, the one
+real miss from §2. Six representations of the same four files, embedded with
+`EmbeddingGemma-300M`, ranked against four queries that deliberately contain **no
+acronym** (a query saying "spsc" makes every representation win and measures nothing):
+
+| representation | bytes/doc | top-1 | what it does |
+|---|---|---|---|
+| filename + `\brief` | 119 | 1/4 | always answers `spsc` |
+| **graph structure** (bound comments) | 1,198 | **1/4** | always answers `mpmc_lockfree` |
+| filename only | 21 | 1/4 | always answers `mpmc_lockfree` |
+| code only (verbatim nodes) | 3,363 | 1/4 | mostly answers `mpsc` |
+| alias-expanded (hand-written table) | 179 | **2/4** | varies |
+| model-written summary (9B) | 386 | **2/4** | varies |
+
+**1/4 is chance for four items, and four of the six representations sit exactly there** —
+each collapsing to one constant answer regardless of the query. The sharpest reading is
+that **filename alone (21 bytes) scores the same as the full verbatim code (3,363
+bytes)**: 160x more of the file's own content changes nothing. The discriminator is the
+acronym, the embedder cannot decode it, and no quantity of surrounding text supplies it.
+
+Only the two representations that inject knowledge **not present in the corpus** beat
+chance, and both do it the same way — by expanding `spsc` into "single producer single
+consumer". One does it from a table someone maintains; the other from a 9B model at
+ingest time. That is the actionable finding: **the remedy is generated description, and
+it does not need a hand-written alias table or a large model.**
+
+Held against it: 2/4 is not "solved". Both remedies get the producer-count dimension
+right and both fail the progress-guarantee one (`lockfree` vs `waitfree` — the summary
+answers `mpsc` for both), and the summary's winning margins are tiny (+0.0015 to
++0.0185) where the failing representations' margins are larger. It separates barely.
+n = 4, one family, one corpus, one embedder.
+
+Also worth stating plainly: §2 recorded 4/4 with alias expansion and this run gets 2/4.
+That is not a contradiction of the earlier measurement — these queries are harder by
+construction (no acronyms at all, and they ask for the lockfree/waitfree distinction,
+which the earlier set did not). The comparison that matters is within this run, where
+every representation faced the same queries.
+
+**Consequence for the plan.** The case for graph retrieval cannot rest on structure
+disambiguating siblings, because it does not. It has to rest on generated per-node
+description, and the ingest pipeline is where that would be produced — which makes 7d/7e
+a summarisation pass, not a traversal problem. `search_files`' BM25 half is unaffected;
+it answers a different question and answers it exactly.
 
 ### Fidelity as project policy
 
