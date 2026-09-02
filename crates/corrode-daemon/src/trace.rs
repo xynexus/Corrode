@@ -183,6 +183,7 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
 /// A note describes code as it was. `reconcile` reports exactly which order keys an edit
 /// changed, so this is a lookup rather than a guess — and it is why staleness is
 /// mechanical here where the earlier "decay" idea had nothing to hang on.
+#[allow(dead_code)] // read side: a reader that surfaces notes has to skip the stale ones
 pub fn stale_notes<'a>(update: &Update, notes: &'a [(String, u64)]) -> Vec<&'a str> {
     notes
         .iter()
@@ -221,6 +222,7 @@ pub fn note_edges(notes: &[Note], task: &str, prior_about_same: &[String]) -> Ve
 /// tool result was produced by the system and a claim was produced by an agent — and the
 /// cheapest way to stop a confident sentence outranking the command output that
 /// contradicts it.
+#[allow(dead_code)] // read side: ordering matters when notes are surfaced, not when written
 pub fn rank_for_reading(notes: &mut [Note]) {
     notes.sort_by_key(|n| (n.kind != NoteKind::Observed, std::cmp::Reverse(n.seq)));
 }

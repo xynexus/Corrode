@@ -26,20 +26,6 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// What happened to one file.
-#[derive(Debug, PartialEq)]
-pub enum Outcome {
-    /// Already in normal form.
-    Unchanged,
-    /// The formatter would rewrite it (check), or did (write).
-    Changed,
-    /// No formatter configured for this language — it stays verbatim.
-    Skipped,
-    /// Not UTF-8, or unreadable.
-    Unreadable,
-    Failed(String),
-}
-
 #[derive(Debug, Default)]
 pub struct Report {
     pub unchanged: usize,

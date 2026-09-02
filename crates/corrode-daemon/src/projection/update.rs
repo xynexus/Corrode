@@ -45,6 +45,10 @@ pub struct Update {
 }
 
 impl Update {
+    /// Nodes this edit changed in any way. Test-only today (`bench_history`'s replay and
+    /// the reconcile tests); kept because "how much did this edit move" is the question
+    /// the replay exists to answer.
+    #[allow(dead_code)]
     pub fn touched(&self) -> usize {
         self.updated + self.inserted + self.deleted
     }
