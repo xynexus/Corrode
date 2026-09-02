@@ -167,6 +167,13 @@ where
         }
         let counts = for_each_file(archive, |e| {
             // Ownership transfer: the worker outlives this borrow.
+            //
+            // The send result is discarded deliberately: it can only fail once every
+            // receiver is gone, and a worker only leaves its loop when the channel
+            // closes — so the sole way to get here is a panicking worker, which
+            // `thread::scope` re-raises when it joins. The failure is therefore
+            // reported, not swallowed; ignoring it here just avoids a second panic
+            // inside the reader that would mask the first.
             let _ = tx.send((e.path.to_string(), e.text.to_string()));
         });
         drop(tx);
