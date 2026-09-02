@@ -75,6 +75,18 @@ pub trait GraphStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Place a file in its directory and record what it describes.
+    ///
+    /// This is what joins the two graphs. Until it is called, `DocIngest` builds
+    /// doc->chunk and `replace_file` builds file->code with nothing between them, so the
+    /// prose explaining a subsystem cannot be reached from the subsystem's code.
+    ///
+    /// `describes` comes from [`projection::docmap`](crate::projection::docmap), which
+    /// derives every link and guesses none.
+    fn place_file(&self, _path: &str, _describes: &[String]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Every code node of one file, in order, as projection nodes — so a caller can
     /// `project` them and get a `Placement` per node.
     ///
@@ -173,7 +185,8 @@ pub mod embedded {
     const REL_EMBEDDING: &str = "embedding_of";
     /// Relations `neighbors` walks (out-edge scans are per-label in helix).
     const NEIGHBOR_RELS: &[&str] =
-        &["part_of", "emitted_from", "produced_by", "has_chunk", "has_code", "has_comment", "in_node"];
+        &["part_of", "emitted_from", "produced_by", "has_chunk", "has_code", "has_comment",
+          "in_node", "in_dir", "describes"];
 
     /// insert_v/search_v want a filter type even when unused (helix's own tests
     /// pass this fn-pointer turbofish).
@@ -551,6 +564,26 @@ pub mod embedded {
             Ok(nodes)
         }
 
+        fn place_file(&self, path: &str, describes: &[String]) -> anyhow::Result<()> {
+            let arena = Bump::new();
+            let mut txn = self.storage.graph_env.write_txn()?;
+
+            let file_node = self.upsert_in(&mut txn, &arena, &format!("file:{path}"), "source_file", path)?;
+            if let Some((parent, _)) = path.rsplit_once('/') {
+                let dir = self.upsert_in(&mut txn, &arena, &format!("dir:{parent}"), "dir", parent)?;
+                self.link_in(&mut txn, &arena, "in_dir", file_node, dir)?;
+            }
+            for target in describes {
+                // The described directory may hold no ingested file yet — a doc can name
+                // a subsystem before its code is walked — so the node is upserted rather
+                // than looked up, and the edge is never dropped for arriving early.
+                let dir = self.upsert_in(&mut txn, &arena, &format!("dir:{target}"), "dir", target)?;
+                self.link_in(&mut txn, &arena, "describes", file_node, dir)?;
+            }
+            txn.commit()?;
+            Ok(())
+        }
+
         fn replace_file(&self, file: &crate::projection::ingest::FileWrite) -> anyhow::Result<()> {
             let arena = Bump::new();
             let mut txn = self.storage.graph_env.write_txn()?;
@@ -898,6 +931,56 @@ pub mod embedded {
                 lines.contains(&3),
                 "derived line should point at the item including its doc comment, got {lines:?}"
             );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// The join: from code, reach the prose that describes it.
+        ///
+        /// Before `place_file` the store held two disconnected graphs — doc->chunk and
+        /// file->code — so a subsystem's documentation sat in the same database as its
+        /// code with no path between them. This walks the path that now exists.
+        #[test]
+        fn prose_is_reachable_from_the_code_it_describes() {
+            use crate::projection::{self, docmap, ingest};
+            let dir = scratch_dir("docjoin");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let known: std::collections::BTreeSet<String> =
+                ["drivers/pci"].iter().map(|s| s.to_string()).collect();
+
+            // The code, placed in its directory.
+            let code_path = "drivers/pci/quirks.c";
+            let src = "/* Work around a broken BIOS. */\nvoid quirk(void) { }\n";
+            let lang = projection::for_path(code_path);
+            store.replace_file(&ingest::file(lang.as_ref(), code_path, src).unwrap()).unwrap();
+            store.place_file(code_path, &[]).unwrap();
+
+            // The prose, which NAMES that directory.
+            let doc_path = "Documentation/PCI/quirks.rst";
+            let doc = "Quirk handling\n\nThe workarounds live in drivers/pci/quirks.c.";
+            let links = docmap::describes(doc_path, doc, &known);
+            assert_eq!(links, vec!["drivers/pci"], "the doc must cite the code's directory");
+            let dlang = projection::for_path(doc_path);
+            store.replace_file(&ingest::file(dlang.as_ref(), doc_path, doc).unwrap()).unwrap();
+            store.place_file(doc_path, &links).unwrap();
+
+            // Walk it: code file -> its directory -> everything describing that directory.
+            let around_code = store.neighbors(&format!("file:{code_path}")).unwrap();
+            let dir_node = around_code
+                .iter()
+                .find(|n| n.id == "dir:drivers/pci")
+                .expect("code file should be placed in its directory");
+
+            let around_dir = store.neighbors(&dir_node.id).unwrap();
+            assert!(
+                around_dir.iter().any(|n| n.id == format!("file:{doc_path}")),
+                "the documentation must be reachable from the directory: {:?}",
+                around_dir.iter().map(|n| &n.id).collect::<Vec<_>>()
+            );
+            // And a source file must not claim to describe a directory just for naming
+            // it — that guard is what keeps the edges meaningful.
+            assert!(docmap::describes(code_path, src, &known).is_empty());
             std::fs::remove_dir_all(&dir).ok();
         }
 

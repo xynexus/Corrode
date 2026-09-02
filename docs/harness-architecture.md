@@ -997,9 +997,19 @@ citation must resolve against the tree's actual directories: `net/imaginary/thin
 produces nothing, and `subnet/core` does not match the `net` root. Source files are not
 scanned at all — a C file's `#include` is not a claim to document that directory.
 
-Still true: nothing joins the two graphs at ingest time yet. `DocIngest` builds
-doc→chunk, `replace_file` builds file→code, and there are no directory nodes. `docmap`
-produces the edges; wiring them into a write is the remaining step.
+**The graphs are now joined.** `GraphStore::place_file` writes the directory node, the
+`in_dir` edge putting a file in its directory, and a `describes` edge per link, and
+`ingest_written` calls it after every `replace_file` — computing the repo's directory set
+once per turn so a doc naming twenty subsystems does not cost twenty walks. A described
+directory is upserted rather than looked up, because prose can name a subsystem before
+that subsystem's code has been walked, and an edge should not be dropped for arriving
+early.
+
+The path that now exists, and is tested end to end: **code file → its directory →
+everything describing that directory.** A design note a task writes becomes reachable
+from the code it explains, which is the point of ingesting prose into the same store as
+source. The same test asserts the guard still holds — a C file that merely *names*
+`drivers/pci` acquires no `describes` edge.
 
 ### Agent traces: summarise for retrieval, keep the reasoning
 

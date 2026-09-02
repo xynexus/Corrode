@@ -774,6 +774,25 @@ impl Daemon {
         };
         let mut seen: std::collections::BTreeSet<&str> = Default::default();
         let mut failed = 0usize;
+        // The repo's real directory set, so `docmap` can confirm a cited path exists
+        // rather than inventing an edge to a directory nobody has. Computed once per
+        // turn: a doc naming twenty subsystems must not cost twenty walks.
+        let known_dirs: std::collections::BTreeSet<String> = session
+            .vfs
+            .tracked_files()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|p| {
+                let mut acc = Vec::new();
+                let mut cur = p.as_str();
+                while let Some((d, _)) = cur.rsplit_once('/') {
+                    acc.push(d.to_string());
+                    cur = d;
+                }
+                acc
+            })
+            .collect();
         for node in &graph.provenance().nodes {
             // Code nodes are `{plan}:code:{path}`; match on the kind rather than
             // reaching for the plan id, which the graph keeps private.
@@ -809,6 +828,17 @@ impl Daemon {
                 failed += 1;
                 if failed <= 3 {
                     eprintln!("code ingest failed for {path}: {e}");
+                }
+                continue;
+            }
+            // Join the graphs: place the file in its directory, and link it to whatever
+            // it documents. A README or design note written by a task becomes reachable
+            // from the code it describes, which is the whole point of ingesting prose
+            // into the same store as source.
+            let describes = crate::projection::docmap::describes(path, &src, &known_dirs);
+            if let Err(e) = store.place_file(path, &describes) {
+                if failed < 3 {
+                    eprintln!("placing {path} failed: {e}");
                 }
             }
         }
