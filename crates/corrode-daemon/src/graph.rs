@@ -520,8 +520,30 @@ pub mod embedded {
                 if prop_str(h, "kind") == "trivia" {
                     continue;
                 }
-                if key.starts_with("code:") || key.starts_with("comment:") {
-                    out.push((key, prop_str(h, "label")));
+                if !(key.starts_with("code:") || key.starts_with("comment:")) {
+                    continue;
+                }
+                let text = prop_str(h, "label");
+                // Drop hits that matched on IDENTITY rather than content.
+                //
+                // helix BM25-indexes every property (`bm25::term_counts_for_node`
+                // iterates the whole map), and our key is `code:{path}#{order}` — so a
+                // query naming any path fragment matches every node in every file
+                // beneath it, whatever those nodes say. Measured: "frobnicator" hits
+                // both nodes of `drivers/frobnicator/widget.c` although the word appears
+                // nowhere in the source. On a kernel-sized tree "drm" would return
+                // millions of nodes on identity alone.
+                //
+                // The real fix is field-selective indexing, which means forking the
+                // vendored engine. This filter costs nothing and removes the false hits;
+                // it does not recover the write time or the storage they cost.
+                let lower = text.to_lowercase();
+                let matched_content = query
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|t| t.len() > 2)
+                    .any(|t| lower.contains(&t.to_lowercase()));
+                if matched_content {
+                    out.push((key, text));
                 }
             }
             Ok(out)
@@ -981,6 +1003,39 @@ pub mod embedded {
             // And a source file must not claim to describe a directory just for naming
             // it — that guard is what keeps the edges meaningful.
             assert!(docmap::describes(code_path, src, &known).is_empty());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// Node ids are BM25-indexed along with content, so a path fragment used to match
+        /// every node in that file. This pins the filter that stops it.
+        ///
+        /// helix tokenises EVERY property (`bm25::term_counts_for_node` iterates the
+        /// whole map), and our `key` is `code:{path}#{order}`. That makes identity
+        /// searchable as if it were content: a query naming a directory hits every node
+        /// of every file under it, whatever those nodes actually say.
+        #[test]
+        fn path_fragments_do_not_match_content() {
+            use crate::projection::{self, ingest};
+            let dir = scratch_dir("keyleak");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let path = "drivers/frobnicator/widget.c";
+            let src = "void a(void) { }\n\nvoid b(void) { }\n";
+            let lang = projection::for_path(path);
+            store.replace_file(&ingest::file(lang.as_ref(), path, src).unwrap()).unwrap();
+
+            // "frobnicator" appears nowhere in the file's TEXT — only in its path.
+            assert!(!src.contains("frobnicator"));
+            let hits = store.code_search("frobnicator", 16).unwrap();
+            assert!(
+                hits.is_empty(),
+                "a term present only in the path must not match content: {hits:?}"
+            );
+            // A term that IS in the text still matches, so the filter has not simply
+            // disabled search.
+            let real = store.code_search("void", 16).unwrap();
+            assert!(!real.is_empty(), "content search must still work");
             std::fs::remove_dir_all(&dir).ok();
         }
 

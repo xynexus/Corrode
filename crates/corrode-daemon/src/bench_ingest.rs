@@ -644,3 +644,89 @@ mod doc_mapping {
         assert!(edges > 0, "the doc mapping produced no links at all");
     }
 }
+
+/// Where does store-write time actually go?
+///
+/// Ingest runs at 225 MB/s in memory and ~1% of that into the store, so the store is the
+/// bottleneck (step 8). Three variants over one corpus triangulate the cause rather than
+/// guessing at it: if shortening the TEXT is what speeds it up, the cost is in the text
+/// (BM25 tokenisation, property serialisation); if dropping TRIVIA is what speeds it up,
+/// the cost is per node. Variants 2 and 3 break byte-exactness on purpose — they are
+/// measurements, not proposals.
+#[cfg(all(test, feature = "helix"))]
+mod store_profile {
+    use crate::graph::GraphStore;
+    use crate::projection::{ingest, for_path};
+    use std::time::Instant;
+
+    fn corpus(limit: usize) -> Vec<(String, String)> {
+        let repo = std::path::PathBuf::from(std::env::var("CORRODE_REPO").unwrap());
+        let out = std::process::Command::new("git")
+            .arg("-C").arg(&repo).args(["ls-files", "-z"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .filter_map(|rel| std::fs::read_to_string(repo.join(rel)).ok().map(|t| (rel.to_string(), t)))
+            .take(limit)
+            .collect()
+    }
+
+    fn run(tag: &str, files: &[(String, String)], mutate: impl Fn(&mut ingest::FileWrite)) {
+        let dir = std::env::temp_dir().join(format!("corrode-prof-{}-{tag}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = crate::graph::embedded::HelixStore::open(dir.to_str().unwrap()).unwrap();
+        let (mut nodes, mut bytes, mut ok) = (0usize, 0usize, 0usize);
+        let t = Instant::now();
+        for (rel, src) in files {
+            let lang = for_path(rel);
+            let Ok(mut fw) = ingest::file(lang.as_ref(), rel, src) else { continue };
+            mutate(&mut fw);
+            nodes += fw.code.len() + fw.comments.len();
+            bytes += fw.code.iter().map(|c| c.text.len()).sum::<usize>();
+            if store.replace_file(&fw).is_ok() { ok += 1 }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        let on_disk: u64 = std::fs::read_dir(&dir).into_iter().flatten().flatten()
+            .filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
+        eprintln!(
+            "  {tag:<22} {ok} files, {nodes:>7} nodes, {:>5.1} MB text in {secs:>5.1}s \
+             ({:>6.0} nodes/s), store {:>5.1} MB",
+            bytes as f64 / 1e6, nodes as f64 / secs.max(0.001), on_disk as f64 / 1e6
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[ignore = "probe: needs a repo and --features helix"]
+    fn where_store_writes_spend_their_time() {
+        let limit: usize = std::env::var("SCALE_FILES").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+        let files = corpus(limit);
+        let trivia: usize = files.iter().filter_map(|(r, s)| {
+            let l = for_path(r);
+            ingest::file(l.as_ref(), r, s).ok()
+        }).map(|fw| fw.code.iter().filter(|c| c.kind == "trivia").count()).sum();
+        let total: usize = files.iter().filter_map(|(r, s)| {
+            let l = for_path(r);
+            ingest::file(l.as_ref(), r, s).ok()
+        }).map(|fw| fw.code.len()).sum();
+        eprintln!("\ncorpus {} files — {trivia} of {total} code nodes are trivia ({:.0}%)",
+            files.len(), 100.0 * trivia as f64 / total.max(1) as f64);
+
+        run("baseline", &files, |_| {});
+        // Same node COUNT, almost no text: isolates text cost (BM25 + serialisation).
+        run("one-char labels", &files, |fw| {
+            for c in &mut fw.code { c.text = "x".into() }
+            for c in &mut fw.comments { c.text = "x".into() }
+        });
+        // Same text, fewer nodes: isolates per-node overhead (index lookup, edge write).
+        run("no trivia nodes", &files, |fw| {
+            fw.code.retain(|c| c.kind != "trivia");
+        });
+        // Neither: the floor.
+        run("no trivia, 1-char", &files, |fw| {
+            fw.code.retain(|c| c.kind != "trivia");
+            for c in &mut fw.code { c.text = "x".into() }
+            for c in &mut fw.comments { c.text = "x".into() }
+        });
+    }
+}

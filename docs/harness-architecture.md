@@ -411,12 +411,13 @@ not a corrode one.
    - **7f [unwired] Project.** The VFS reading files *from* the graph rather than the
      disk. Composition is proven byte-exact in both directions; nothing calls it yet.
 
-8. **[blocking 7 at scale]** **Store throughput.** Not in the original ordering because
-   nothing had measured it. curl ingests at 2,847 nodes/s warm with 14.3x on-disk
-   amplification, rising with store size — the in-memory pipeline is ~100x faster.
-   Extrapolated to the kernel that is over an hour and ~23 GB, so large-tree ingest is
-   not viable as written. Also unfixed: a single token over LMDB's 511-byte max key
-   (base64, minified JS) rejects a whole node write.
+8. **[diagnosed]** **Store throughput.** Not in the original ordering because nothing
+   had measured it. Profiled below: **the cost is text, not nodes** — writing the same
+   node count with the text removed is 7.4x faster. The cause is that helix
+   BM25-indexes every property on every node write, with no field selection, and our
+   `label` is the verbatim text. Fine for a repo (curl, 58k nodes, ~30 s); infeasible
+   for a kernel-sized tree (13.8M nodes, ~1.8 h, ~23 GB). Also unfixed: a single token
+   over LMDB's 511-byte max key (base64, minified JS) rejects a whole node write.
 
 What steps 1-4 and 6 cost, for calibration: roughly one working session each,
 several of them under an hour, and every one of them removed a failure that had
@@ -1034,6 +1035,47 @@ Summarising at every-node granularity does not scale (the kernel has 11.5M code 
 even at file granularity, note generation is an Opportunistic-band job, not a synchronous
 one). And a summary that is embedded while the trace is discarded is unrecoverable —
 unlike every other lossy step here, there is no verbatim copy to fall back to.
+
+### Step 8: the store's cost is text, and identity was leaking into search
+
+Four variants over the same 1,500 curl files isolate the cause instead of guessing at it:
+
+| variant | nodes | text | time | nodes/s | store |
+|---|---|---|---|---|---|
+| baseline | 36,015 | 7.9 MB | 17.0 s | 2,121 | 144.6 MB |
+| **one-char labels** | 36,015 | 0.0 MB | **2.3 s** | **15,816** | 63.4 MB |
+| no trivia nodes | 28,184 | 7.3 MB | 11.6 s | 2,424 | 127.9 MB |
+| no trivia, one-char | 28,184 | 0.0 MB | 4.0 s | 6,971 | 50.5 MB |
+
+**Text is the cost, not node count.** Removing the text at identical node count is 7.4x
+faster; removing 22% of the nodes is 1.5x, and even that is proportional to the text
+those nodes carried. The cause is in the vendored engine:
+`bm25::term_counts_for_node` iterates the **whole property map** and tokenises every
+value — there is no field selection and no opt-out — and our `label` holds the verbatim
+node text.
+
+Run-to-run variance is large (the same workload measured 727 and 2,847 nodes/s cold
+versus warm), so nothing under ~2x in this table should be read as a difference. The 7.4x
+is well clear of it.
+
+**The same design flaw is also a correctness bug**, which is the part worth acting on.
+Every property is indexed, and our node key is `code:{path}#{order}` — so **identity is
+searchable as though it were content**. Measured: querying `frobnicator`, a word that
+appears nowhere in `drivers/frobnicator/widget.c`, returned both of its code nodes. On a
+kernel-sized tree a query for `drm` would match millions of nodes on their paths alone,
+and BM25's document lengths and IDF are skewed by path terms throughout.
+
+`code_search` now drops hits whose query terms appear only in the key, pinned by a test
+that also checks real content search still works. That removes the false hits and costs
+nothing; it recovers none of the write time or storage those path terms cost. The real
+fix is field-selective indexing, which means forking the pinned engine — worth doing when
+kernel-scale ingest is actually needed, and not before.
+
+**Scoping the finding honestly.** At 2,121 nodes/s a normal repository ingests in tens of
+seconds, which is fine. Only whole-tree ingest of something kernel-sized is out of reach,
+and that was a stress test rather than a use case. Step 8 is therefore diagnosed rather
+than urgent — but it is diagnosed, and the number that matters (7.4x, in the text) points
+at one specific upstream behaviour rather than at "the store is slow".
 
 ### Fidelity as project policy
 
