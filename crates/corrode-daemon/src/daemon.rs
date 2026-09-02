@@ -1570,6 +1570,10 @@ async fn run_tool_loop(
     let dialect = dialects.resolve(caller.model_id());
     let schema = dialect.render(crate::tools::role_tools(role), None);
     let mut scratchpad = String::new();
+    // The trace, kept as the loop already separates it: what the model said, and what a
+    // tool returned. `trace::extract` needs no parsing of the scratchpad because the two
+    // are never merged here in the first place.
+    let mut steps: Vec<crate::trace::Step> = Vec::new();
     let mut last = String::new();
     for _ in 0..MAX_TOOL_STEPS {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
@@ -1595,6 +1599,9 @@ async fn run_tool_loop(
         last = text.clone();
 
         let Some(intent) = crate::tools::parse_tool_intent(&text) else {
+            // Final turn: it called nothing, so it contributes claims only.
+            steps.push(crate::trace::Step { said: text.clone(), intent: None, observation: None });
+            record_trace(task, &steps);
             return Ok(text); // no TOOL: line -> this turn is the final answer
         };
 
@@ -1618,10 +1625,39 @@ async fn run_tool_loop(
             Ok(Err(e)) => format!("error: tool-call construction failed: {e}"),
             Err(e) => format!("error: tool-call thread panicked: {e}"),
         };
+        steps.push(crate::trace::Step {
+            said: text.clone(),
+            intent: Some(intent.clone()),
+            observation: Some(observation.clone()),
+        });
         scratchpad.push_str(&format!("\nTOOL: {intent}\nRESULT: {observation}\n"));
     }
     // Step budget spent: hand back the last turn as the answer.
+    record_trace(task, &steps);
     Ok(last)
+}
+
+/// Extract and report a task's notes.
+///
+/// ponytail: reported, not yet persisted. The graph write is `upsert_node` + `add_edge`
+/// over `trace::note_edges`, which needs the session's store threaded into the tool loop;
+/// until then the extraction runs on every real trace and is visible, which is what tells
+/// us whether the filter keeps anything worth keeping before anything depends on it.
+fn record_trace(task: &str, steps: &[crate::trace::Step]) {
+    let notes = crate::trace::extract(task, steps);
+    if notes.is_empty() {
+        return;
+    }
+    let observed = notes.iter().filter(|n| n.kind == crate::trace::NoteKind::Observed).count();
+    eprintln!(
+        "trace: {} note(s) from {} step(s) — {observed} observed, {} asserted",
+        notes.len(),
+        steps.len(),
+        notes.len() - observed
+    );
+    for n in notes.iter().take(4) {
+        eprintln!("  [{}] {}", n.kind.as_str(), n.text.lines().next().unwrap_or(""));
+    }
 }
 
 /// One full execution of a task: pick the capability path and run it.

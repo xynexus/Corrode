@@ -1194,6 +1194,48 @@ already takes the whole prompt and leaves exactly the logits wanted. One prefill
 of the walk: **168 ms per pair, 11.4x**, with identical accuracy — the same logits,
 obtained the cheap way (hipfire #409).
 
+### Notes from traces, and what happens to the wrong ones
+
+Cold-generated documentation measured badly (a 9B calling a `Waitfree_MPMC_Queue`
+"lock-free"), so `trace.rs` takes a different source. The expensive part of agent work is
+not writing prose — it is **search and verification**. Establishing that a function is
+never called, that a path is unwired, that a test fails for a particular reason costs real
+effort and nothing to record, and a later agent would otherwise pay to rediscover it.
+Those are also mostly *negative* facts, which no static extraction can produce.
+
+**Observed and asserted, split mechanically.** The tool loop already separates the two:
+text the model emitted is its own claim, and the string `ToolBox` returned is what the
+system reported. So the split needs no judgement and no classifier — and `Observed` is not
+a quality rating, it means "a tool produced this". Observations are kept **verbatim**,
+never summarised, because a summary of a fact is a claim about a fact and the point of the
+split is that one side introduces nothing.
+
+**Wrong notes are expected; the design is about what happens next.** Prevention was never
+available — this session alone produced three confident falsehoods worth storing as
+warnings: that stitch's docs do not describe the queue variants (a truncated `head -8`),
+that hipfire had no reranker work (a two-crate grep), that the sparse key was working in
+production (nothing called `reconcile`). A filter that rejected implausible claims would
+have kept all three, since each read perfectly plausible. So instead:
+
+- **Provenance.** Every note says whether a tool produced it or an agent claimed it, so
+  storing a guess cannot launder it into a fact.
+- **Supersession.** Append-only. A correction is a new note plus a `supersedes` edge,
+  never an edit — the wrong version stays readable and stays attributed, so a contested
+  claim is visible as contested.
+- **Staleness.** `reconcile` already reports which order keys an edit changed, so a note
+  about a changed node is marked stale mechanically. This is what the earlier "decay"
+  idea lacked: something to hang on.
+- **Reading order.** Observed before asserted. Not a truth ranking — it is the one thing
+  the provenance licenses, and it stops a confident sentence outranking the command output
+  that contradicts it.
+
+The filter keeps lines that state an outcome and drops narration, the same shape that made
+commit-message binding concentrate signal (19% of commits carry a rationale word, 38% of
+bindings do). Extraction runs on every real tool-loop trace and reports what it found;
+persisting to the graph is `upsert_node` + `add_edge` over `note_edges` and needs the
+session store threaded into the loop. Reporting first is deliberate — it shows whether the
+filter keeps anything worth keeping before anything depends on it.
+
 ### Per-directory prose: what is actually there
 
 `AGENTS.md` is read from the repo root only (`repo_root.join("AGENTS.md")`) — there is no

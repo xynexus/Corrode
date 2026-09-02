@@ -43,6 +43,7 @@ mod skills;
 mod swarm;
 mod telemetry;
 mod terminal;
+mod trace;
 mod toolcall;
 mod tools;
 mod vfs;
