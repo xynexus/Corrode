@@ -401,6 +401,9 @@ impl Daemon {
                     // The store gives `search_files` its soft half. `None` in the base
                     // build, where search stays literal-only.
                     let graph = session.graph.clone();
+                    // Cross-encoder reranking for graph hits, when CORRODE_RERANK_MODEL
+                    // names a served reranker. Same client the swarm generates through.
+                    let reranker = Some(Arc::clone(&client));
                     let dialects = Arc::clone(&self.dialects);
                     let telemetry = Arc::clone(&self.telemetry);
                     let telemetry_plan = plan_id.clone();
@@ -425,6 +428,7 @@ impl Daemon {
                         let toolbox = ToolBox::new(vfs, root, skill_scripts)
                             .with_sandbox(sandbox)
                             .with_graph(graph)
+                            .with_reranker(reranker)
                             .with_owner_token(owner_token);
                         let started = std::time::Instant::now();
                         let output = if role == Role::Coder && fanout > 1 {

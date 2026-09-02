@@ -159,6 +159,31 @@ struct EmbeddingsRequest<'a> {
     input_type: &'a str,
 }
 
+#[derive(Serialize)]
+struct RerankRequest<'a> {
+    model: &'a str,
+    query: &'a str,
+    documents: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct RerankReply {
+    results: Vec<RerankHit>,
+    /// Which scorer ran: `cross-encoder` (one forward per pair, `yes` against `no`) or
+    /// `cosine` (bi-encoder). hipfire picks by loaded model, so asking for reranking
+    /// with an embedding model silently gets cosine — which is the same computation
+    /// this crate could do itself, and cannot express "matches on two axes at once".
+    /// Checked rather than assumed.
+    #[serde(default)]
+    mode: String,
+}
+
+#[derive(Deserialize)]
+struct RerankHit {
+    index: usize,
+    relevance_score: f32,
+}
+
 #[derive(Deserialize)]
 struct EmbeddingsReply {
     #[serde(default)]
@@ -421,6 +446,47 @@ impl Client {
     /// Batch-embed via `POST /v1/embeddings`: one request, N vectors, input order.
     /// Empty inputs are rejected server-side (400s the whole batch) — filter first.
     /// Entries over ~2048 tokens 400 too, so chunk before embedding.
+    /// Rerank `documents` against `query` (`/v1/rerank`), best first.
+    ///
+    /// Returns `(index, score)` into `documents`. This is a CROSS-encoder call: hipfire
+    /// scores each pair jointly rather than embedding the two sides separately, which is
+    /// the difference that matters for near-identical candidates — a blended vector
+    /// cannot express "matches on two axes at once".
+    ///
+    /// Errors if the server answers in `cosine` mode. That is not a failure of the
+    /// server; it means the named model is a bi-encoder, and silently accepting it would
+    /// return embedding similarity under the name of reranking.
+    pub async fn rerank(
+        &self,
+        model: &str,
+        query: &str,
+        documents: &[String],
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
+        if documents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let req = RerankRequest { model, query, documents };
+        let mut rb = self
+            .http
+            .post(format!("{}/v1/rerank", self.base_url))
+            .json(&req);
+        if let Some(key) = &self.api_key {
+            rb = rb.bearer_auth(key);
+        }
+        let reply: RerankReply = rb.send().await?.error_for_status()?.json().await?;
+        if reply.mode == "cosine" {
+            anyhow::bail!(
+                "rerank: {model} scored in cosine mode — a bi-encoder, not a cross-encoder"
+            );
+        }
+        Ok(reply
+            .results
+            .into_iter()
+            .filter(|h| h.index < documents.len())
+            .map(|h| (h.index, h.relevance_score))
+            .collect())
+    }
+
     pub async fn embed_batch(
         &self,
         model: &str,

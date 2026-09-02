@@ -468,6 +468,7 @@ falsify it.
 | Generated notes fix sibling separation | **FALSE** — isolated 2/4, contrastive 1/4 and factually wrong | same benchmark | note-generation pass |
 | A better DESCRIPTION can separate siblings | **FALSE** — 9 representations, none above 2/4; failures predicted by attribute uniqueness, not by text | `bench_siblings` full table | rules out description work; points at reranking |
 | Decomposed matching beats a blended vector | **TRUE** — 3/4 vs a 2/4 ceiling, same embedder and documents, gaining exactly the files with no unique attribute | `bench_siblings` decomposed section | retrieval design; no cross-encoder needed |
+| A cross-encoder beats decomposition | **FALSE — it ties** at 3/4, at 168 ms per candidate against ~0 | `bench_siblings::rerank_versus_decomposition` | whether reranking is worth its latency |
 | The graph is the source of truth, files a projection | **aspiration** — ingest built, projection direction unwired | — | bijective line numbers |
 | A sparse order key beats a dense index on real edits | **TRUE** — 19% of mutations are inserts; 0 rebalances in 28,881 re-ingests | `bench_history::replay_history` over 5,000 curl commits | node identity; provenance stability |
 | Ingest holds up on unfamiliar languages at scale | **UNTESTED** — predictions recorded below | `CORRODE_SCAN_REPO=<repo>` round trip | absorbing arbitrary codebases |
@@ -1151,6 +1152,47 @@ between two axes ties every document (Borda being right, with first-seen order k
 deterministic), and a multi-clause query can be won by a *comment* node — the text lives
 where it lives, and requiring a `code:` node would be the wrong assertion rather than the
 right result.
+
+### Wiring retrieval to a real cross-encoder
+
+The reranker that 7e wanted now exists: hipfire serves `Qwen3-Reranker-0.6B--oq8`
+through `/v1/rerank`, and `code_search`'s BM25 shortlist can be rescored jointly instead
+of term-by-term. `ToolBox::with_reranker` enables it when `CORRODE_RERANK_MODEL` names a
+served reranker; absent, search is exactly what it was.
+
+Two guards. The client **errors if the server answers in `cosine` mode** — hipfire picks
+the scorer from the loaded model, so naming an embedding model would silently return
+bi-encoder similarity under the name of reranking, which is the thing this was built to
+get away from. And a reranker that is down falls through to the BM25 order rather than
+emptying the results: a worse answer, not no answer.
+
+**It ties decomposition, and costs real time.**
+
+| approach | top-1 | cost |
+|---|---|---|
+| blended single vector (nine representations) | 2/4 | ~0 |
+| decomposed query, rank-combined | 3/4 | one BM25 pass per axis |
+| **cross-encoder rerank** | **3/4** | **168 ms per candidate** |
+
+Both reach 3/4 and both recover `queue_mpmc_waitfree.h`, the file no blended
+representation ever retrieved. They are two routes to the same place: decomposition
+splits the query so a single vector never has to compose, while the cross-encoder reads
+the pair jointly so composition never has to be factored out. The cross-encoder's margins
+are far wider (+0.107 against +0.010), which suggests it is more robust than the tie
+implies — but on this corpus it does not retrieve anything decomposition misses.
+
+So the recommendation is decomposition first, reranking as an opt-in over a small
+shortlist. A 24-candidate rerank is ~4 s, which is affordable for a deliberate search and
+not for an incidental one.
+
+**A performance defect found by measuring rather than by profiling.** The first wiring
+measured **1,912 ms per pair** — 46 s for a 24-candidate shortlist, unusable. The cause
+was in the code I had just written into hipfire: it drove `ChunkScoredForward::forward_chunk_scored`,
+whose teacher-forced walk prefills one token and then decodes the rest one at a time, so
+scoring a single final position cost a decode step per prompt token. `SimpleAr::prefill`
+already takes the whole prompt and leaves exactly the logits wanted. One prefill instead
+of the walk: **168 ms per pair, 11.4x**, with identical accuracy — the same logits,
+obtained the cheap way (hipfire #409).
 
 ### Per-directory prose: what is actually there
 

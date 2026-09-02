@@ -196,6 +196,9 @@ pub struct ToolBox {
     /// BM25 over ingested code and comments, on top of the literal scan. `None` in the
     /// base build, where search stays literal-only.
     graph: Option<Arc<dyn crate::graph::GraphStore>>,
+    /// hipfire client + model for cross-encoder reranking of graph hits. `None` unless
+    /// `CORRODE_RERANK_MODEL` names a served reranker, so search is unchanged by default.
+    reranker: Option<(Arc<crate::hipfire::Client>, String)>,
 }
 
 impl ToolBox {
@@ -211,6 +214,7 @@ impl ToolBox {
             sandbox: crate::sandbox::Sandbox::disabled(),
             owner_token: None,
             graph: None,
+            reranker: None,
         }
     }
 
@@ -224,6 +228,16 @@ impl ToolBox {
     /// default `None` = the daemon's shared key).
     pub fn with_graph(mut self, graph: Option<Arc<dyn crate::graph::GraphStore>>) -> Self {
         self.graph = graph;
+        self
+    }
+
+    /// Attach a cross-encoder reranker for graph hits. Reads `CORRODE_RERANK_MODEL`;
+    /// absent means no reranking, which is the behaviour that predates this.
+    pub fn with_reranker(mut self, client: Option<Arc<crate::hipfire::Client>>) -> Self {
+        self.reranker = match (client, std::env::var("CORRODE_RERANK_MODEL").ok()) {
+            (Some(c), Some(m)) if !m.trim().is_empty() => Some((c, m)),
+            _ => None,
+        };
         self
     }
 
@@ -363,14 +377,35 @@ impl ToolBox {
     /// hit's order key selects its placement. A line written at ingest time would be
     /// wrong after the next edit above it; this is right by construction, which is what
     /// the sparse order key and byte-exact composition were for.
-    fn graph_matches(&self, query: &str, prefix: Option<&str>, already: &[String]) -> Vec<String> {
+    async fn graph_matches(&self, query: &str, prefix: Option<&str>, already: &[String]) -> Vec<String> {
         const MAX_SOFT: usize = 12;
+        /// Shortlist handed to the cross-encoder. It costs one forward per candidate, so
+        /// this is the knob that decides whether reranking is affordable: BM25 narrows
+        /// cheaply and the reranker only reorders what survived.
+        const SHORTLIST: usize = 24;
         let Some(store) = &self.graph else {
             return Vec::new();
         };
-        let Ok(hits) = store.code_search(query, MAX_SOFT * 4) else {
+        let fetch = if self.reranker.is_some() { SHORTLIST } else { MAX_SOFT * 4 };
+        let Ok(mut hits) = store.code_search(query, fetch) else {
             return Vec::new();
         };
+
+        // Rerank the shortlist jointly. BM25 (even decomposed) scores a document against
+        // the query one term at a time; a cross-encoder reads the pair together, which is
+        // what separates candidates that share every individual term.
+        if let Some((client, model)) = &self.reranker {
+            let docs: Vec<String> = hits.iter().map(|(_, text)| text.clone()).collect();
+            match client.rerank(model, query, &docs).await {
+                Ok(order) if !order.is_empty() => {
+                    hits = order.into_iter().filter_map(|(i, _)| hits.get(i).cloned()).collect();
+                }
+                // A reranker that is down or misconfigured must not empty the results:
+                // fall through to the BM25 order, which is a worse answer, not no answer.
+                Ok(_) => {}
+                Err(e) => eprintln!("rerank unavailable ({e}); using BM25 order"),
+            }
+        }
 
         let mut out = Vec::new();
         let mut placements: HashMap<String, Vec<crate::projection::Placement>> = HashMap::new();
@@ -496,7 +531,7 @@ impl ToolBox {
         // The graph's half. Appended, never substituted: a literal scan answers "where
         // is this exact string", which BM25 does not, and losing that would be a
         // regression dressed up as an upgrade.
-        let soft = self.graph_matches(query, prefix.as_deref(), &matches);
+        let soft = self.graph_matches(query, prefix.as_deref(), &matches).await;
 
         if matches.is_empty() && soft.is_empty() {
             let mut msg = format!("no matches for {query:?}");

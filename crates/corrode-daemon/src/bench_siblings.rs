@@ -343,3 +343,84 @@ async fn structure_versus_description_on_near_identical_siblings() -> anyhow::Re
 
     Ok(())
 }
+
+/// Does reranking a BM25 shortlist beat decomposing the query, and what does it cost?
+///
+/// The two are different answers to the same problem. Decomposition splits the query and
+/// rank-combines per-axis BM25; reranking keeps one query and rescores candidates jointly
+/// with a cross-encoder. Both reached 3/4 on the sibling corpus by different routes, so
+/// the question is whether they compose — and whether the per-candidate forward pass is
+/// affordable in a tool call.
+#[cfg(test)]
+mod rerank_bench {
+    use crate::hipfire::Client;
+    use std::time::Instant;
+
+    const RERANK_MODEL: &str = "Qwen3-Reranker-0.6B--oq8";
+
+    #[tokio::test]
+    #[ignore = "needs a served reranker"]
+    async fn rerank_versus_decomposition_on_siblings() -> anyhow::Result<()> {
+        let client = Client::new(
+            std::env::var("HIPFIRE_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:11435".into()),
+            std::env::var("HIPFIRE_API_KEY").ok(),
+        );
+        let root = std::path::PathBuf::from(format!("{}/stitch", std::env::var("HOME").unwrap()));
+        let names = ["queue_spsc_waitfree.h", "queue_mpsc_waitfree.h",
+                     "queue_mpmc_lockfree.h", "queue_mpmc_waitfree.h"];
+
+        // Identifier gloss: the type each file declares plus the repo's own prose on it.
+        let mut docs = Vec::new();
+        for n in &names {
+            let src = std::fs::read_to_string(root.join("stitch").join(n))?;
+            let ids: Vec<String> = src
+                .lines()
+                .filter_map(|l| {
+                    let t = l.trim_start();
+                    let rest = t.strip_prefix("class ").or_else(|| t.strip_prefix("struct "))?;
+                    let id: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    (id.len() > 2).then_some(id)
+                })
+                .collect();
+            let mut gloss = Vec::new();
+            for id in &ids {
+                let out = std::process::Command::new("grep")
+                    .args(["-rhI", "--include=*.md", "--include=*.rst", id])
+                    .arg(&root).output()?;
+                for l in String::from_utf8_lossy(&out.stdout).lines() {
+                    let l = l.trim();
+                    if l.len() > id.len() + 20 && gloss.len() < 6 && !gloss.iter().any(|g| g == l) {
+                        gloss.push(l.to_string());
+                    }
+                }
+            }
+            docs.push(format!("{n} {}\n{}", ids.join(" "), gloss.join("\n")));
+        }
+
+        // Warm the model first: the first call pays load + first prefill, and folding
+        // that into a per-pair average would overstate the steady-state cost several-fold.
+        let warm = Instant::now();
+        let _ = client.rerank(RERANK_MODEL, "warmup", &docs[..1]).await?;
+        eprintln!("  (warmup {} ms)", warm.elapsed().as_millis());
+
+        let (mut correct, mut total_ms, mut calls) = (0usize, 0u128, 0usize);
+        for (q, want) in super::QUERIES {
+            let t = Instant::now();
+            let order = client.rerank(RERANK_MODEL, q, &docs).await?;
+            let ms = t.elapsed().as_millis();
+            eprintln!("      ({ms} ms for {} docs)", docs.len());
+            total_ms += ms;
+            calls += docs.len();
+            let got = names[order[0].0];
+            let margin = order[0].1 - order[1].1;
+            let hit = got == *want;
+            if hit { correct += 1 }
+            eprintln!("  {} want {want:<26} got {got:<26} score {:.4} margin {margin:+.4}",
+                if hit { "ok  " } else { "MISS" }, order[0].1);
+        }
+        eprintln!("\ncross-encoder rerank: {correct}/{} top-1", super::QUERIES.len());
+        eprintln!("  {total_ms} ms for {} queries x {} docs = {calls} pair scorings ({:.0} ms/pair)",
+            super::QUERIES.len(), docs.len(), total_ms as f64 / calls.max(1) as f64);
+        Ok(())
+    }
+}
