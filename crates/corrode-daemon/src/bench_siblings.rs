@@ -261,5 +261,85 @@ async fn structure_versus_description_on_near_identical_siblings() -> anyhow::Re
             eprintln!("      {mark} want {want:<26} got {got:<26} margin {margin:+.4}");
         }
     }
+    // ---- Does DECOMPOSED matching beat a single blended vector? ----
+    //
+    // Nine representations plateaued at 2/4, and which file failed was predicted by
+    // attribute uniqueness: the two with no unique property were never found, because
+    // identifying them needs two axes matched at once and a single embedding is a
+    // blended bag of features.
+    //
+    // A cross-encoder would test that directly, and none is served — hipfire's
+    // `/v1/rerank` is `rank_by_cosine` over the SAME bi-encoder, so calling it would
+    // reproduce the numbers above by construction rather than test anything. This tests
+    // the hypothesis with what exists: score each axis of the query separately against
+    // the same documents, and rank by the WEAKEST axis, which is "must match all of
+    // them" rather than "matches something strongly".
+    const AXES: &[(&str, &[&str])] = &[
+        ("queue_spsc_waitfree.h", &["exactly one producer thread", "exactly one consumer thread"]),
+        ("queue_mpsc_waitfree.h", &["many producer threads", "exactly one consumer thread"]),
+        ("queue_mpmc_lockfree.h", &["many producer threads", "many consumer threads", "lock-free progress, an operation may retry"]),
+        ("queue_mpmc_waitfree.h", &["many producer threads", "many consumer threads", "wait-free progress, bounded steps per operation"]),
+    ];
+
+    for (label, docs) in [("identifier gloss", &glossed), ("model summary", &summarised)] {
+        let vecs = client.embed_batch(EMBED_MODEL, docs, false).await?;
+        let (mut correct, mut borda) = (0, 0);
+        for (want, axes) in AXES {
+            let axis_texts: Vec<String> = axes.iter().map(|a| a.to_string()).collect();
+            let avecs = client.embed_batch(EMBED_MODEL, &axis_texts, true).await?;
+            // Per document: the weakest axis score. A document that nails one axis and
+            // misses another scores low, which is exactly what the blended vector cannot
+            // express.
+            let mut scored: Vec<(f32, &str)> = vecs
+                .iter()
+                .zip(&names)
+                .map(|(v, n)| {
+                    let worst = avecs
+                        .iter()
+                        .map(|a| cosine(a, v))
+                        .fold(f32::INFINITY, f32::min);
+                    (worst, *n)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let hit = scored[0].1 == *want;
+            if hit {
+                correct += 1;
+            }
+            eprintln!(
+                "      min  {} want {want:<26} got {:<26}",
+                if hit { "ok  " } else { "MISS" },
+                scored[0].1,
+            );
+
+            // Rank-combine (Borda) instead of `min`. Axes are not on a common scale —
+            // "many producer threads" and "wait-free progress" have different absolute
+            // similarities — so comparing raw scores across axes penalises whichever
+            // axis happens to sit lower. Ranking within each axis first removes the
+            // scale, then summing ranks asks "is this document near the top for EVERY
+            // axis" without requiring the numbers to be comparable.
+            let mut points: Vec<(usize, &str)> = names.iter().map(|n| (0usize, *n)).collect();
+            for a in &avecs {
+                let mut per: Vec<(f32, usize)> =
+                    vecs.iter().enumerate().map(|(i, v)| (cosine(a, v), i)).collect();
+                per.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
+                for (rank, (_, i)) in per.iter().enumerate() {
+                    points[*i].0 += rank;
+                }
+            }
+            points.sort_by_key(|(p, _)| *p);
+            let borda_hit = points[0].1 == *want;
+            if borda_hit {
+                borda += 1;
+            }
+            eprintln!(
+                "      rank {} want {want:<26} got {:<26}",
+                if borda_hit { "ok  " } else { "MISS" },
+                points[0].1,
+            );
+        }
+        eprintln!("  decomposed/{label:<18} min {correct}/{n} top-1, rank-combined {borda}/{n} top-1", n = AXES.len());
+    }
+
     Ok(())
 }

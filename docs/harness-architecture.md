@@ -467,6 +467,7 @@ falsify it.
 | **Graph structure** is what separates them | **FALSE** — comments 1/4, code 1/4, filename 1/4, all at chance | `bench_siblings::structure_versus_description` | step 7e; the case for graph retrieval |
 | Generated notes fix sibling separation | **FALSE** — isolated 2/4, contrastive 1/4 and factually wrong | same benchmark | note-generation pass |
 | A better DESCRIPTION can separate siblings | **FALSE** — 9 representations, none above 2/4; failures predicted by attribute uniqueness, not by text | `bench_siblings` full table | rules out description work; points at reranking |
+| Decomposed matching beats a blended vector | **TRUE** — 3/4 vs a 2/4 ceiling, same embedder and documents, gaining exactly the files with no unique attribute | `bench_siblings` decomposed section | retrieval design; no cross-encoder needed |
 | The graph is the source of truth, files a projection | **aspiration** — ingest built, projection direction unwired | — | bijective line numbers |
 | A sparse order key beats a dense index on real edits | **TRUE** — 19% of mutations are inserts; 0 rebalances in 28,881 re-ingests | `bench_history::replay_history` over 5,000 curl commits | node identity; provenance stability |
 | Ingest holds up on unfamiliar languages at scale | **UNTESTED** — predictions recorded below | `CORRODE_SCAN_REPO=<repo>` round trip | absorbing arbitrary codebases |
@@ -1068,6 +1069,53 @@ discriminates between them, and hipfire already serves `/v1/rerank`.
 192 bytes, ties the model at half the size and none of the cost, and it links prose to
 code by identifier — the same derivation `docmap` does for directories, on the key that
 actually works.
+
+### The remedy: decompose the query, rank-combine the axes
+
+7e's conclusion predicted that the ceiling was single-vector composition, not
+description. That prediction is testable, and it holds.
+
+**There is no reranker to test with.** hipfire's `/v1/rerank` is
+`rank_by_cosine(query_embedding, doc_embeddings)` over the same bi-encoder
+(`hipfire-daemon/src/lib.rs`), so calling it would reproduce the numbers above *by
+construction* — "the reranker did not help" would have been a false result about a
+cross-encoder that was never involved. Worth knowing before trusting the endpoint's
+name.
+
+The hypothesis is testable without one. Score each axis of the query separately against
+the same documents, then combine:
+
+| scoring | identifier gloss | model summary |
+|---|---|---|
+| blended single vector | 2/4 | 2/4 |
+| decomposed, combined by `min` | 2/4 | 2/4 |
+| **decomposed, rank-combined** | **3/4** | **3/4** |
+
+**3/4 beats a ceiling nine representations could not, using the same embedder and the
+same documents.** Nothing was added — the query was taken apart.
+
+`min` was the obvious combiner and the wrong one: axes are not on a common scale, so
+comparing raw similarities across them penalises whichever axis happens to sit lower.
+Ranking within each axis first removes the scale, then summing ranks asks "is this near
+the top for *every* axis" without requiring the numbers to be comparable. That is the
+whole difference between 2/4 and 3/4.
+
+The gain lands exactly where the mechanism predicted. Under blended scoring
+`mpsc_waitfree` failed 7 of 9 and `mpmc_waitfree` 9 of 9, because neither has an
+attribute no sibling shares. Decomposed + rank-combined over the identifier gloss finds
+**both** — and misses `spsc_waitfree`, which blending found easily. The two approaches
+fail on opposite files, which is what "different failure mode" looks like rather than
+"one is better".
+
+**What this does not settle.** n = 4, and 3/4 versus 2/4 is a single file — the weight is
+in the mechanism being predicted in advance, not in the score. The axis decomposition was
+written by hand for this test; extracting axes from a real query is unsolved and is now
+the load-bearing unknown, having replaced "write better notes". And Borda over four
+documents is coarse.
+
+What it does establish is a direction that needs no cross-encoder, no larger model and no
+generated prose: **retrieval decomposes the query, scores axes independently, and
+rank-combines.** Every piece of that is available today.
 
 ### Per-directory prose: what is actually there
 
