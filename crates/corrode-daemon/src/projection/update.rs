@@ -16,7 +16,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 /// What one re-ingest did to a file's stored nodes.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Update {
     /// Byte-identical: key and text both untouched.
     pub kept: usize,
@@ -25,6 +25,19 @@ pub struct Update {
     /// New nodes, each needing a key minted between its neighbours.
     pub inserted: usize,
     pub deleted: usize,
+    /// Order keys of the nodes this edit actually changed — updated in place or newly
+    /// inserted. This is the identity, since ids derive from the key.
+    ///
+    /// It exists so a commit message can be bound to the TEXT THAT CHANGED rather than
+    /// to the file: "why is this line like this" is answered by the commit that wrote
+    /// the line, and attaching it at file granularity throws that away.
+    pub changed: Vec<u64>,
+    /// Updates whose text differs only in whitespace. Excluded from `changed`: a
+    /// reformat, a rename sweep or an indentation change is not a reason, and binding a
+    /// commit's rationale to one attaches the message to noise. On a repo that ran a
+    /// formatter once this is the difference between a useful index and thousands of
+    /// false attachments.
+    pub cosmetic: usize,
     /// A gap ran out and the file was renumbered. Correct, but it re-addresses every
     /// node in the file, so its frequency is the number that decides whether a sparse
     /// key was worth having.
@@ -52,10 +65,40 @@ fn same(a: &Node, fa: u64, b: &Node, fb: u64) -> bool {
 
 /// Which stored node, if any, a slot in the new sequence inherits its key from.
 enum Slot {
-    /// Reuses `stored[i]`'s key; carries the fresh text (identical when `kept`).
+    /// Reuses `stored[i]`'s key, text byte-identical.
     Keep(usize, usize),
+    /// Reuses `stored[i]`'s key with new text — the same slot, edited.
+    Update(usize, usize),
     /// Genuinely new: index into `fresh`.
     New(usize),
+}
+
+impl Slot {
+    /// The stored index a slot inherits its key from, if any.
+    fn stored(&self) -> Option<usize> {
+        match self {
+            Slot::Keep(si, _) | Slot::Update(si, _) => Some(*si),
+            Slot::New(_) => None,
+        }
+    }
+
+    fn fresh(&self) -> usize {
+        match self {
+            Slot::Keep(_, ni) | Slot::Update(_, ni) | Slot::New(ni) => *ni,
+        }
+    }
+}
+
+/// Whitespace-only difference: the same bytes once layout is removed.
+///
+/// Whitespace is stripped ENTIRELY rather than normalised into single spaces. Splitting
+/// on whitespace and comparing token streams looks equivalent and is not — `x(){1}` is
+/// one token and `x ( ) { 1 }` is seven, so a pure reflow reads as changed content. That
+/// is the same mistake `roundtrip::regen::formatting_only` documents costing 76 of 78
+/// files a false result, and it recurred here until a test caught it.
+pub fn cosmetic_only(a: &str, b: &str) -> bool {
+    let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    strip(a) == strip(b)
 }
 
 /// ponytail: O(n*m) LCS after prefix/suffix trimming. A commit usually touches a few
@@ -71,6 +114,8 @@ pub fn reconcile(stored: &[Node], fresh: &[Node]) -> (Vec<Node>, Update) {
     // A file that is new, or emptied, has nothing to reconcile against.
     if stored.is_empty() {
         st.inserted = fresh.len();
+        // A first ingest changes everything by definition; attributing a whole file to
+        // whatever commit happened to add it is noise, so `changed` stays empty.
         let nodes: Vec<Node> = fresh
             .iter()
             .enumerate()
@@ -139,7 +184,7 @@ fn align(
         // and let the remainder be pure insert/delete.
         let common = n.min(m);
         for k in 0..common {
-            slots.push(Slot::Keep(o_off + k, n_off + k));
+            slots.push(Slot::Update(o_off + k, n_off + k));
             st.updated += 1;
         }
         for k in common..m {
@@ -172,7 +217,7 @@ fn align(
     let mut flush = |del: &mut Vec<usize>, ins: &mut Vec<usize>, slots: &mut Vec<Slot>, st: &mut Update| {
         let common = del.len().min(ins.len());
         for k in 0..common {
-            slots.push(Slot::Keep(del[k], ins[k]));
+            slots.push(Slot::Update(del[k], ins[k]));
             st.updated += 1;
         }
         for &k in &ins[common..] {
@@ -211,7 +256,14 @@ fn assign_keys(stored: &[Node], fresh: &[Node], slots: &[Slot], st: &mut Update)
     let mut k = 0;
     while k < slots.len() {
         match slots[k] {
-            Slot::Keep(si, ni) => {
+            Slot::Keep(si, ni) | Slot::Update(si, ni) => {
+                if matches!(slots[k], Slot::Update(..)) {
+                    if cosmetic_only(&stored[si].text, &fresh[ni].text) {
+                        st.cosmetic += 1;
+                    } else {
+                        st.changed.push(stored[si].order);
+                    }
+                }
                 out.push(Node { order: stored[si].order, ..fresh[ni].clone() });
                 k += 1;
             }
@@ -221,21 +273,18 @@ fn assign_keys(stored: &[Node], fresh: &[Node], slots: &[Slot], st: &mut Update)
                 // burns the gap in ~32 inserts, spreading uses it once.
                 let run_end = slots[k..]
                     .iter()
-                    .position(|s| matches!(s, Slot::Keep(..)))
+                    .position(|s| s.stored().is_some())
                     .map_or(slots.len(), |off| k + off);
                 let count = run_end - k;
                 let lo = out.last().map_or(0, |n| n.order);
-                let hi = match slots.get(run_end) {
-                    Some(Slot::Keep(si, _)) => Some(stored[*si].order),
+                let hi = match slots.get(run_end).and_then(Slot::stored) {
+                    Some(si) => Some(stored[si].order),
                     // Appending past the last stored node: no upper bound, so extend at
                     // full stride instead of subdividing.
                     _ => None,
                 };
                 for (idx, slot) in slots[k..run_end].iter().enumerate() {
-                    let ni = match slot {
-                        Slot::New(ni) => *ni,
-                        _ => unreachable!(),
-                    };
+                    let ni = slot.fresh();
                     let order = match hi {
                         None => lo.saturating_add(ORDER_STRIDE * (idx as u64 + 1)),
                         Some(hi) => {
@@ -250,6 +299,7 @@ fn assign_keys(stored: &[Node], fresh: &[Node], slots: &[Slot], st: &mut Update)
                             }
                         }
                     };
+                    st.changed.push(order);
                     out.push(Node { order, ..fresh[ni].clone() });
                 }
                 k = run_end;
@@ -259,6 +309,9 @@ fn assign_keys(stored: &[Node], fresh: &[Node], slots: &[Slot], st: &mut Update)
     if exhausted {
         rebalance(&mut out);
         st.rebalanced = true;
+        // Rebalance re-addresses every node, so keys collected above no longer name
+        // anything. Reporting stale ids would bind commit notes to the wrong code.
+        st.changed.clear();
     }
     out
 }
@@ -322,6 +375,31 @@ mod tests {
         assert!(st.rebalanced);
         assert!(out.windows(2).all(|w| w[0].order < w[1].order));
         assert_eq!(super::super::project(&out).0, "amidb");
+    }
+
+    #[test]
+    fn changed_reports_the_edited_node_and_skips_a_reformat() {
+        let stored = vec![n(1 << 32, "a"), n(2 << 32, "fn x(){1}"), n(3 << 32, "c")];
+
+        // A real edit names the node it changed, by the key its id derives from.
+        let (_, st) = reconcile(&stored, &[n(0, "a"), n(0, "fn x(){2}"), n(0, "c")]);
+        assert_eq!(st.changed, vec![2 << 32]);
+        assert_eq!(st.cosmetic, 0);
+
+        // A reformat names nothing: binding a commit's rationale to whitespace attaches
+        // it to noise, and one formatter run would otherwise produce thousands.
+        let (_, st) = reconcile(&stored, &[n(0, "a"), n(0, "fn x ( ) { 1 }"), n(0, "c")]);
+        assert!(st.changed.is_empty(), "whitespace-only edit must not be attributed");
+        assert_eq!(st.cosmetic, 1);
+
+        // An insert is a change and names its new key.
+        let (out, st) = reconcile(&stored, &[n(0, "a"), n(0, "fn x(){1}"), n(0, "new"), n(0, "c")]);
+        assert_eq!(st.changed.len(), 1);
+        assert_eq!(st.changed[0], out[2].order);
+
+        // A first ingest attributes nothing: every node is new by definition.
+        let (_, st) = reconcile(&[], &[n(0, "a"), n(0, "b")]);
+        assert!(st.changed.is_empty());
     }
 
     #[test]

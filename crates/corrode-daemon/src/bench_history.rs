@@ -263,3 +263,98 @@ fn tree_round_trip_at_head() -> anyhow::Result<()> {
     assert_eq!(mismatch, 0, "projection was not byte-exact for every tracked blob");
     Ok(())
 }
+
+/// Bind each commit's message to the NODES it changed, and measure whether that is
+/// signal or noise.
+///
+/// "Why is this line like this" is answered by the commit that wrote the line. Binding
+/// at file granularity throws that away — a file accumulates hundreds of messages and
+/// none of them point at anything. `reconcile` already knows exactly which nodes an edit
+/// touched, so the binding is a small addition to machinery that exists.
+///
+/// Nothing here is a new store method: a commit is `upsert_node` and each binding is
+/// `add_edge`, both already on `GraphStore`.
+#[test]
+#[ignore = "needs a local git clone; set HISTORY_REPO"]
+fn bind_commit_messages_to_changed_nodes() -> anyhow::Result<()> {
+    let repo = std::env::var("HISTORY_REPO")
+        .unwrap_or_else(|_| format!("{}/.cache/corrode-fixtures/curl", std::env::var("HOME").unwrap()));
+    let repo = Path::new(&repo);
+    let limit: usize = std::env::var("HISTORY_COMMITS").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+
+    /// Words that mark a message as carrying a REASON rather than just a label. The
+    /// gotchas are the payload; "bump version" is not one.
+    const RATIONALE: &[&str] = &[
+        "because", "why", "regression", "breaks", "broken", "workaround", "otherwise",
+        "instead", "avoid", "prevent", "race", "leak", "deadlock", "overflow", "fixes",
+        "reported-by", "caused", "due to", "must not", "cannot",
+    ];
+
+    let out = git(repo, &["rev-list", "--first-parent", "-n", &limit.to_string(), "HEAD"])?;
+    let commits: Vec<String> = String::from_utf8(out)?.lines().rev().map(str::to_owned).collect();
+
+    let mut live: HashMap<String, Vec<Node>> = HashMap::new();
+    let (mut bindings, mut rich_bindings, mut cosmetic, mut commits_binding, mut msg_bytes) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut per_node: HashMap<String, usize> = HashMap::new();
+
+    for sha in &commits {
+        let msg = String::from_utf8_lossy(&git(repo, &["log", "-1", "--format=%s%n%b", sha])?)
+            .trim()
+            .to_string();
+        let lower = msg.to_lowercase();
+        let rich = RATIONALE.iter().any(|w| lower.contains(w));
+
+        let out = git(repo, &["diff-tree", "--no-commit-id", "--name-status", "-r", "-M", sha])?;
+        let mut bound_here = 0;
+        for line in String::from_utf8_lossy(&out).lines() {
+            let mut f = line.split('\t');
+            let status = f.next().unwrap_or("");
+            let (old, new) = (f.next(), f.next());
+            let Some(first) = old else { continue };
+            let path = if status.starts_with('R') { new.unwrap_or(first) } else { first };
+            if status.starts_with('D') {
+                live.remove(path);
+                continue;
+            }
+            let Ok(blob) = git(repo, &["show", &format!("{sha}:{path}")]) else { continue };
+            let Ok(src) = String::from_utf8(blob) else { continue };
+            let lang = projection::for_path(path);
+            let Ok((items, _)) = lang.spans(&src) else { continue };
+            let fresh = projection::nodes_from_items(path, &src, &items);
+
+            let stored = live.get(path).map(|v| v.as_slice()).unwrap_or(&[]);
+            let (nodes, st) = projection::update::reconcile(stored, &fresh);
+            cosmetic += st.cosmetic;
+            for order in &st.changed {
+                // The edge the store would write: commit:{sha} -changed-> code:{path}#{order}
+                bindings += 1;
+                bound_here += 1;
+                if rich {
+                    rich_bindings += 1;
+                }
+                *per_node.entry(format!("code:{path}#{order}")).or_default() += 1;
+            }
+            live.insert(path.to_string(), nodes);
+        }
+        if bound_here > 0 {
+            commits_binding += 1;
+            msg_bytes += msg.len();
+        }
+    }
+
+    let mut counts: Vec<usize> = per_node.values().copied().collect();
+    counts.sort_unstable();
+    let median = counts.get(counts.len() / 2).copied().unwrap_or(0);
+    let p99 = counts.get(counts.len() * 99 / 100).copied().unwrap_or(0);
+
+    eprintln!("\n{} commits — {commits_binding} bound at least one node", commits.len());
+    eprintln!("  bindings            {bindings}");
+    eprintln!("  … carrying a reason {rich_bindings} ({:.0}%)", pct(rich_bindings, bindings));
+    eprintln!("  cosmetic, excluded  {cosmetic} ({:.0}% of would-be bindings)",
+        pct(cosmetic, bindings + cosmetic));
+    eprintln!("  distinct nodes      {}", per_node.len());
+    eprintln!("  notes per node      median {median}, p99 {p99}, max {}", counts.last().copied().unwrap_or(0));
+    eprintln!("  mean message        {} bytes", msg_bytes / commits_binding.max(1));
+    Ok(())
+}

@@ -897,6 +897,77 @@ description, and the ingest pipeline is where that would be produced — which m
 a summarisation pass, not a traversal problem. `search_files`' BM25 half is unaffected;
 it answers a different question and answers it exactly.
 
+### Commit messages bound to the text that changed
+
+"Why is this line like this" is answered by the commit that wrote the line. Binding at
+file granularity throws that away — a file accumulates hundreds of messages and none of
+them point at anything. `reconcile` already knows exactly which nodes an edit touched, so
+`Update` now reports them (`changed`), and a binding is `upsert_node` for the commit plus
+`add_edge` per node: no new store method.
+
+Two rules are built in. A first ingest attributes nothing — every node is new by
+definition, and crediting a whole file to whatever commit added it is noise. And a
+**whitespace-only edit attributes nothing**, because binding a commit's rationale to a
+reformat is worse than not binding it: one formatter run would otherwise produce
+thousands of false attachments.
+
+That second rule reintroduced a bug this repo had already fixed and documented. The first
+version compared `split_whitespace()` token streams, which is not normalisation —
+`x(){1}` is one token and `x ( ) { 1 }` is seven, so a pure reflow reads as changed
+content. `roundtrip::regen::formatting_only` carries a comment saying exactly this cost
+76 of 78 files a false result. A test caught it; the rule now has **one** implementation,
+in production, and `roundtrip` delegates to it.
+
+Measured over 2,000 first-parent curl commits:
+
+| | |
+|---|---|
+| commits binding at least one node | 1,878 of 2,000 |
+| bindings | 16,094 across 9,187 distinct nodes |
+| **carrying a reason** | **6,112 (38%)** |
+| cosmetic, excluded | 1,035 (6% of would-be bindings) |
+| notes per node | median 1, p99 10, **max 133** |
+
+**Binding to changed nodes concentrates the signal**: 19% of all curl commits contain a
+rationale word, but 38% of *bindings* do — because commits that touch code are richer
+than version bumps and doc sweeps, and those never bind. The cosmetic filter fires on 1
+in 16. And accumulation is mild where it was expected to be the problem: the median node
+carries exactly one note, so decay is a tail concern (p99 = 10, max = 133), not a general
+one. Selection — keeping the 38% that explain something — matters more than aging.
+
+**It does not solve 7e.** Added to the sibling benchmark as a seventh representation,
+commit notes score **1/4 — chance**, alongside structure, filename and code. The reason
+is visible in the corpus: the messages are largely *shared* across siblings ("Add
+lockfree MPMC queue; Rename queue classes and files" touches all four), and where they do
+discriminate they use the same acronyms the embedder cannot decode. Rich in general does
+not mean discriminating here.
+
+So commit notes are a **gotcha index, not a disambiguator** — they answer "what should I
+know before touching this" and not "which of these four is the one I want". Those are
+different jobs and the earlier finding stands: only generated description separates
+siblings.
+
+### Per-directory prose: what is actually there
+
+`AGENTS.md` is read from the repo root only (`repo_root.join("AGENTS.md")`) — there is no
+per-subdirectory stack, and composing one down the tree is unbuilt.
+
+The kernel is the corpus worth sizing this against, and its per-directory prose is not
+where it is assumed to be:
+
+| | files |
+|---|---|
+| `Documentation/` | 12,037 |
+| `Kconfig` (help blocks) | 1,916 |
+| `README*` | **89** (of 6,204 directories — 1.4%) |
+
+READMEs are not the kernel's mechanism. `Documentation/` is, and it **mirrors the source
+tree by subsystem** (`Documentation/networking/` ↔ `net/`), so the code↔prose mapping is
+derivable from paths rather than needing a model. Kconfig help is per-directory prose
+describing precisely what the code in that directory does. Neither is linked to anything
+today: `DocIngest` builds doc→chunk, `replace_file` builds file→code, and **no edge joins
+the two graphs**. There are no directory nodes at all.
+
 ### Fidelity as project policy
 
 Verbatim storage is exact today and its bill grows: every increase in node specificity

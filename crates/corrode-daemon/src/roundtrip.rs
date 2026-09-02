@@ -321,13 +321,10 @@ pub mod regen {
     /// whitespace made cosmetic reflow look like content loss, and stripping whitespace
     /// still cannot see a canonicalised comma. The census reports what it can defend.
     pub fn formatting_only(src: &str, printed: &str) -> bool {
-        // Remove whitespace ENTIRELY rather than normalising runs of it. Splitting on
-        // whitespace and rejoining looks equivalent and is not: `lookup(&self,` is one
-        // token and `lookup( &self,` is two, so a purely cosmetic reflow inside a
-        // parameter list reads as changed content. That mistake turned 76 of 78 files
-        // into false "content lost" results on the first run of this census.
-        let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-        strip(src) == strip(printed)
+        // One implementation of this rule, in production code: `reconcile` needs the
+        // same test to avoid binding a commit's rationale to a reformat, and a second
+        // copy is how the token-splitting bug came back after being fixed here.
+        crate::projection::update::cosmetic_only(src, printed)
     }
 
     /// Regenerate and report both the classification and whether the loss was purely
