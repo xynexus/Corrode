@@ -538,11 +538,18 @@ pub mod embedded {
                 // vendored engine. This filter costs nothing and removes the false hits;
                 // it does not recover the write time or the storage they cost.
                 let lower = text.to_lowercase();
-                let matched_content = query
+                let terms: Vec<String> = query
                     .split(|c: char| !c.is_alphanumeric() && c != '_')
                     .filter(|t| t.len() > 2)
-                    .any(|t| lower.contains(&t.to_lowercase()));
-                if matched_content {
+                    .map(|t| t.to_lowercase())
+                    .collect();
+                // With no term long enough to check against, the filter cannot tell an
+                // identity match from a content one — so it must pass the hit through
+                // rather than discard it. `.any()` over an empty iterator is false, and
+                // the first version of this returned NOTHING for every query made only
+                // of short tokens: `fd`, `mm`, `sk`, `nr`, `rq` are ordinary C
+                // identifiers, so that silently broke a whole class of searches.
+                if terms.is_empty() || terms.iter().any(|t| lower.contains(t)) {
                     out.push((key, text));
                 }
             }
@@ -1021,12 +1028,26 @@ pub mod embedded {
             let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
 
             let path = "drivers/frobnicator/widget.c";
-            let src = "void a(void) { }\n\nvoid b(void) { }\n";
+            let src = "void a(int fd) { }\n\nvoid b(int mm) { }\n";
             let lang = projection::for_path(path);
             store.replace_file(&ingest::file(lang.as_ref(), path, src).unwrap()).unwrap();
 
             // "frobnicator" appears nowhere in the file's TEXT — only in its path.
             assert!(!src.contains("frobnicator"));
+            // A query of only SHORT tokens must still work. `fd`, `mm`, `sk`, `nr` are
+            // ordinary C identifiers, and a filter that needs a >2-char term to confirm
+            // a match would silently return nothing for every one of them.
+            // Upstream limit, pinned so it is not rediscovered as a mystery: helix's
+            // BM25 tokeniser drops any token of 2 characters or fewer, at index time and
+            // at query time alike (`bm25.rs`, `if SHOULD_FILTER && token.len() <= 2`).
+            // So `code_search` CANNOT find `fd`, `mm`, `sk`, `nr`, `id`, `rq` — a large
+            // share of C identifiers — however plainly they appear in the source. This
+            // is why `search_files` appends BM25 to its literal scan instead of replacing
+            // it: grep finds exactly the identifiers BM25 is blind to.
+            assert!(src.contains("fd") && src.contains("mm"));
+            assert!(store.code_search("fd", 16).unwrap().is_empty(), "≤2-char terms are dropped upstream");
+            assert!(!store.code_search("void", 16).unwrap().is_empty(), "longer terms are found");
+
             let hits = store.code_search("frobnicator", 16).unwrap();
             assert!(
                 hits.is_empty(),

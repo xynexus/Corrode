@@ -1069,7 +1069,21 @@ kernel-sized tree a query for `drm` would match millions of nodes on their paths
 and BM25's document lengths and IDF are skewed by path terms throughout.
 
 `code_search` now drops hits whose query terms appear only in the key, pinned by a test
-that also checks real content search still works. That removes the false hits and costs
+that also checks real content search still works.
+
+**Two limits found while writing that filter, both pinned by the same test.** The first
+version collected query terms longer than two characters and required one to appear in
+the node text — and `.any()` over an empty iterator is `false`, so a query made *only* of
+short tokens silently returned nothing. It now passes the hit through when no term is
+long enough to check, because a filter that cannot distinguish must not discard.
+
+The second is upstream and cannot be fixed here: helix's BM25 tokeniser drops any token
+of **two characters or fewer**, at index time and query time alike (`bm25.rs`,
+`if SHOULD_FILTER && token.len() <= 2`). So `code_search` structurally cannot find `fd`,
+`mm`, `sk`, `nr`, `id`, `rq` — a large share of C identifiers — however plainly they
+appear in the source. That is a good argument for the shape `search_files` already has:
+BM25 is **appended to** the literal scan rather than replacing it, and grep finds exactly
+the identifiers BM25 is blind to. That removes the false hits and costs
 nothing; it recovers none of the write time or storage those path terms cost. The real
 fix is field-selective indexing, which means forking the pinned engine — worth doing when
 kernel-scale ingest is actually needed, and not before.
