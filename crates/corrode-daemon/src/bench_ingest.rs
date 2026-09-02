@@ -577,3 +577,70 @@ mod store_scale {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// How much prose does the doc mapping actually connect, on a tree that has plenty?
+#[cfg(test)]
+mod doc_mapping {
+    use crate::projection::{archive, docmap, for_path};
+    use std::collections::BTreeSet;
+
+    #[test]
+    #[ignore = "probe: needs the kernel archive"]
+    fn map_kernel_docs_to_source_dirs() {
+        // Absolute, from the manifest dir: cargo runs tests with the PACKAGE as cwd, so
+        // a workspace-relative default resolves to nothing.
+        let archive_path = std::env::var("INGEST_ARCHIVE").unwrap_or_else(|_| {
+            format!("{}/../../fixtures/linux-7.2.2.tar.xz", env!("CARGO_MANIFEST_DIR"))
+        });
+        let path = std::path::Path::new(&archive_path);
+
+        // Pass 1: the repo's real directory set. Links are confirmed against this, so a
+        // path that merely looks plausible produces no edge.
+        let mut dirs: BTreeSet<String> = BTreeSet::new();
+        archive::for_each_file(path, |e| {
+            let mut p = e.path;
+            while let Some((d, _)) = p.rsplit_once('/') {
+                if !dirs.insert(d.to_string()) {
+                    break;
+                }
+                p = d;
+            }
+        })
+        .unwrap();
+
+        // Pass 2: the links themselves.
+        let (mut scanned, mut linked, mut edges, mut own_dir) = (0usize, 0usize, 0usize, 0usize);
+        let mut by_kind: std::collections::BTreeMap<&str, usize> = Default::default();
+        archive::for_each_file(path, |e| {
+            let name = e.path.rsplit('/').next().unwrap_or(e.path);
+            let is_prose = matches!(
+                name.rsplit_once('.').map(|(_, x)| x).unwrap_or(""),
+                "rst" | "txt" | "md"
+            );
+            let stem = name.split_once('.').map(|(s, _)| s).unwrap_or(name);
+            let is_cfg = matches!(stem, "Kconfig" | "Makefile" | "Kbuild" | "README");
+            if !is_prose && !is_cfg {
+                return;
+            }
+            scanned += 1;
+            let d = docmap::describes(e.path, e.text, &dirs);
+            if !d.is_empty() {
+                linked += 1;
+                edges += d.len();
+                *by_kind.entry(for_path(e.path).name()).or_default() += 1;
+                if is_cfg {
+                    own_dir += 1;
+                }
+            }
+        })
+        .unwrap();
+
+        eprintln!("\n{} directories in the tree", dirs.len());
+        eprintln!("  prose+config files scanned {scanned}");
+        eprintln!("  files linked to at least one dir {linked} ({:.0}%)", 100.0 * linked as f64 / scanned.max(1) as f64);
+        eprintln!("  describes edges {edges}");
+        eprintln!("  of which config/build files describing their own dir {own_dir}");
+        eprintln!("  linked files by backend: {by_kind:?}");
+        assert!(edges > 0, "the doc mapping produced no links at all");
+    }
+}

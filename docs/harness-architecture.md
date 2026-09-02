@@ -961,12 +961,69 @@ where it is assumed to be:
 | `Kconfig` (help blocks) | 1,916 |
 | `README*` | **89** (of 6,204 directories — 1.4%) |
 
-READMEs are not the kernel's mechanism. `Documentation/` is, and it **mirrors the source
-tree by subsystem** (`Documentation/networking/` ↔ `net/`), so the code↔prose mapping is
-derivable from paths rather than needing a model. Kconfig help is per-directory prose
-describing precisely what the code in that directory does. Neither is linked to anything
-today: `DocIngest` builds doc→chunk, `replace_file` builds file→code, and **no edge joins
-the two graphs**. There are no directory nodes at all.
+READMEs are not the kernel's mechanism. `Documentation/` is, and Kconfig help is
+per-directory prose describing precisely what the code in that directory does.
+
+#### Mapping them, without guessing
+
+The obvious mapping is directory-name matching — `Documentation/networking` → `net/`,
+`filesystems` → `fs/`. Measured, it is thin: nine top-level names match directly
+(`arch`, `block`, `mm`, `security`, `sound`…), three need aliases, and the rest are
+guides that map to nothing. It is also a *guess*, and a wrong edge points an agent at the
+wrong subsystem, which is worse than no edge.
+
+Two exact rules do better, both checked against the kernel before being written:
+
+- **A config/build/readme file describes its own directory.** 1,912 of the kernel's 1,916
+  `Kconfig` files live outside `Documentation/` — in the directory they document. No
+  inference at all.
+- **A prose file describes every source directory it NAMES**, confirmed against the
+  repo's real directory set so a plausible-looking path yields nothing.
+
+`projection::docmap` implements exactly those two and deliberately omits name matching.
+Over the whole kernel:
+
+```
+6,204 directories
+  prose + config files scanned              10,394
+  linked to at least one directory           6,610  (64%)
+  describes edges                           10,224
+  … config/build files describing own dir    5,412
+  linked by backend: hash 5,330  rst 1,164  none 47  c-family 61  markup 8
+```
+
+**10,224 derived edges, no table and no model.** The guard that makes this safe is that a
+citation must resolve against the tree's actual directories: `net/imaginary/thing.c`
+produces nothing, and `subnet/core` does not match the `net` root. Source files are not
+scanned at all — a C file's `#include` is not a claim to document that directory.
+
+Still true: nothing joins the two graphs at ingest time yet. `DocIngest` builds
+doc→chunk, `replace_file` builds file→code, and there are no directory nodes. `docmap`
+produces the edges; wiring them into a write is the remaining step.
+
+### Agent traces: summarise for retrieval, keep the reasoning
+
+Recorded before it is built, because the shape is already decided by what exists.
+
+An agent trace attached to the code it generated is **the same relation as a commit
+message attached to the nodes it changed** — a change, its rationale, and the text that
+moved. That relation is built (`Update::changed`), and `produced_by` edges from code
+nodes to tasks already exist in provenance. So this is not new machinery; it is the
+existing machinery pointed at the swarm's own output.
+
+The one design commitment worth making now: **a summary is an index, not a replacement.**
+Reasoning is the part that cannot be reconstructed — the alternatives rejected, the
+constraint discovered, the thing that looked right and was not — and it is exactly what a
+summary drops. The doc side already has the right pattern: `doc → has_chunk → chunk`,
+where chunks are embedded and the doc is intact. Traces take the same shape — trace node
+holds the full text, a summary node is what retrieval matches, an edge joins them — so a
+hit on the summary is one traversal from the reasoning that produced it.
+
+Two things this must not do, both already observed elsewhere in this document.
+Summarising at every-node granularity does not scale (the kernel has 11.5M code nodes;
+even at file granularity, note generation is an Opportunistic-band job, not a synchronous
+one). And a summary that is embedded while the trace is discarded is unrecoverable —
+unlike every other lossy step here, there is no verbatim copy to fall back to.
 
 ### Fidelity as project policy
 

@@ -36,6 +36,7 @@
 
 pub mod archive;
 pub mod c;
+pub mod docmap;
 pub mod rust;
 pub mod text;
 pub mod update;
