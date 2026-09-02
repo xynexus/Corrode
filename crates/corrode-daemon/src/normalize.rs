@@ -49,6 +49,9 @@ pub struct Report {
     pub failed: usize,
     /// A few names, so a failure is actionable rather than a count.
     pub examples: Vec<String>,
+    /// Per backend: (files, files with no formatter). A bare total hides that most of
+    /// a real tree — Makefiles, Kconfig, docs — has no formatter and never will.
+    pub by_language: std::collections::BTreeMap<&'static str, (usize, usize)>,
 }
 
 impl Report {
@@ -129,7 +132,10 @@ pub fn run(project: &Project, write: bool) -> anyhow::Result<Report> {
     let mut r = Report::default();
     for rel in &files {
         let lang = crate::projection::for_path(rel);
+        let entry = r.by_language.entry(lang.name()).or_default();
+        entry.0 += 1;
         let Some(cmd) = project.formatters.get(lang.name()) else {
+            entry.1 += 1;
             r.skipped += 1;
             continue;
         };
@@ -178,6 +184,10 @@ pub fn main(project: &Project, write: bool) -> bool {
     if !r.examples.is_empty() {
         eprintln!("  e.g. {}", r.examples.join(", "));
     }
+    eprintln!("\n  {:<10} {:>7} {:>14}", "backend", "files", "no formatter");
+    for (lang, (total, none)) in &r.by_language {
+        eprintln!("  {lang:<10} {total:>7} {none:>14}");
+    }
     if write && r.changed > 0 {
         eprintln!("\nreview and commit as one change; ingest stays byte-exact afterwards.");
     }
@@ -193,6 +203,25 @@ pub fn main(project: &Project, write: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nothing that is whitespace-significant or prose may acquire a default formatter.
+    ///
+    /// A Makefile's recipe lines are distinguished from continuations by a LEADING TAB;
+    /// a formatter that normalises indentation silently breaks the build, and the repo
+    /// still compiles for everyone who has not re-run make. Prose is worse in a quieter
+    /// way — reflowing a README is a diff on every line of every document for no gain.
+    /// These languages stay verbatim by construction, not by anyone remembering.
+    #[test]
+    fn tab_significant_and_prose_backends_have_no_default_formatter() {
+        let p = crate::project::Project::load(std::path::Path::new("/nonexistent"));
+        for lang in ["hash", "markup", "rst", "none", "dashdash", "semicolon"] {
+            assert!(
+                !p.formatters.contains_key(lang),
+                "{lang} must not have a default formatter: Makefiles are tab-significant \
+                 and prose reflow is a whole-repo diff for nothing"
+            );
+        }
+    }
 
     #[test]
     fn formatter_runs_over_stdin_and_substitutes_the_path() {

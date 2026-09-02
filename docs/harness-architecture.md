@@ -794,6 +794,41 @@ not exist yet.
 not do is let anyone delete the fidelity machinery — and it would have been easy to
 ship it believing otherwise.
 
+**And it can only ever cover the languages that have a formatter.** Per-backend census
+of curl's 4,472 tracked files:
+
+| backend | files | formatter |
+|---|---|---|
+| c | 1,026 | clang-format |
+| c-family (fallback) | 2,227 | none |
+| markup (930 `.md`) | 930 | none, deliberately |
+| hash (Makefiles, automake) | 271 | none, deliberately |
+| none / semicolon | 18 | none |
+
+**23% of the repo has a formatter.** The kernel's mix is the opposite way round (~78%
+C/Rust), so "normalise the repo" means very different amounts of coverage per project —
+but in both cases the verbatim path is what the remainder runs on, and cannot be
+removed. Prose and make fragments are excluded *by construction*, not by convention: a
+Makefile's recipe lines are distinguished by a leading TAB, so a formatter that
+normalises indentation breaks the build while the tree still compiles for anyone who
+has not re-run make. `tab_significant_and_prose_backends_have_no_default_formatter`
+pins it.
+
+Running the census found two wrong file-type mappings, in the same class as the four the
+kernel sweep found — and this time with a formatter behind them:
+
+- **`.inc` was claimed by the C backend.** All 12 `.inc` files in curl are `Makefile.inc`
+  and all 3 in the kernel are shell fragments: **0 of 15 is C**. Under `normalize` that
+  guess hands a tab-significant file to clang-format.
+- **Make fragments were matched by exact filename**, so `Makefile.inc`, `Makefile.am`
+  and `Kconfig.debug` all missed the hash backend and fell through to an extension
+  lookup. The kernel has 82 more `Makefile.*`. Matching is now on the dotted stem, and
+  `.am`/`.ac`/`.in`/`.inc` route to `hash`.
+
+Worth noting how they surfaced: not from reading the routing table, but from a
+per-backend breakdown printed by a tool built for something else. A bare total said
+"1,038 C files" and looked right.
+
 ### Result: the Linux kernel, streamed from its tarball
 
 94,750 files / 1,615 MB, ingested in **107.9 s** (15.0 MB/s, 878 files/s) **without

@@ -260,7 +260,7 @@ impl Language for C {
     }
 
     fn extensions(&self) -> &'static [&'static str] {
-        &["c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "inc", "dts", "dtsi", "dtso"]
+        &["c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "dts", "dtsi", "dtso"]
     }
 
     fn items(&self, src: &str) -> anyhow::Result<Vec<Span>> {

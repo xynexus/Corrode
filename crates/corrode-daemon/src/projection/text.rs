@@ -29,6 +29,18 @@ impl PlainText {
     /// to the C family would silently find no comments in thousands of files.
     pub fn for_filename(name: &str) -> Option<PlainText> {
         let base = name.rsplit('/').next().unwrap_or(name);
+        // Prefix, not equality: a make fragment is `Makefile.inc` / `Makefile.am` /
+        // `Kconfig.debug`, and an exact-name test sends every one of them to an
+        // extension lookup that has no idea what it is holding. In curl that put all 12
+        // `Makefile.inc` files on the C backend, where `normalize` would have handed a
+        // TAB-SIGNIFICANT file to clang-format; the kernel has 82 more `Makefile.*`.
+        // The suffix here is a real dotted extension, so `Makefile` still matches by
+        // equality below and `Makefilebackup` does not match at all.
+        if let Some(stem) = base.split_once('.').map(|(stem, _)| stem) {
+            if matches!(stem, "Makefile" | "makefile" | "GNUmakefile" | "Kbuild" | "Kconfig") {
+                return Some(PlainText { name: "hash", line: &["#"], block: None });
+            }
+        }
         // `Kbuild`, `config` and `defconfig` were measured landing on the C family in a
         // kernel sweep — 440 files whose `#` comments were invisible because the marker
         // guess was wrong, reported as "commentless" rather than as a bug.
@@ -45,7 +57,13 @@ impl PlainText {
         match ext {
             "py" | "rb" | "sh" | "bash" | "toml" | "yaml" | "yml" | "cfg" | "conf" | "mk"
             | "pl" | "pm" | "r" | "jl" | "tf" | "gitignore" | "dockerignore" | "service"
-            | "ini" | "properties" | "env" | "config" | "defconfig" | "kconfig" => {
+            | "ini" | "properties" | "env" | "config" | "defconfig" | "kconfig"
+            // autoconf/automake inputs, and the include fragment `.inc`. `.inc` was
+            // claimed by the C backend on the reasonable guess that it is an included
+            // header; measured, it is not one. Every `.inc` file in curl (12) is a
+            // Makefile and every one in the kernel (3) is a shell fragment — 0 of 15 is
+            // C, and the wrong guess was the one that led to a formatter.
+            | "am" | "ac" | "in" | "inc" => {
                 PlainText { name: "hash", line: &["#"], block: None }
             }
             "sql" | "hs" | "lua" | "elm" | "vhd" | "vhdl" | "adb" | "ads" => {
@@ -153,6 +171,29 @@ mod tests {
 
     /// Extensionless build files are the common case in a kernel tree, and defaulting
     /// them to C-family markers finds no comments at all.
+
+    /// Make fragments must never reach a C formatter.
+    ///
+    /// Measured, not supposed: all 12 `.inc` files in curl are `Makefile.inc` and all 3
+    /// in the kernel are shell fragments, so the C backend's claim on `.inc` was wrong
+    /// 15 times out of 15 — and `normalize` turns a wrong claim into clang-format
+    /// rewriting a file whose recipe lines are distinguished by a leading TAB.
+    #[test]
+    fn make_fragments_route_to_hash_not_to_c() {
+        for name in [
+            "Makefile", "Makefile.inc", "Makefile.am", "Makefile.in", "lib/Makefile.inc",
+            "Kbuild.include", "Kconfig.debug", "GNUmakefile.local",
+        ] {
+            let lang = crate::projection::for_path(name);
+            assert_eq!(lang.name(), "hash", "{name} must be a hash-comment file");
+        }
+        // A bare `.inc` with no Makefile stem is still not C.
+        assert_eq!(crate::projection::for_path("samples/script-ask.inc").name(), "hash");
+        // And the prefix rule must not swallow a genuine source file.
+        assert_eq!(crate::projection::for_path("src/main.c").name(), "c");
+        assert_eq!(crate::projection::for_path("Makefiles.c").name(), "c");
+    }
+
     #[test]
     fn extensionless_build_files_get_hash_comments() {
         for name in ["Makefile", "drivers/net/Kconfig", "Dockerfile", "CMakeLists.txt"] {
