@@ -243,11 +243,22 @@ impl Default for Dialects {
                     "*zaya*".to_string(),
                     ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::ZyphraXml, HashMap::new()),
                 ),
-                // Qwen emits Hermes-style `<tool_call>` JSON once tools are declared. It
-                // was doing so already and being ignored, which is how a capable model
-                // ended up answering from guesswork — see `ParseFormat::QwenToolCall`.
+                // Qwen3.5-9B emits its own `<tool_call>` blocks and they were being
+                // thrown away — see `ParseFormat::QwenToolCall`. Scoped to the ARTIFACT,
+                // not to `*qwen*`, because measuring the family showed the shape is a
+                // property of the build rather than the model line: of four served Qwen
+                // artifacts, 3.5-9B emits `<invoke>` XML, 3.6-35B emits
+                // `tool_name:/tool_args:` YAML, and 3.5-0.8b emits prose with no call at
+                // all. A family glob routed the other three natively and cost them their
+                // tools — the 0.8b hallucinated a file's contents rather than reading it,
+                // which is the exact failure native routing was meant to fix.
+                //
+                // Needle is the right default for the rest precisely because it is
+                // shape-agnostic: it builds the call from a plain-English line, so a new
+                // artifact's private format costs nothing. Add a rule here per artifact
+                // once its shape is verified, never per family.
                 (
-                    "*qwen*".to_string(),
+                    "*qwen3.5-9b*".to_string(),
                     ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::QwenToolCall, HashMap::new()),
                 ),
             ],
@@ -475,16 +486,22 @@ mod tests {
     }
 
     #[test]
-    fn qwen_models_emit_their_own_calls_by_default() {
-        // The regression this closes: a Qwen model was emitting <tool_call> blocks that
-        // nothing parsed, so the swarm answered repo questions by guessing.
+    fn native_routing_is_per_artifact_not_per_family() {
         let d = Dialects::default();
-        for id in ["Qwen3.5-9B--oq4.25++", "Qwen3.6--35B-A3B.oq4.25++", "qwen3.8-27b"] {
-            let dialect = d.resolve(id);
-            assert!(dialect.emits_own_calls(), "{id} should route natively");
-            assert_eq!(dialect.parse, ParseFormat::QwenToolCall);
+        // Verified live: this build emits `<tool_call>` blocks that were being discarded.
+        let nine_b = d.resolve("Qwen3.5-9B--oq4.25++");
+        assert!(nine_b.emits_own_calls());
+        assert_eq!(nine_b.parse, ParseFormat::QwenToolCall);
+
+        // The rest of the family must NOT be assumed to share it. Measured, they do not:
+        // the 35B emits `tool_name:/tool_args:` YAML and the 0.8b emits prose with no
+        // call at all, and routing them natively cost them their tools entirely.
+        for id in ["Qwen3.6--35B-A3B.oq4.25++", "Qwen3.8-27B--oq4.25++", "Qwen3.5--0.8b-oq4++"] {
+            assert!(
+                !d.resolve(id).emits_own_calls(),
+                "{id} was not verified to emit its own calls; Needle is shape-agnostic and safe"
+            );
         }
-        // Anything unrecognised still falls to the Needle default.
         assert!(!d.resolve("some-other-model").emits_own_calls());
     }
 

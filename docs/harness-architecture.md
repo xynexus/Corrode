@@ -1225,6 +1225,33 @@ The parser is deliberately forgiving — a malformed block does not discard the 
 ones beside it, and a reply truncated at the token cap still yields its last complete call
 — because every strictness here costs a tool call the model made correctly.
 
+#### The shape is a property of the artifact, not the model family
+
+Routing `*qwen*` natively was wrong, and testing the family rather than the one model
+showed it. Same prompt, same repo, one served artifact each:
+
+| artifact | emits | tool results |
+|---|---|---|
+| `Qwen3.5-9B--oq4.25++` | `<tool_call><invoke name=…>` XML | 1 |
+| `Qwen3.6--35B-A3B.oq4.25++` | `tool_name:` / `tool_args:` YAML | 0 |
+| `Qwen3.8-27B--oq4.25++` | — | 0 |
+| `Qwen3.5--0.8b-oq4++` | prose, no call at all | 0 |
+
+Three different shapes across four builds of one model line. The family glob routed the
+other three natively and **cost them their tools**: the 0.8b answered by inventing the
+contents of `src/lib.rs` rather than reading it, which is the precise failure native
+routing was added to fix, reintroduced one layer along. Narrowed to `*qwen3.5-9b*`, the
+0.8b goes back through Needle and gets a tool result again.
+
+So the rule is per artifact and never per family, and **Needle is the right default
+because it is shape-agnostic** — it builds the call from a plain-English line, so a new
+artifact's private format costs nothing. A native dialect is an optimisation that has to
+be measured for the exact build it names.
+
+For comparison, `MiniCPM5--1B.oq4.25++` on its own native dialect produced **12 tool
+results in 12 outputs** — when the shape is right, native routing is very good, which is
+what makes assuming it tempting.
+
 ### Notes from traces, and what happens to the wrong ones
 
 Cold-generated documentation measured badly (a 9B calling a `Waitfree_MPMC_Queue`
