@@ -1261,7 +1261,29 @@ a command makes something happen, and only the second can yield an observed find
 (Unknown tools count as outcome-producing, so a new mutating tool is not silently dropped
 by an out-of-date list.)
 
-**That fix is unvalidated, and the corpus is why.** The session used a shell for
+**Run against a real swarm turn.** The demo repo, a 9B, a live HelixDB store, both tool
+loops instrumented (only the Needle loop was, so a model on a native dialect wrote no
+notes at all — silently, since nothing reports notes it never tried to make):
+
+```
+trace: 1 note(s) from 2 step(s) — 0 observed, 1 asserted
+trace: 1 note(s) from 6 step(s) — 1 observed, 0 asserted
+persisted 2/2 notes, 4 edges; both readable back from file:src/lib.rs
+```
+
+The first run of that produced **4** notes, and two were the agent narrating its own
+tool-call formatting errors — "the previous tool call failed because I tried to use JSON
+syntax". Those pass the finding filter honestly (they contain "failed" and "because") and
+say nothing about the code. A `SELF_TALK` filter drops them, taking yield from 50% to 25%
+and leaving the two that are about the repository, including the one worth having:
+`is_prime` is O(n) with a TODO to make it O(sqrt n).
+
+The first store read returned **0 notes from a write that had happened** — the query asked
+for neighbours of provenance `code:` nodes, and notes attach to `file:{path}`. Nearly
+recorded as "persistence is broken". `record_trace` now reports what it wrote, so the next
+such gap is visible from the log rather than from a guess.
+
+**The transcript fix is unvalidated, and the corpus is why.** The session used a shell for
 everything — 1,139 of 1,761 steps map to `run_command`, including greps and file reads —
 so the split has almost nothing to separate here and the numbers are unchanged. In
 corrode's own toolset `read_file` and `search_files` are distinct tools and it would bite,
