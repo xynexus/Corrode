@@ -125,6 +125,23 @@ impl Daemon {
         let default_repo = canonical(&repo_root.to_string_lossy());
         // The default repo's resources come pre-built from `main` (or a test); seed
         // the registry so anonymous/default connections reuse them without reopening.
+        // Step 7f: with a store open and `CORRODE_VFS_GRAPH` set, reads are composed
+        // from graph nodes and fall through to the filesystem for anything the graph
+        // does not hold. Off by default, so the passthrough stays the behaviour nobody
+        // opted out of.
+        let vfs: Arc<dyn Vfs> = match (&graph, crate::graphvfs::enabled()) {
+            (Some(store), true) => {
+                eprintln!("vfs: graph-backed reads enabled (CORRODE_VFS_GRAPH)");
+                Arc::new(crate::graphvfs::GraphVfs::new(Arc::clone(store), vfs))
+            }
+            (None, true) => {
+                // Asking for it and silently not getting it is the failure mode worth
+                // avoiding: without a store there is nothing to compose from.
+                eprintln!("vfs: CORRODE_VFS_GRAPH set but no graph store is open; using the filesystem");
+                vfs
+            }
+            _ => vfs,
+        };
         let default_res = RepoResources {
             repo_root: default_repo.clone(),
             project: Arc::new(project),
@@ -381,6 +398,12 @@ impl Daemon {
                     let skill_scripts = Arc::clone(&session.skill_scripts);
                     let owner_token = session.owner_token.clone();
                     let sandbox = self.sandbox.clone();
+                    // The store gives `search_files` its soft half. `None` in the base
+                    // build, where search stays literal-only.
+                    let graph = session.graph.clone();
+                    // Cross-encoder reranking for graph hits, when CORRODE_RERANK_MODEL
+                    // names a served reranker. Same client the swarm generates through.
+                    let reranker = Some(Arc::clone(&client));
                     let dialects = Arc::clone(&self.dialects);
                     let telemetry = Arc::clone(&self.telemetry);
                     let telemetry_plan = plan_id.clone();
@@ -404,6 +427,8 @@ impl Daemon {
                         let mut artifacts = Vec::new();
                         let toolbox = ToolBox::new(vfs, root, skill_scripts)
                             .with_sandbox(sandbox)
+                            .with_graph(graph)
+                            .with_reranker(reranker)
                             .with_owner_token(owner_token);
                         let started = std::time::Instant::now();
                         let output = if role == Role::Coder && fanout > 1 {
@@ -539,6 +564,11 @@ impl Daemon {
                 // graph store, so the code<->task<->plan lineage is queryable — and
                 // ship it to the graph explorer.
                 self.persist_provenance(session, &graph);
+                // Re-ingest what the turn wrote. Staleness is the one real cost of
+                // indexing code — a stale index is confidently wrong where reading
+                // files is merely slow — so the index is refreshed at the moment the
+                // truth changes, using the written paths provenance already collects.
+                self.ingest_written(session, &graph).await;
                 let prov = graph.provenance();
                 let nodes = prov
                     .nodes
@@ -747,6 +777,110 @@ impl Daemon {
             }];
         }
         Ok((plan, prefix))
+    }
+
+    /// Re-ingest every file this turn wrote into the code graph.
+    ///
+    /// Only files the swarm actually changed: a full re-scan would be wasteful and,
+    /// worse, would hide which nodes a turn is responsible for. Best-effort like
+    /// provenance — a store that cannot take the write logs once and stops, because
+    /// losing an index refresh must never fail the work that produced it.
+    ///
+    /// Every written path is ingested, whatever the language: a backend exists for Rust
+    /// and a byte-exact fallback for everything else, so an unfamiliar codebase is
+    /// absorbed with less structure rather than not at all.
+    async fn ingest_written(&self, session: &Session, graph: &plan_graph::PlanGraph) {
+        let Some(store) = &session.graph else {
+            return;
+        };
+        let mut seen: std::collections::BTreeSet<&str> = Default::default();
+        let mut failed = 0usize;
+        // The repo's real directory set, so `docmap` can confirm a cited path exists
+        // rather than inventing an edge to a directory nobody has. Computed once per
+        // turn: a doc naming twenty subsystems must not cost twenty walks.
+        let known_dirs: std::collections::BTreeSet<String> = session
+            .vfs
+            .tracked_files()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|p| {
+                let mut acc = Vec::new();
+                let mut cur = p.as_str();
+                while let Some((d, _)) = cur.rsplit_once('/') {
+                    acc.push(d.to_string());
+                    cur = d;
+                }
+                acc
+            })
+            .collect();
+        for node in &graph.provenance().nodes {
+            // Code nodes are `{plan}:code:{path}`; match on the kind rather than
+            // reaching for the plan id, which the graph keeps private.
+            if node.kind != plan_graph::NodeKind::Code {
+                continue;
+            }
+            let Some(path) = node.id.rsplit(":code:").next() else {
+                continue;
+            };
+            if !seen.insert(path) {
+                continue;
+            }
+            let Ok(bytes) = session.vfs.read(path).await else {
+                continue; // written then removed, or outside the VFS
+            };
+            let Ok(src) = String::from_utf8(bytes) else {
+                continue;
+            };
+            // Backend chosen per path: Rust gets syn, anything else falls back to the
+            // plain-text projector, which still ingests and projects byte-exactly with
+            // less structure. Absorbing an unfamiliar codebase is never blocked.
+            let lang = crate::projection::for_path(path);
+            // Reconcile against what the store already holds, rather than re-scanning
+            // from scratch. A fresh scan renumbers the file end to end, and since ids
+            // derive from the order key that re-addresses every node for a one-line
+            // change — the churn the sparse key exists to prevent. `stored` is empty for
+            // a file the graph has not seen, which is exactly a first ingest.
+            let stored = store.file_nodes(path).unwrap_or_default();
+            let Ok((fw, update)) = crate::projection::ingest::file_against(lang.as_ref(), path, &src, &stored)
+            else {
+                continue; // unparseable mid-edit: leave the previous nodes in place
+            };
+            if !update.changed.is_empty() || update.rebalanced {
+                eprintln!(
+                    "code ingest {path}: {} changed, {} cosmetic{}",
+                    update.changed.len(),
+                    update.cosmetic,
+                    if update.rebalanced { ", rebalanced" } else { "" }
+                );
+            }
+            if let Err(e) = store.replace_file(&fw) {
+                // Continue, do not abort the turn. One unwritable file must not stop
+                // every later file from being indexed: measured on curl, 5 of 2,995
+                // files contain a token longer than LMDB's 511-byte max key, which the
+                // BM25 index rejects (`MDB_BAD_VALSIZE`) — a base64 blob on one line is
+                // enough. Returning here let one such file silently cost the whole
+                // turn's code ingest.
+                failed += 1;
+                if failed <= 3 {
+                    eprintln!("code ingest failed for {path}: {e}");
+                }
+                continue;
+            }
+            // Join the graphs: place the file in its directory, and link it to whatever
+            // it documents. A README or design note written by a task becomes reachable
+            // from the code it describes, which is the whole point of ingesting prose
+            // into the same store as source.
+            let describes = crate::projection::docmap::describes(path, &src, &known_dirs);
+            if let Err(e) = store.place_file(path, &describes) {
+                if failed < 3 {
+                    eprintln!("placing {path} failed: {e}");
+                }
+            }
+        }
+        if failed > 3 {
+            eprintln!("code ingest: {failed} files failed in total");
+        }
     }
 
     /// Persist a plan's provenance subgraph to the graph store, if one is open.
@@ -1436,6 +1570,17 @@ async fn run_tool_loop(
     let dialect = dialects.resolve(caller.model_id());
     let schema = dialect.render(crate::tools::role_tools(role), None);
     let mut scratchpad = String::new();
+    // The trace, kept as the loop already separates it: what the model said, and what a
+    // tool returned. `trace::extract` needs no parsing of the scratchpad because the two
+    // are never merged here in the first place.
+    let mut steps: Vec<crate::trace::Step> = Vec::new();
+    // Paths the task touched, taken from the STRUCTURED call rather than parsed out of
+    // the model's prose — a note bound to a path guessed from English would attach real
+    // findings to the wrong file.
+    let mut touched: Vec<String> = Vec::new();
+    // Canonical tool name of the turn's call, so extraction can tell an outcome from
+    // content without re-reading the model's prose.
+    let mut called: Option<String> = None;
     let mut last = String::new();
     for _ in 0..MAX_TOOL_STEPS {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
@@ -1461,6 +1606,14 @@ async fn run_tool_loop(
         last = text.clone();
 
         let Some(intent) = crate::tools::parse_tool_intent(&text) else {
+            // Final turn: it called nothing, so it contributes claims only.
+            steps.push(crate::trace::Step {
+                said: text.clone(),
+                intent: None,
+                tool: None,
+                observation: None,
+            });
+            record_trace(&toolbox, task, &steps, &touched);
             return Ok(text); // no TOOL: line -> this turn is the final answer
         };
 
@@ -1474,6 +1627,12 @@ async fn run_tool_loop(
         let observation = match raw.map(|r| r.and_then(|raw| dialect.parse(&raw))) {
             Ok(Ok(calls)) => match calls.first() {
                 Some(c) => {
+                    called = Some(c.name.clone());
+                    if let Some(p) = crate::tools::arg_str(c, "path") {
+                        if !touched.iter().any(|t| t == p) {
+                            touched.push(p.to_string());
+                        }
+                    }
                     gate_and_execute(
                         c, &toolbox, approvals, events, id, written, seen, read_only,
                     )
@@ -1484,10 +1643,79 @@ async fn run_tool_loop(
             Ok(Err(e)) => format!("error: tool-call construction failed: {e}"),
             Err(e) => format!("error: tool-call thread panicked: {e}"),
         };
+        steps.push(crate::trace::Step {
+            said: text.clone(),
+            intent: Some(intent.clone()),
+            tool: called.clone(),
+            observation: Some(observation.clone()),
+        });
         scratchpad.push_str(&format!("\nTOOL: {intent}\nRESULT: {observation}\n"));
     }
     // Step budget spent: hand back the last turn as the answer.
+    record_trace(&toolbox, task, &steps, &touched);
     Ok(last)
+}
+
+/// Extract a task's notes and persist them.
+///
+/// No new store method: a note is `upsert_node` and each edge is `add_edge`, both already
+/// on `GraphStore`. Notes are append-only — a correction arrives as a new note plus a
+/// `supersedes` edge, never as an edit — so nothing here removes or rewrites what an
+/// earlier task recorded, however wrong it turns out to be.
+fn record_trace(toolbox: &ToolBox, task: &str, steps: &[crate::trace::Step], touched: &[String]) {
+    use crate::trace::NoteKind;
+    let notes = crate::trace::extract(task, steps);
+    if notes.is_empty() {
+        return;
+    }
+    let observed = notes.iter().filter(|n| n.kind == NoteKind::Observed).count();
+    eprintln!(
+        "trace: {} note(s) from {} step(s) — {observed} observed, {} asserted, {} path(s)",
+        notes.len(),
+        steps.len(),
+        notes.len() - observed,
+        touched.len()
+    );
+
+    let Some(store) = toolbox.graph() else {
+        return; // no store (base build): extraction still runs and reports.
+    };
+    // The task must exist as a node before an edge can name it.
+    if let Err(e) = store.upsert_node(task, "task", task) {
+        eprintln!("trace: cannot record task node ({e}); notes not persisted");
+        return;
+    }
+    for n in &notes {
+        // `kind` carries the provenance, so a reader can weigh a tool result against a
+        // claim rather than the store flattening both into "a note".
+        if let Err(e) = store.upsert_node(&n.id(), n.kind.as_str(), &n.text) {
+            eprintln!("trace: note {} failed ({e})", n.id());
+            continue;
+        }
+        let _ = store.add_edge(&n.id(), "noted_by", task);
+        for path in touched {
+            // Bound to the file, not to a node inside it: a finding like "this loader is
+            // never called" is about the file's role, and binding it to whichever node
+            // happened to be read would be a precision the trace does not have.
+            let _ = store.add_edge(&n.id(), "about", &format!("file:{path}"));
+        }
+    }
+
+    // Supersede prior notes on the same files. The claim is ordering — this note was
+    // written with more of the trace behind it — not correctness.
+    let prior: Vec<String> = touched
+        .iter()
+        .filter_map(|p| store.neighbors(&format!("file:{p}")).ok())
+        .flatten()
+        .filter(|n| n.kind == "observed" || n.kind == "asserted")
+        .map(|n| n.id)
+        .filter(|id| !id.starts_with(&format!("note:{task}#")))
+        .collect();
+    for (from, rel, to) in crate::trace::note_edges(&notes, task, &prior) {
+        if rel == "supersedes" {
+            let _ = store.add_edge(&from, rel, &to);
+        }
+    }
 }
 
 /// One full execution of a task: pick the capability path and run it.

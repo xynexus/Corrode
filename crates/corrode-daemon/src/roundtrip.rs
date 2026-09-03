@@ -1,406 +1,286 @@
-//! Projection fidelity: can a file be reconstructed from the nodes that represent it?
+//! Measurements of the projection, kept separate from the projection itself.
 //!
-//! `graph-model.md` makes a load-bearing claim — files are a *projection* of the graph,
-//! not the other way round — and `ProjectionMode::Composed` is what that claim looks
-//! like when it holds. Everything above it depends on it: a graph-backed VFS, deriving
-//! line numbers instead of storing them, and the argument that we avoid the line-level
-//! failures a Tree-Sitter index pays for (`harness-architecture.md` §10).
-//!
-//! Nothing had ever tested it. This is the cheapest test that can falsify it.
-//!
-//! # What this tier measures, and what it does not
-//!
-//! Byte-exact composition needs two things to hold. This module tests the first:
-//!
-//! 1. **Decomposition is total** — the item spans account for every byte of the file,
-//!    so reassembling them reproduces it exactly. If some bytes belong to no node, the
-//!    node model cannot represent the file and no amount of clever regeneration fixes
-//!    it.
-//! 2. **Regeneration is exact** — an item rendered back from its structured form is
-//!    byte-identical to its source. That is where `RustfmtSkip`, `MacroExpansion` and
-//!    `RawStringMismatch` live, and it needs a real parser + printer (`syn` +
-//!    `prettyplease`), which the workspace does not depend on. Tier 2, not here.
-//!
-//! Tier 1 is the *necessary* condition, so it is the one worth having first: if the
-//! byte census shows unclaimed regions, tier 2 is moot.
-//!
-//! # Honesty rule
-//!
-//! The scanner is a brace/string/comment-aware splitter, not a parser. When it cannot
-//! confidently find a boundary it reports [`Fidelity::Unscannable`] rather than
-//! guessing. A check that says "I could not read this" is useful; one that silently
-//! mis-splits is the failure mode this whole exercise exists to avoid.
+//! These verify the load-bearing claims in `harness-architecture.md` §8 and print the
+//! censuses behind them. They live here rather than in `projection/` because their
+//! corpora are whole repositories and their job is to *measure* the projection rather
+//! than perform it — `CORRODE_SCAN_REPO` points them at any repo.
 
-/// Where a file's bytes went when split into top-level items.
-#[derive(Debug, PartialEq)]
-pub struct Census {
-    /// Bytes inside a top-level item span.
-    pub item_bytes: usize,
-    /// Bytes between items — blank lines, free-standing comments, inner attributes.
-    /// A node model made only of items cannot reproduce these.
-    pub gap_bytes: usize,
-    /// Number of top-level items found.
-    pub items: usize,
-    /// Reassembling spans + gaps reproduced the input exactly. This is the tier-1
-    /// round trip; it fails only if the scanner loses or duplicates bytes.
-    pub exact: bool,
-    /// What the gap bytes actually are, so the schema knows what it must carry.
-    pub gap_kinds: GapKinds,
+use crate::projection::{self, ingest, regenerate, scan, Language};
+
+/// The end-to-end claim: a repository decomposes into nodes and reassembles byte-for-
+/// byte. Runs whatever backend each path selects, so it covers the fallback too.
+/// Per-backend outcome for one repository.
+#[cfg(test)]
+#[derive(Default)]
+struct Census {
+    files: usize,
+    exact: usize,
+    mismatched: usize,
+    nodes: usize,
+    comments: usize,
+    bound: usize,
 }
 
-#[derive(Debug, Default, PartialEq)]
-pub struct GapKinds {
-    pub blank: usize,
-    pub comment: usize,
-    pub attribute: usize,
-    pub other: usize,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Fidelity {
-    Scanned(Census),
-    /// The scanner hit something it cannot bound confidently.
-    Unscannable(&'static str),
-}
-
-/// Split `src` at top-level item boundaries and account for every byte.
+/// Ingest every tracked file and report what happened, by language.
 ///
-/// "Top-level item" is approximated as: a run of source at brace depth 0 ending at the
-/// `}` that closes a depth-1 block, or at a `;` at depth 0. That covers `fn`, `struct`,
-/// `impl`, `mod`, `use`, `const`, and macro invocations with braces or a trailing `;`.
-pub fn census(src: &str) -> Fidelity {
-    let b = src.as_bytes();
-    let mut i = 0usize;
-    let mut depth: i32 = 0;
-    let mut item_start: Option<usize> = None;
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    // An item begins after the previous one ends. Deriving the start from the file
-    // origin instead made consecutive items resolve to the same offset — every span
-    // after the first then overlapped, which is what the first run of this check
-    // actually found (a defect here, not a fact about Rust).
-    let mut prev_end = 0usize;
+/// The breakdown matters more than the total on a mixed repo: a fallback that quietly
+/// swallows half a tree looks identical to full coverage if you only count round trips.
+#[cfg(test)]
+fn scan_repo(repo: &str) -> (std::collections::BTreeMap<&'static str, Census>, usize, usize) {
+    use std::collections::BTreeMap;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "-s", "-z"])
+        .output()
+        .expect("git ls-files");
+    let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter_map(|r| {
+            let (m, p) = r.split_once('\t')?;
+            matches!(m.split_whitespace().next()?, "100644" | "100755").then(|| p.to_string())
+        })
+        .collect();
 
-    while i < b.len() {
-        match b[i] {
-            // Comments: skip whole, so braces and quotes inside cannot mislead.
-            b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
+    let mut by_lang: BTreeMap<&'static str, Census> = BTreeMap::new();
+    // Files skipped for reasons that are NOT the projection's fault, counted rather
+    // than silently dropped: a kernel tree has latin-1 sources and binaries, and
+    // "skipped 9000" reads very differently from "byte-exact 100%".
+    let (mut unreadable, mut ingest_failed) = (0usize, 0usize);
+
+    for rel in &files {
+        let path = std::path::Path::new(repo).join(rel);
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            unreadable += 1; // binary, or not UTF-8
+            continue;
+        };
+        let lang = projection::for_path(rel);
+        let name = lang.name();
+        let e = by_lang.entry(name).or_default();
+        e.files += 1;
+        match ingest::file(lang.as_ref(), rel, &src) {
+            Err(_) => {
+                ingest_failed += 1;
+                e.files -= 1;
             }
-            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
-                let mut nest = 1;
-                i += 2;
-                while i + 1 < b.len() && nest > 0 {
-                    if b[i] == b'/' && b[i + 1] == b'*' {
-                        nest += 1;
-                        i += 2;
-                    } else if b[i] == b'*' && b[i + 1] == b'/' {
-                        nest -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
+            Ok(fw) => {
+                if ingest::project(&fw) == src {
+                    e.exact += 1;
+                } else {
+                    e.mismatched += 1;
+                    if e.mismatched <= 3 {
+                        eprintln!("  MISMATCH [{name}] {rel}");
                     }
                 }
-                if nest > 0 {
-                    return Fidelity::Unscannable("unterminated block comment");
-                }
-                continue;
+                e.nodes += fw.code.len();
+                e.comments += fw.comments.len();
+                e.bound += fw.comments.iter().filter(|c| c.describes_kind.is_some()).count();
             }
-            // Raw strings: r"..", r#".."#, br#".."# — the hash count sets the terminator.
-            b'r' | b'b' if raw_string_start(b, i).is_some() => {
-                let Some((body, hashes)) = raw_string_start(b, i) else {
-                    return Fidelity::Unscannable("raw string");
-                };
-                match raw_string_end(b, body, hashes) {
-                    Some(e) => {
-                        i = e;
-                        continue;
-                    }
-                    None => return Fidelity::Unscannable("unterminated raw string"),
-                }
-            }
-            b'"' => match plain_string_end(b, i) {
-                Some(e) => {
-                    i = e;
-                    continue;
-                }
-                None => return Fidelity::Unscannable("unterminated string"),
-            },
-            // Char literal or lifetime — `'a` is not a string, `'x'` is.
-            b'\'' => {
-                i = char_or_lifetime_end(b, i);
-                continue;
-            }
-            b'{' => {
-                if depth == 0 && item_start.is_none() {
-                    item_start = Some(item_start_after(b, prev_end));
-                }
-                depth += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth < 0 {
-                    return Fidelity::Unscannable("unbalanced closing brace");
-                }
-                if depth == 0 {
-                    if let Some(s) = item_start.take() {
-                        spans.push((s, i + 1));
-                        prev_end = i + 1;
-                    }
-                }
-            }
-            b';' if depth == 0 => {
-                // `use x;`, `const A: u8 = 1;`, `mac!();` — an item with no block.
-                let s = item_start.take().unwrap_or_else(|| item_start_after(b, prev_end));
-                spans.push((s, i + 1));
-                prev_end = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    if depth != 0 {
-        return Fidelity::Unscannable("unbalanced braces at EOF");
-    }
-
-    // Account for every byte: spans, plus the gaps between them.
-    let mut item_bytes = 0usize;
-    let mut gaps: Vec<(usize, usize)> = Vec::new();
-    let mut cursor = 0usize;
-    for (s, e) in &spans {
-        if *s < cursor {
-            return Fidelity::Unscannable("overlapping item spans");
-        }
-        if *s > cursor {
-            gaps.push((cursor, *s));
-        }
-        item_bytes += e - s;
-        cursor = *e;
-    }
-    if cursor < b.len() {
-        gaps.push((cursor, b.len()));
-    }
-
-    // The tier-1 round trip: spans + gaps, in order, must rebuild the input.
-    let mut rebuilt = String::with_capacity(src.len());
-    let mut all: Vec<(usize, usize)> = spans.iter().copied().chain(gaps.iter().copied()).collect();
-    all.sort();
-    for (s, e) in &all {
-        rebuilt.push_str(&src[*s..*e]);
-    }
-
-    let mut kinds = GapKinds::default();
-    let mut gap_bytes = 0usize;
-    for (s, e) in &gaps {
-        let text = &src[*s..*e];
-        gap_bytes += e - s;
-        let t = text.trim();
-        if t.is_empty() {
-            kinds.blank += e - s;
-        } else if t.lines().all(|l| {
-            let l = l.trim();
-            l.is_empty() || l.starts_with("//")
-        }) {
-            kinds.comment += e - s;
-        } else if t.starts_with("#!") || t.starts_with("#[") {
-            kinds.attribute += e - s;
-        } else {
-            kinds.other += e - s;
         }
     }
-
-    Fidelity::Scanned(Census {
-        item_bytes,
-        gap_bytes,
-        items: spans.len(),
-        exact: rebuilt == src,
-        gap_kinds: kinds,
-    })
+    (by_lang, unreadable, ingest_failed)
 }
 
-/// Where the next item begins, given where the previous one ended: the first
-/// non-whitespace byte at or after `prev_end`. Monotonic by construction, so spans
-/// cannot overlap. Doc comments and attributes preceding an item fall INSIDE its span,
-/// which is correct — they belong to the item they document.
-fn item_start_after(b: &[u8], prev_end: usize) -> usize {
-    let mut j = prev_end;
-    while j < b.len() && b[j].is_ascii_whitespace() {
-        j += 1;
-    }
-    j
-}
-
-pub(super) fn raw_string_start(b: &[u8], i: usize) -> Option<(usize, usize)> {
-    let mut j = i;
-    if b[j] == b'b' {
-        j += 1;
-    }
-    if j >= b.len() || b[j] != b'r' {
-        return None;
-    }
-    j += 1;
-    let mut hashes = 0usize;
-    while j < b.len() && b[j] == b'#' {
-        hashes += 1;
-        j += 1;
-    }
-    if j < b.len() && b[j] == b'"' {
-        Some((j + 1, hashes))
-    } else {
-        None
-    }
-}
-
-pub(super) fn raw_string_end(b: &[u8], body: usize, hashes: usize) -> Option<usize> {
-    let mut j = body;
-    while j < b.len() {
-        if b[j] == b'"' && b[j + 1..].iter().take(hashes).all(|c| *c == b'#') && j + hashes < b.len()
-        {
-            return Some(j + 1 + hashes);
+/// Which extensions are landing on the fallback, biggest first — the worklist for
+/// deciding which backend to write next.
+#[cfg(test)]
+fn fallback_extensions(repo: &str) -> Vec<(String, usize)> {
+    use std::collections::BTreeMap;
+    let out = std::process::Command::new("git")
+        .arg("-C").arg(repo).args(["ls-files", "-z"]).output().expect("git");
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for rel in String::from_utf8_lossy(&out.stdout).split('\0').filter(|s| !s.is_empty()) {
+        let lang = projection::for_path(rel);
+        if lang.name() == "rust" {
+            continue;
         }
-        j += 1;
+        let ext = rel.rsplit('/').next().unwrap_or(rel);
+        let ext = ext.rsplit_once('.').map(|(_, e)| e.to_string()).unwrap_or_else(|| "(none)".into());
+        *counts.entry(ext).or_default() += 1;
     }
-    None
-}
-
-pub(super) fn plain_string_end(b: &[u8], i: usize) -> Option<usize> {
-    let mut j = i + 1;
-    while j < b.len() {
-        match b[j] {
-            b'\\' => j += 2,
-            b'"' => return Some(j + 1),
-            _ => j += 1,
-        }
-    }
-    None
-}
-
-/// `'a` (lifetime) vs `'x'` / `'\n'` (char). Returns the index just past it.
-fn char_or_lifetime_end(b: &[u8], i: usize) -> usize {
-    if i + 2 < b.len() && b[i + 1] == b'\\' {
-        let mut j = i + 2;
-        while j < b.len() && b[j] != b'\'' {
-            j += 1;
-        }
-        return j + 1;
-    }
-    if i + 2 < b.len() && b[i + 2] == b'\'' {
-        return i + 3; // 'x'
-    }
-    i + 1 // lifetime
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    v
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn scanned(src: &str) -> Census {
-        match census(src) {
-            Fidelity::Scanned(c) => c,
-            Fidelity::Unscannable(why) => panic!("unscannable: {why}"),
+    /// Every tracked file in a repo, whatever its language, projects back exactly.
+    ///
+    /// `CORRODE_SCAN_REPO=/path/to/repo` points it at anything.
+    #[test]
+    fn a_repository_round_trips() {
+        let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let (by_lang, unreadable, failed) = scan_repo(&repo);
+
+        eprintln!("--- ingest census: {repo} ---");
+        eprintln!(
+            "  {:<12} {:>7} {:>8} {:>7} {:>8} {:>9} {:>7}",
+            "backend", "files", "exact", "MISM", "nodes", "comments", "bound"
+        );
+        let (mut tf, mut te, mut tm) = (0usize, 0usize, 0usize);
+        for (name, c) in &by_lang {
+            eprintln!(
+                "  {:<12} {:>7} {:>8} {:>7} {:>8} {:>9} {:>7}",
+                name, c.files, c.exact, c.mismatched, c.nodes, c.comments, c.bound
+            );
+            tf += c.files;
+            te += c.exact;
+            tm += c.mismatched;
         }
+        eprintln!("  {:<12} {:>7} {:>8} {:>7}", "TOTAL", tf, te, tm);
+        eprintln!("  skipped: {unreadable} unreadable/non-UTF-8, {failed} ingest errors");
+
+        let fb = fallback_extensions(&repo);
+        if !fb.is_empty() {
+            eprintln!("  top extensions without a backend:");
+            for (ext, n) in fb.iter().take(8) {
+                eprintln!("    .{ext:<10} {n}");
+            }
+        }
+
+        assert!(tf > 0, "nothing scanned");
+        assert_eq!(tm, 0, "projection was not byte-exact");
     }
 
+    /// Positions are an OUTPUT of projection, never node state: a byte offset is a fact
+    /// about one source text, and a generated VFS has none.
+    ///
+    /// Also the point of the sparse key: inserting a node touches ONE key, and every
+    /// existing node keeps its own — so identity survives the edit.
     #[test]
-    fn every_byte_is_accounted_for() {
-        let c = scanned("use a::b;\n\nfn f() {}\n");
-        assert!(c.exact, "spans + gaps must rebuild the input");
-        assert_eq!(c.items, 2, "`use ...;` and `fn f() {{}}`");
+    fn positions_are_recomputed_and_inserting_touches_one_key() {
+        let lang = projection::rust::Rust;
+        let src = "use a::b;\n\nfn one() {}\n\nfn two() {}\n";
+        let nodes = scan(&lang, "t.rs", src).unwrap();
+        let (text, places) = projection::project(&nodes);
+        assert_eq!(text, src);
+
+        let two = nodes.iter().find(|n| n.text.contains("fn two")).unwrap().clone();
+        let before_line = places.iter().find(|p| p.order == two.order).unwrap().start_line;
+
+        // Insert ahead of everything: one new key between the file start and the first
+        // node. No existing key changes — with a dense index every one of them would.
+        let first = nodes.iter().map(|n| n.order).min().unwrap();
+        let key = projection::order_between(0, first).expect("stride leaves room");
+        let mut mutated = nodes.clone();
+        mutated.push(projection::Node {
+            path: "t.rs".into(),
+            order: key,
+            kind: "use",
+            text: "use inserted::thing;\n\n".into(),
+        });
+
+        assert!(
+            nodes.iter().all(|n| mutated.iter().any(|m| m.order == n.order && m.text == n.text)),
+            "no existing node was renumbered"
+        );
+        let (_, after) = projection::project(&mutated);
+        let now = after.iter().find(|p| p.order == two.order).unwrap().start_line;
+        assert_eq!(now, before_line + 2, "projection reports the shifted line");
     }
 
-    /// Braces and quotes inside strings, raw strings and comments must not move an
-    /// item boundary — these are what a naive scanner gets wrong.
+    /// The key is deterministic: the same file ingests to the same graph. A random key
+    /// would be equally sparse and would break diffing, caching and content-addressing.
     #[test]
-    fn braces_inside_literals_and_comments_do_not_split_items() {
+    fn ingest_is_reproducible() {
+        let lang = projection::rust::Rust;
+        let src = "fn a() {}\n\nfn b() {}\n";
+        let one = scan(&lang, "t.rs", src).unwrap();
+        let two = scan(&lang, "t.rs", src).unwrap();
+        assert_eq!(one, two, "same input, same keys");
+        assert_eq!(one[0].order, projection::ORDER_STRIDE, "keys start at one stride");
+        assert_eq!(one[1].order, 2 * projection::ORDER_STRIDE);
+    }
+
+    /// Exhaustion is recoverable, not terminal: rebalance restores the stride.
+    #[test]
+    fn an_exhausted_gap_rebalances() {
+        assert_eq!(projection::order_between(0, 2), Some(1));
+        assert_eq!(projection::order_between(4, 5), None, "adjacent keys have no room");
+
+        let mut nodes: Vec<projection::Node> = [5u64, 6, 7]
+            .iter()
+            .map(|o| projection::Node {
+                path: "t.rs".into(),
+                order: *o,
+                kind: "fn",
+                text: format!("fn f{o}() {{}}\n"),
+            })
+            .collect();
+        let before = projection::regenerate(&nodes);
+        projection::rebalance(&mut nodes);
+        assert_eq!(nodes[0].order, projection::ORDER_STRIDE);
+        assert_eq!(nodes[1].order, 2 * projection::ORDER_STRIDE);
+        assert!(
+            projection::order_between(nodes[0].order, nodes[1].order).is_some(),
+            "room restored"
+        );
+        assert_eq!(projection::regenerate(&nodes), before, "order preserved");
+    }
+
+    /// Braces and quotes inside literals and comments must not move a boundary.
+    #[test]
+    fn literals_do_not_confuse_the_rust_backend() {
+        let lang = projection::rust::Rust;
         for src in [
             "fn f() { let s = \"}{\"; }\n",
-            "fn f() { let s = r#\"}{ \"quoted\" \"#; }\n",
+            "fn f() { let s = r#\"}{ \"q\" \"#; }\n",
             "fn f() { /* } { */ }\n",
             "fn f() { let c = '}'; }\n",
             "fn f<'a>(x: &'a str) -> &'a str { x }\n",
         ] {
-            let c = scanned(src);
-            assert!(c.exact, "round trip failed: {src:?}");
-            assert_eq!(c.items, 1, "one item expected in {src:?}");
+            let nodes = scan(&lang, "t.rs", src).unwrap();
+            assert_eq!(regenerate(&nodes), src, "round trip: {src:?}");
+            assert_eq!(
+                nodes.iter().filter(|n| n.kind == "fn").count(),
+                1,
+                "one item: {src:?}"
+            );
         }
     }
 
+    /// A language with no backend is still absorbed: byte-exact, less structure.
     #[test]
-    fn unterminated_input_is_reported_not_guessed() {
-        assert!(matches!(census("fn f() {\n"), Fidelity::Unscannable(_)));
-        assert!(matches!(census("let s = \"oops\n"), Fidelity::Unscannable(_)));
+    fn an_unknown_language_degrades_without_losing_fidelity() {
+        let src = "# a python comment\ndef f():\n    return 1  # trailing\n";
+        let lang = projection::for_path("s.py");
+        assert_eq!(lang.name(), "hash", "hash-comment family selected");
+        let fw = ingest::file(lang.as_ref(), "s.py", src).unwrap();
+
+        assert_eq!(ingest::project(&fw), src, "fidelity is not language-dependent");
+        assert_eq!(fw.code.len(), 1, "no grammar -> one node for the file");
+        assert_eq!(fw.comments.len(), 2, "comments still recovered");
+        assert!(
+            fw.comments.iter().all(|c| c.describes_kind.is_none()),
+            "no anchors without a grammar — reported, not guessed"
+        );
     }
 
-    /// The load-bearing measurement: over this crate's real sources, how many bytes
-    /// belong to no item? Those are bytes an item-only node model cannot reproduce,
-    /// and they decide whether `ProjectionMode::Composed` is reachable at all.
-    ///
-    /// Asserts only the round trip. The census is PRINTED rather than thresholded —
-    /// a number nobody has seen before should not become a pass/fail gate on its
-    /// first run.
+    /// C-family markers cover most of what a mixed repo contains.
     #[test]
-    fn census_over_this_crate() {
-        // Defaults to this crate; `CORRODE_CENSUS_DIR` points it at a wider corpus
-        // (one crate is not evidence about Rust in general).
-        let dir = match std::env::var("CORRODE_CENSUS_DIR") {
-            Ok(d) => std::path::PathBuf::from(d),
-            Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        };
-        let mut files = 0usize;
-        let mut unscannable: Vec<(String, &'static str)> = Vec::new();
-        let (mut item, mut gap) = (0usize, 0usize);
-        let mut kinds = GapKinds::default();
-
-        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let src = std::fs::read_to_string(&path).unwrap();
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            match census(&src) {
-                Fidelity::Scanned(c) => {
-                    assert!(c.exact, "{name}: spans + gaps did not rebuild the file");
-                    files += 1;
-                    item += c.item_bytes;
-                    gap += c.gap_bytes;
-                    kinds.blank += c.gap_kinds.blank;
-                    kinds.comment += c.gap_kinds.comment;
-                    kinds.attribute += c.gap_kinds.attribute;
-                    kinds.other += c.gap_kinds.other;
-                }
-                Fidelity::Unscannable(why) => unscannable.push((name, why)),
-            }
+    fn the_fallback_covers_the_common_comment_families() {
+        for (path, text, want) in [
+            ("a.go", "// go\nfunc f() {}\n", 1),
+            ("a.ts", "/* block */\nlet x = 1;\n", 1),
+            ("a.sql", "-- sql\nSELECT 1;\n", 1),
+            ("a.html", "<!-- markup -->\n<p/>\n", 1),
+            ("a.yaml", "# yaml\nk: v\n", 1),
+        ] {
+            let lang = projection::for_path(path);
+            let fw = ingest::file(lang.as_ref(), path, text).unwrap();
+            assert_eq!(ingest::project(&fw), text, "{path} round trips");
+            assert_eq!(fw.comments.len(), want, "{path}: {:?}", fw.comments);
         }
-
-        let total = item + gap;
-        eprintln!("--- projection census: {files} scanned, {} unscannable ---", unscannable.len());
-        for (f, why) in &unscannable {
-            eprintln!("  UNSCANNABLE {f}: {why}");
-        }
-        eprintln!(
-            "  item bytes {item} ({:.1}%), gap bytes {gap} ({:.1}%)",
-            100.0 * item as f64 / total as f64,
-            100.0 * gap as f64 / total as f64
-        );
-        eprintln!(
-            "  gaps: blank {} comment {} attribute {} other {}",
-            kinds.blank, kinds.comment, kinds.attribute, kinds.other
-        );
-        assert!(files > 0, "no sources scanned");
     }
 }
-
-/// Tier 2: can an item be REGENERATED from its parsed form byte-for-byte?
-///
-/// Tier 1 showed decomposition is total — items plus whitespace account for every
-/// byte. That makes verbatim composition possible. Tier 2 asks the harder question
-/// `ProjectionMode::Composed` actually poses: if a node stores *structure* rather than
-/// text, does rendering it back reproduce the source?
-///
-/// This is where [`crate::FallbackReason`]'s variants were always going to live.
 pub mod regen {
     use corrode_core::FallbackReason;
 
@@ -441,13 +321,10 @@ pub mod regen {
     /// whitespace made cosmetic reflow look like content loss, and stripping whitespace
     /// still cannot see a canonicalised comma. The census reports what it can defend.
     pub fn formatting_only(src: &str, printed: &str) -> bool {
-        // Remove whitespace ENTIRELY rather than normalising runs of it. Splitting on
-        // whitespace and rejoining looks equivalent and is not: `lookup(&self,` is one
-        // token and `lookup( &self,` is two, so a purely cosmetic reflow inside a
-        // parameter list reads as changed content. That mistake turned 76 of 78 files
-        // into false "content lost" results on the first run of this census.
-        let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-        strip(src) == strip(printed)
+        // One implementation of this rule, in production code: `reconcile` needs the
+        // same test to avoid binding a commit's rationale to a reformat, and a second
+        // copy is how the token-splitting bug came back after being fixed here.
+        crate::projection::update::cosmetic_only(src, printed)
     }
 
     /// Regenerate and report both the classification and whether the loss was purely
@@ -501,15 +378,15 @@ pub mod regen {
                 }
                 continue;
             }
-            if let Some((body, hashes)) = super::raw_string_start(b, i) {
-                if let Some(e) = super::raw_string_end(b, body, hashes) {
+            if let Some((body, hashes)) = crate::projection::rust::raw_string_start(b, i) {
+                if let Some(e) = crate::projection::rust::raw_string_end(b, body, hashes) {
                     out.push_str(&src[i..e]);
                     i = e;
                     continue;
                 }
             }
             if b[i] == b'"' {
-                if let Some(e) = super::plain_string_end(b, i) {
+                if let Some(e) = crate::projection::rust::plain_string_end(b, i) {
                     out.push_str(&src[i..e]);
                     i = e;
                     continue;
@@ -576,6 +453,74 @@ pub mod regen {
                 first_diff_offset: 0,
             }
         }
+    }
+}
+
+pub mod canonical {
+    /// Does printing a canonical file reproduce it? If the printer is not idempotent
+    /// there is no fixed point to converge on and the scheme has no foundation.
+    pub fn is_idempotent(src: &str) -> Option<bool> {
+        let once = prettyplease::unparse(&syn::parse_file(src).ok()?);
+        let twice = prettyplease::unparse(&syn::parse_file(&once).ok()?);
+        Some(once == twice)
+    }
+
+    /// What canonicalisation destroys. `syn`'s AST has no node for a plain comment, so
+    /// rewriting a repo into printer output deletes every one of them permanently.
+    /// Doc comments become attributes and survive.
+    #[derive(Debug, Default, PartialEq)]
+    pub struct Loss {
+        pub plain_comment_lines: usize,
+        pub plain_comment_bytes: usize,
+        pub doc_comment_lines: usize,
+        pub total_bytes: usize,
+    }
+
+    /// Splits the destroyed comments into the ones that could be SAVED by rewriting
+    /// them as doc comments (they sit between items, so they attach to the next one)
+    /// and the ones that cannot (inside a function body, where `///` is not legal).
+    /// Uses the composer's own node decomposition, so the split is structural rather
+    /// than an indentation guess.
+    pub fn migratable(path: &str, src: &str) -> (usize, usize) {
+        let Ok(nodes) = crate::projection::scan(&crate::projection::rust::Rust, path, src)
+        else {
+            return (0, 0);
+        };
+        let (mut between, mut inside) = (0usize, 0usize);
+        for n in &nodes {
+            for line in n.text.lines() {
+                let t = line.trim_start();
+                let plain = (t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!"))
+                    || t.starts_with("/*");
+                if !plain {
+                    continue;
+                }
+                if n.kind == "trivia" {
+                    between += 1;
+                } else {
+                    inside += 1;
+                }
+            }
+        }
+        (between, inside)
+    }
+
+    pub fn loss(src: &str) -> Loss {
+        let mut l = Loss {
+            total_bytes: src.len(),
+            ..Default::default()
+        };
+        let stripped = crate::roundtrip::regen::strip_plain_comments(src);
+        l.plain_comment_bytes = src.len().saturating_sub(stripped.len());
+        for line in src.lines() {
+            let t = line.trim_start();
+            if t.starts_with("///") || t.starts_with("//!") {
+                l.doc_comment_lines += 1;
+            } else if t.starts_with("//") || t.starts_with("/*") || t.starts_with("*") {
+                l.plain_comment_lines += 1;
+            }
+        }
+        l
     }
 }
 
@@ -667,497 +612,6 @@ mod regen_tests {
     }
 }
 
-/// The composer itself: scan a repo into nodes, regenerate it, diff the tree.
-///
-/// Tiers 1 and 2 each measured a *proxy*. Tier 1 counted bytes inside spans found by a
-/// hand-rolled scanner; tier 2 round-tripped whole files through a printer nobody
-/// proposed using. Neither built the thing under test — a node model — so neither could
-/// answer whether a repo survives decomposition and reassembly.
-///
-/// This does. `syn` supplies the item boundaries (real structure, not a brace count);
-/// each node stores its VERBATIM bytes; regeneration concatenates. Byte-exactness is
-/// then a property of the decomposition, not of a printer's manners.
-pub mod compose {
-    use proc_macro2::Span;
-    use syn::spanned::Spanned;
-
-    /// One node as the graph would hold it.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct Node {
-        pub path: String,
-        /// Order within the file — the only thing regeneration needs.
-        pub ordinal: usize,
-        /// `fn`, `struct`, `impl`, `use`, `mod`, `macro`, … from syn, or `trivia` for
-        /// the whitespace and free-standing comments between items.
-        pub kind: &'static str,
-        /// Verbatim source. NOT regenerated: tier 2 measured that regeneration loses
-        /// comments and canonicalises punctuation, so content is stored, not printed.
-        pub text: String,
-        /// 1-based line at SCAN time only, and not authoritative.
-        ///
-        /// Kept because the ingest census reports it, but a projector must never read
-        /// it: a byte offset or line number is a fact about one source text, and a
-        /// dynamically generated VFS has no such text. Files are produced FROM nodes,
-        /// possibly reordered, edited, or drawn from a branch that was never
-        /// materialised — so a stored position is either stale or meaningless. Use
-        /// [`super::compose::project`], which computes positions as an OUTPUT.
-        pub scan_line: usize,
-    }
-
-    /// Public alias so the `describes` visitor can label item anchors identically.
-    pub fn kind_of_public(item: &syn::Item) -> &'static str {
-        kind_of(item)
-    }
-
-    fn kind_of(item: &syn::Item) -> &'static str {
-        match item {
-            syn::Item::Fn(_) => "fn",
-            syn::Item::Struct(_) => "struct",
-            syn::Item::Enum(_) => "enum",
-            syn::Item::Impl(_) => "impl",
-            syn::Item::Trait(_) => "trait",
-            syn::Item::Mod(_) => "mod",
-            syn::Item::Use(_) => "use",
-            syn::Item::Const(_) => "const",
-            syn::Item::Static(_) => "static",
-            syn::Item::Type(_) => "type",
-            syn::Item::Macro(_) => "macro",
-            syn::Item::ExternCrate(_) => "extern_crate",
-            syn::Item::ForeignMod(_) => "foreign_mod",
-            syn::Item::TraitAlias(_) => "trait_alias",
-            syn::Item::Union(_) => "union",
-            _ => "item",
-        }
-    }
-
-    /// Byte range of a span, using proc-macro2's `span-locations`.
-    fn range(span: Span) -> std::ops::Range<usize> {
-        span.byte_range()
-    }
-
-    /// Decompose one file into nodes covering every byte.
-    ///
-    /// An item's span does NOT include its outer attributes or doc comments, so those
-    /// would land in trivia and lose their association with the item they document.
-    /// Each item's start is pulled back over any immediately preceding attribute and
-    /// doc-comment lines, which is where they belong.
-    pub fn scan(path: &str, src: &str) -> anyhow::Result<Vec<Node>> {
-        let file = syn::parse_file(src)?;
-        let mut nodes = Vec::new();
-        let mut cursor = 0usize;
-        let mut ordinal = 0usize;
-
-        for item in &file.items {
-            let r = range(item.span());
-            let start = pull_back_attrs(src, r.start, cursor);
-            if start > cursor {
-                push_trivia(&mut nodes, path, &mut ordinal, src, cursor, start);
-            }
-            nodes.push(Node {
-                path: path.to_string(),
-                ordinal,
-                kind: kind_of(item),
-                text: src[start..r.end].to_string(),
-                scan_line: line_of(src, start),
-            });
-            ordinal += 1;
-            cursor = r.end;
-        }
-        if cursor < src.len() {
-            push_trivia(&mut nodes, path, &mut ordinal, src, cursor, src.len());
-        }
-        Ok(nodes)
-    }
-
-    fn push_trivia(
-        nodes: &mut Vec<Node>,
-        path: &str,
-        ordinal: &mut usize,
-        src: &str,
-        from: usize,
-        to: usize,
-    ) {
-        nodes.push(Node {
-            path: path.to_string(),
-            ordinal: *ordinal,
-            kind: "trivia",
-            text: src[from..to].to_string(),
-            scan_line: line_of(src, from),
-        });
-        *ordinal += 1;
-    }
-
-    /// Walk back from an item's span over attribute and doc-comment lines directly
-    /// above it, stopping at `floor` (the previous item's end) or a blank line.
-    fn pull_back_attrs(src: &str, start: usize, floor: usize) -> usize {
-        let mut at = start;
-        loop {
-            let Some(line_start) = src[floor..at].rfind('\n').map(|i| floor + i + 1) else {
-                break;
-            };
-            let prev_end = line_start.saturating_sub(1);
-            let Some(prev_start) = src[floor..prev_end].rfind('\n').map(|i| floor + i + 1) else {
-                // First line of the region.
-                let l = src[floor..prev_end].trim_start();
-                if l.starts_with("#[") || l.starts_with("///") || l.starts_with("//!") {
-                    return floor;
-                }
-                break;
-            };
-            let line = src[prev_start..prev_end].trim();
-            if line.starts_with("#[") || line.starts_with("///") || line.starts_with("//!") {
-                at = prev_start;
-                continue;
-            }
-            break;
-        }
-        // `at` now points at the first attribute line, or the original start.
-        src[floor..at].rfind('\n').map(|i| floor + i + 1).unwrap_or(at)
-    }
-
-    fn line_of(src: &str, byte: usize) -> usize {
-        src[..byte].bytes().filter(|b| *b == b'\n').count() + 1
-    }
-
-    /// Attach each trivia block's comment to the item that follows it.
-    ///
-    /// Comments are absent from syn's AST — Rust's lexer discards them before a token
-    /// stream exists, so nothing built on proc-macro2 can see one. They are NOT absent
-    /// from the source, and `Span::byte_range()` says where every item begins, so the
-    /// text between items is recoverable and can be associated structurally.
-    ///
-    /// This is why a comment-aware *parser* is not required for projection: the
-    /// composer keeps the bytes, and attachment is a post-pass over positions we
-    /// already have. A lossless CST (rust-analyzer's `ra_ap_syntax`, built on rowan)
-    /// would be the tool if comments had to attach to sub-item elements — a comment on
-    /// one statement inside a function — which spans alone cannot resolve.
-    pub fn attach_comments(nodes: &[Node]) -> Vec<(usize, String)> {
-        let mut out = Vec::new();
-        for (i, n) in nodes.iter().enumerate() {
-            if n.kind != "trivia" {
-                continue;
-            }
-            let comment: String = n
-                .text
-                .lines()
-                .filter(|l| {
-                    let t = l.trim_start();
-                    t.starts_with("//") || t.starts_with("/*") || t.starts_with('*')
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if comment.trim().is_empty() {
-                continue;
-            }
-            // The next non-trivia node is the item this comment introduces.
-            if let Some(target) = nodes.iter().skip(i + 1).find(|m| m.kind != "trivia") {
-                out.push((target.ordinal, comment));
-            }
-        }
-        out
-    }
-
-    /// Where a node landed in a projection. Produced BY projection, never stored.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct Placement {
-        pub ordinal: usize,
-        pub kind: &'static str,
-        /// 1-based line where this node starts in the projected file.
-        pub start_line: usize,
-        pub start_byte: usize,
-    }
-
-    /// Project nodes into a file AND report where each one landed.
-    ///
-    /// This is the operation a dynamic VFS actually performs. Positions come out of it;
-    /// they are never inputs. Reorder the nodes, insert one, edit one — the next
-    /// projection reports the new truth, and nothing had to be invalidated because
-    /// nothing had been stored.
-    pub fn project(nodes: &[Node]) -> (String, Vec<Placement>) {
-        let mut sorted: Vec<&Node> = nodes.iter().collect();
-        sorted.sort_by_key(|n| n.ordinal);
-        let mut text = String::new();
-        let mut places = Vec::with_capacity(sorted.len());
-        for n in sorted {
-            places.push(Placement {
-                ordinal: n.ordinal,
-                kind: n.kind,
-                start_line: text.bytes().filter(|b| *b == b'\n').count() + 1,
-                start_byte: text.len(),
-            });
-            text.push_str(&n.text);
-        }
-        (text, places)
-    }
-
-    /// Reassemble a file from its nodes. This is the whole composer.
-    pub fn regenerate(nodes: &[Node]) -> String {
-        let mut out = String::new();
-        let mut sorted: Vec<&Node> = nodes.iter().collect();
-        sorted.sort_by_key(|n| n.ordinal);
-        for n in sorted {
-            out.push_str(&n.text);
-        }
-        out
-    }
-}
-
-#[cfg(test)]
-mod compose_tests {
-    use super::compose::*;
-
-    /// Scan a whole repository into nodes, regenerate every file, diff the tree.
-    ///
-    /// This is the end-to-end claim `graph-model.md` makes — files are a projection of
-    /// the graph — reduced to something that either holds byte-for-byte or does not.
-    /// `CORRODE_SCAN_REPO` points it at any repo; the default is this one.
-    #[test]
-    fn scan_and_regenerate_a_repository() {
-        let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .to_string_lossy()
-                .into_owned()
-        });
-        let listed = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["ls-files", "-s", "-z"])
-            .output()
-            .expect("git ls-files");
-        let files: Vec<String> = String::from_utf8_lossy(&listed.stdout)
-            .split('\0')
-            .filter_map(|rec| {
-                let (meta, path) = rec.split_once('\t')?;
-                let mode = meta.split_whitespace().next()?;
-                (matches!(mode, "100644" | "100755") && path.ends_with(".rs"))
-                    .then(|| path.to_string())
-            })
-            .collect();
-
-        let (mut ok, mut mismatched, mut unparseable) = (0usize, 0usize, 0usize);
-        let (mut nodes_total, mut bytes_total) = (0usize, 0usize);
-        let mut kinds: std::collections::BTreeMap<&'static str, usize> = Default::default();
-        let mut failures: Vec<String> = Vec::new();
-
-        for rel in &files {
-            let full = std::path::Path::new(&repo).join(rel);
-            let Ok(src) = std::fs::read_to_string(&full) else {
-                continue;
-            };
-            match scan(rel, &src) {
-                Err(_) => unparseable += 1,
-                Ok(nodes) => {
-                    let rebuilt = regenerate(&nodes);
-                    if rebuilt == src {
-                        ok += 1;
-                        nodes_total += nodes.len();
-                        bytes_total += src.len();
-                        for n in &nodes {
-                            *kinds.entry(n.kind).or_default() += 1;
-                        }
-                    } else {
-                        mismatched += 1;
-                        if failures.len() < 5 {
-                            let at = src
-                                .bytes()
-                                .zip(rebuilt.bytes())
-                                .position(|(a, b)| a != b)
-                                .unwrap_or(src.len().min(rebuilt.len()));
-                            failures.push(format!(
-                                "{rel}: first diff at byte {at} (src {} bytes, rebuilt {})",
-                                src.len(),
-                                rebuilt.len()
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        eprintln!("--- scan + regenerate: {} .rs files in {repo} ---", files.len());
-        eprintln!("  byte-exact {ok}, mismatched {mismatched}, unparseable {unparseable}");
-        eprintln!("  {nodes_total} nodes over {bytes_total} bytes");
-        let trivia = kinds.get("trivia").copied().unwrap_or(0);
-        eprintln!(
-            "  node kinds: {}",
-            kinds
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        eprintln!(
-            "  {:.1}% of nodes are real items (rest trivia)",
-            100.0 * (nodes_total - trivia) as f64 / nodes_total.max(1) as f64
-        );
-        for f in &failures {
-            eprintln!("  MISMATCH {f}");
-        }
-
-        assert!(!files.is_empty(), "no .rs files found in {repo}");
-        assert_eq!(mismatched, 0, "regeneration was not byte-exact");
-    }
-
-    /// Positions are an OUTPUT of projection, not node state.
-    ///
-    /// The distinction is not academic: a dynamically generated VFS projects files
-    /// that were never on disk, from nodes that get reordered, inserted and edited. A
-    /// byte offset or line number stored on a node is a fact about one source text,
-    /// so it is stale or meaningless the moment the graph moves. This asserts that
-    /// `project` reports the truth after a mutation that would invalidate any stored
-    /// position.
-    #[test]
-    fn positions_are_recomputed_not_stored() {
-        let src = "use a::b;\n\nfn one() {}\n\nfn two() {}\n";
-        let nodes = scan("t.rs", src).unwrap();
-        let (text, places) = project(&nodes);
-        assert_eq!(text, src, "projection reproduces the source");
-
-        let line_of = |ord: usize| places.iter().find(|p| p.ordinal == ord).unwrap().start_line;
-        let two = nodes.iter().find(|n| n.text.contains("fn two")).unwrap();
-        assert_eq!(line_of(two.ordinal), 5, "fn two starts at line 5");
-        let stored_before = two.scan_line;
-
-        // Now do what a live graph does: insert a node ahead of it.
-        let mut mutated: Vec<Node> = nodes
-            .iter()
-            .cloned()
-            .map(|mut n| {
-                n.ordinal += 2;
-                n
-            })
-            .collect();
-        mutated.push(Node {
-            path: "t.rs".into(),
-            ordinal: 0,
-            kind: "use",
-            text: "use inserted::thing;".into(),
-            scan_line: 0,
-        });
-        mutated.push(Node {
-            path: "t.rs".into(),
-            ordinal: 1,
-            kind: "trivia",
-            text: "\n\n".into(),
-            scan_line: 0,
-        });
-
-        let (text2, places2) = project(&mutated);
-        assert!(text2.starts_with("use inserted::thing;"), "insert took effect");
-        let two_after = places2
-            .iter()
-            .find(|p| p.ordinal == two.ordinal + 2)
-            .expect("fn two still projected");
-        assert_eq!(
-            two_after.start_line,
-            stored_before + 2,
-            "two inserted lines shifted it; projection reports the new line"
-        );
-        // The node's own `scan_line` is now wrong — which is exactly why a projector
-        // must never read it.
-        assert_ne!(
-            stored_before, two_after.start_line,
-            "a stored position would have been stale here"
-        );
-    }
-
-    /// Comments bind to (node, line-within-node), so they survive the same mutation.
-    /// An absolute line would not.
-    #[test]
-    fn comment_attachment_survives_reordering() {
-        use super::comments::*;
-        let src = "fn f() {\n    // explains the loop\n    let x = 1;\n}\n";
-        let nodes = scan("t.rs", src).unwrap();
-        let refs = extract("t.rs", src, &nodes);
-        let c = refs.iter().find(|c| c.text.contains("explains")).expect("found");
-        assert_eq!(c.line_in_node, 2, "second line of its node");
-
-        // Shift the whole file down; the relative position is unchanged, the absolute
-        // one is not.
-        let shifted = format!("// header\n\n{src}");
-        let nodes2 = scan("t.rs", &shifted).unwrap();
-        let refs2 = extract("t.rs", &shifted, &nodes2);
-        let c2 = refs2.iter().find(|c| c.text.contains("explains")).expect("found");
-        assert_eq!(c2.line_in_node, 2, "line WITHIN the node is stable");
-        assert_ne!(c.abs_line, c2.abs_line, "the absolute line moved");
-    }
-}
-
-/// The canonical-form alternative: instead of preserving arbitrary source, rewrite the
-/// repo ONCE into the projector's own form, after which regeneration is exact because
-/// the source is already what the printer emits.
-///
-/// Measured and REJECTED ON COST, not feasibility: the printer reaches a fixed point in
-/// two passes, but canonicalising destroys 35,477 body comments that no migration can
-/// recover. Kept so the measurement can be re-run rather than re-argued.
-pub mod canonical {
-    /// Does printing a canonical file reproduce it? If the printer is not idempotent
-    /// there is no fixed point to converge on and the scheme has no foundation.
-    pub fn is_idempotent(src: &str) -> Option<bool> {
-        let once = prettyplease::unparse(&syn::parse_file(src).ok()?);
-        let twice = prettyplease::unparse(&syn::parse_file(&once).ok()?);
-        Some(once == twice)
-    }
-
-    /// What canonicalisation destroys. `syn`'s AST has no node for a plain comment, so
-    /// rewriting a repo into printer output deletes every one of them permanently.
-    /// Doc comments become attributes and survive.
-    #[derive(Debug, Default, PartialEq)]
-    pub struct Loss {
-        pub plain_comment_lines: usize,
-        pub plain_comment_bytes: usize,
-        pub doc_comment_lines: usize,
-        pub total_bytes: usize,
-    }
-
-    /// Splits the destroyed comments into the ones that could be SAVED by rewriting
-    /// them as doc comments (they sit between items, so they attach to the next one)
-    /// and the ones that cannot (inside a function body, where `///` is not legal).
-    /// Uses the composer's own node decomposition, so the split is structural rather
-    /// than an indentation guess.
-    pub fn migratable(path: &str, src: &str) -> (usize, usize) {
-        let Ok(nodes) = super::compose::scan(path, src) else {
-            return (0, 0);
-        };
-        let (mut between, mut inside) = (0usize, 0usize);
-        for n in &nodes {
-            for line in n.text.lines() {
-                let t = line.trim_start();
-                let plain = (t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!"))
-                    || t.starts_with("/*");
-                if !plain {
-                    continue;
-                }
-                if n.kind == "trivia" {
-                    between += 1;
-                } else {
-                    inside += 1;
-                }
-            }
-        }
-        (between, inside)
-    }
-
-    pub fn loss(src: &str) -> Loss {
-        let mut l = Loss {
-            total_bytes: src.len(),
-            ..Default::default()
-        };
-        let stripped = super::regen::strip_plain_comments(src);
-        l.plain_comment_bytes = src.len().saturating_sub(stripped.len());
-        for line in src.lines() {
-            let t = line.trim_start();
-            if t.starts_with("///") || t.starts_with("//!") {
-                l.doc_comment_lines += 1;
-            } else if t.starts_with("//") || t.starts_with("/*") || t.starts_with("*") {
-                l.plain_comment_lines += 1;
-            }
-        }
-        l
-    }
-}
-
 #[cfg(test)]
 mod canonical_tests {
     use super::canonical::*;
@@ -1227,519 +681,6 @@ mod canonical_tests {
             "  of the destroyed: {between_items} between items (could migrate to ///), \
              {inside_bodies} inside bodies (unrecoverable — /// is not legal there)"
         );
-        assert!(!files.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod attach_tests {
-    use super::compose::*;
-
-    /// Comments are recoverable and attachable even though syn cannot see them.
-    #[test]
-    fn comments_attach_to_the_item_they_introduce() {
-        let src = "\
-// explains the constant
-const A: u8 = 1;
-
-// explains the function
-// on two lines
-fn f() {}
-";
-        let nodes = scan("t.rs", src).unwrap();
-        let attached = attach_comments(&nodes);
-        assert_eq!(attached.len(), 2, "both comments attached: {attached:?}");
-
-        let kind_of = |ord: usize| nodes.iter().find(|n| n.ordinal == ord).unwrap().kind;
-        assert_eq!(kind_of(attached[0].0), "const");
-        assert!(attached[0].1.contains("explains the constant"));
-        assert_eq!(kind_of(attached[1].0), "fn");
-        assert!(attached[1].1.contains("on two lines"), "multi-line block kept together");
-
-        // And the file still regenerates byte-exactly: attachment is a VIEW over the
-        // nodes, not a transformation of them.
-        assert_eq!(regenerate(&nodes), src);
-    }
-
-    /// How much of a real repo's commentary can be attached structurally?
-    #[test]
-    fn attachment_census() {
-        let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .to_string_lossy()
-                .into_owned()
-        });
-        let out = std::process::Command::new("git")
-            .arg("-C").arg(&repo).args(["ls-files", "-s", "-z"])
-            .output().expect("git");
-        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .split('\0')
-            .filter_map(|r| {
-                let (m, p) = r.split_once('\t')?;
-                (matches!(m.split_whitespace().next()?, "100644" | "100755") && p.ends_with(".rs"))
-                    .then(|| p.to_string())
-            })
-            .collect();
-        let (mut attached, mut inside) = (0usize, 0usize);
-        for rel in &files {
-            let Ok(src) = std::fs::read_to_string(std::path::Path::new(&repo).join(rel)) else { continue };
-            let Ok(nodes) = scan(rel, &src) else { continue };
-            attached += attach_comments(&nodes).len();
-            for n in nodes.iter().filter(|n| n.kind != "trivia") {
-                inside += n.text.lines().filter(|l| {
-                    let t = l.trim_start();
-                    (t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!"))
-                        || t.starts_with("/*")
-                }).count();
-            }
-        }
-        eprintln!("--- comment attachment over {} files ---", files.len());
-        eprintln!("  {attached} comment blocks attached to the item they introduce");
-        eprintln!("  {inside} plain-comment lines live INSIDE item bodies (kept verbatim in the node,");
-        eprintln!("    attachable to a sub-item element only with a lossless CST)");
-        assert!(!files.is_empty());
-    }
-}
-
-/// The comment-extraction pass.
-///
-/// Comments never reach the AST — Rust's lexer discards them — so recovering them is a
-/// SEPARATE pass over the source, run alongside the parse rather than derived from it.
-/// This is that pass: find every comment lexically, then bind it to the node that
-/// contains it and to a line within that node.
-///
-/// Granularity worth being precise about. Byte offsets resolve a comment to a *line*
-/// inside a node, which is what a reader needs and what `path:line` reporting wants.
-/// They do not resolve it to a syntactic *element* — "the comment on this match arm" —
-/// because item spans stop at item boundaries. That needs a lossless CST
-/// (`ra_ap_syntax`). Line-level does not.
-pub mod comments {
-    use super::compose::Node;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Kind {
-        /// `// ...`
-        Line,
-        /// `/* ... */`
-        Block,
-        /// `/// ...` or `/** ... */` — survives into the AST as `#[doc]`.
-        Doc,
-        /// `//! ...` — inner doc.
-        InnerDoc,
-    }
-
-    /// One comment, bound to where it lives.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct CommentRef {
-        pub path: String,
-        /// Which node contains it. `None` only if it precedes every node.
-        pub node_ordinal: Option<usize>,
-        /// 1-based line WITHIN that node — stable under edits elsewhere in the file.
-        pub line_in_node: usize,
-        /// 1-based line in the file as it currently projects. Derived, not stored.
-        pub abs_line: usize,
-        pub kind: Kind,
-        pub text: String,
-    }
-
-    /// Find every comment in `src`, skipping string, raw-string and char literals so a
-    /// `//` inside a string is never mistaken for one.
-    pub fn extract(path: &str, src: &str, nodes: &[Node]) -> Vec<CommentRef> {
-        let b = src.as_bytes();
-        let mut out = Vec::new();
-        let mut i = 0usize;
-
-        // Byte ranges of each node, in ordinal order, so a comment can be located.
-        let mut ranges: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, ordinal)
-        let mut at = 0usize;
-        let mut sorted: Vec<&Node> = nodes.iter().collect();
-        sorted.sort_by_key(|n| n.ordinal);
-        for n in &sorted {
-            ranges.push((at, at + n.text.len(), n.ordinal));
-            at += n.text.len();
-        }
-
-        while i < b.len() {
-            if let Some((body, hashes)) = super::raw_string_start(b, i) {
-                if let Some(e) = super::raw_string_end(b, body, hashes) {
-                    i = e;
-                    continue;
-                }
-            }
-            if b[i] == b'"' {
-                if let Some(e) = super::plain_string_end(b, i) {
-                    i = e;
-                    continue;
-                }
-            }
-            if b[i] == b'\'' {
-                i = super::char_or_lifetime_end(b, i);
-                continue;
-            }
-            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
-                let kind = match b.get(i + 2) {
-                    Some(b'/') => Kind::Doc,
-                    Some(b'!') => Kind::InnerDoc,
-                    _ => Kind::Line,
-                };
-                let start = i;
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-                out.push(make_ref(path, src, &ranges, start, i, kind));
-                continue;
-            }
-            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
-                let kind = match b.get(i + 2) {
-                    Some(b'*') => Kind::Doc,
-                    Some(b'!') => Kind::InnerDoc,
-                    _ => Kind::Block,
-                };
-                let start = i;
-                let mut nest = 1;
-                i += 2;
-                while i + 1 < b.len() && nest > 0 {
-                    if b[i] == b'/' && b[i + 1] == b'*' {
-                        nest += 1;
-                        i += 2;
-                    } else if b[i] == b'*' && b[i + 1] == b'/' {
-                        nest -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                out.push(make_ref(path, src, &ranges, start, i, kind));
-                continue;
-            }
-            i += 1;
-        }
-        out
-    }
-
-    fn make_ref(
-        path: &str,
-        src: &str,
-        ranges: &[(usize, usize, usize)],
-        start: usize,
-        end: usize,
-        kind: Kind,
-    ) -> CommentRef {
-        let owner = ranges
-            .iter()
-            .find(|(s, e, _)| start >= *s && start < *e)
-            .map(|(s, _, ord)| (*s, *ord));
-        let (node_start, node_ordinal) = match owner {
-            Some((s, o)) => (s, Some(o)),
-            None => (0, None),
-        };
-        CommentRef {
-            path: path.to_string(),
-            node_ordinal,
-            line_in_node: src[node_start..start].bytes().filter(|c| *c == b'\n').count() + 1,
-            abs_line: src[..start].bytes().filter(|c| *c == b'\n').count() + 1,
-            kind,
-            text: src[start..end].to_string(),
-        }
-    }
-}
-
-/// What a comment DESCRIBES, as an edge rather than a position.
-///
-/// Graph search asks two things a coordinate cannot answer: what is this comment
-/// about, and what commentary applies to this region of code. Both need an edge from
-/// the comment to the syntax element it annotates.
-///
-/// `syn` gives spans for any syntax node, not just top-level items — a statement inside
-/// a body has a byte range like anything else — so anchors go all the way down without
-/// a lossless CST. That corrects an earlier note in this module.
-pub mod describes {
-    use super::comments::{CommentRef, Kind};
-    use syn::spanned::Spanned;
-    use syn::visit::Visit;
-
-    /// A syntax element a comment can be about.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct Anchor {
-        pub kind: &'static str,
-        pub start: usize,
-        pub end: usize,
-    }
-
-    /// How the comment relates to what it describes.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Relation {
-        /// On its own line(s), immediately above the element.
-        Precedes,
-        /// After code on the same line — describes that line's element.
-        Trailing,
-        /// Nothing follows it in scope; it belongs to the element enclosing it.
-        Encloses,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct Edge {
-        pub comment: CommentRef,
-        pub relation: Relation,
-        pub target: Option<Anchor>,
-    }
-
-    #[derive(Default)]
-    struct Collect {
-        anchors: Vec<Anchor>,
-    }
-
-    impl<'ast> Visit<'ast> for Collect {
-        fn visit_item(&mut self, i: &'ast syn::Item) {
-            let s = i.span().byte_range();
-            self.anchors.push(Anchor {
-                kind: super::compose::kind_of_public(i),
-                start: s.start,
-                end: s.end,
-            });
-            syn::visit::visit_item(self, i);
-        }
-        fn visit_stmt(&mut self, s: &'ast syn::Stmt) {
-            let r = s.span().byte_range();
-            self.anchors.push(Anchor {
-                kind: "stmt",
-                start: r.start,
-                end: r.end,
-            });
-            syn::visit::visit_stmt(self, s);
-        }
-        fn visit_arm(&mut self, a: &'ast syn::Arm) {
-            let r = a.span().byte_range();
-            self.anchors.push(Anchor {
-                kind: "match_arm",
-                start: r.start,
-                end: r.end,
-            });
-            syn::visit::visit_arm(self, a);
-        }
-        fn visit_field(&mut self, f: &'ast syn::Field) {
-            let r = f.span().byte_range();
-            self.anchors.push(Anchor {
-                kind: "field",
-                start: r.start,
-                end: r.end,
-            });
-            syn::visit::visit_field(self, f);
-        }
-    }
-
-    /// Every anchorable element in the file, innermost-last.
-    pub fn anchors(src: &str) -> anyhow::Result<Vec<Anchor>> {
-        let file = syn::parse_file(src)?;
-        let mut c = Collect::default();
-        c.visit_file(&file);
-        c.anchors.sort_by_key(|a| (a.start, std::cmp::Reverse(a.end)));
-        Ok(c.anchors)
-    }
-
-    /// Bind each comment to what it describes.
-    pub fn bind(src: &str, comments: &[CommentRef], anchors: &[Anchor]) -> Vec<Edge> {
-        comments
-            .iter()
-            .map(|c| {
-                let start = byte_of(src, c);
-                let end = start + c.text.len();
-                // Is there code before it on this line? Then it trails that code.
-                let line_start = src[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                let trailing = !src[line_start..start].trim().is_empty();
-
-                let (relation, target) = if trailing {
-                    // The innermost anchor whose span covers the code to its left.
-                    let t = anchors
-                        .iter()
-                        .filter(|a| a.start <= start && a.end >= line_start)
-                        .min_by_key(|a| a.end - a.start)
-                        .cloned();
-                    (Relation::Trailing, t)
-                } else {
-                    // The first element starting after it — what it introduces.
-                    match anchors.iter().filter(|a| a.start >= end).min_by_key(|a| a.start) {
-                        Some(a) => (Relation::Precedes, Some(a.clone())),
-                        None => {
-                            let t = anchors
-                                .iter()
-                                .filter(|a| a.start <= start && a.end >= end)
-                                .min_by_key(|a| a.end - a.start)
-                                .cloned();
-                            (Relation::Encloses, t)
-                        }
-                    }
-                };
-                Edge {
-                    comment: c.clone(),
-                    relation,
-                    target,
-                }
-            })
-            .collect()
-    }
-
-    /// Query 2: what commentary applies to a byte region of the source?
-    ///
-    /// Everything whose TARGET falls in the region — so a comment introducing a
-    /// function is returned when asking about that function's body, not merely when
-    /// asking about the line it sits on.
-    pub fn comments_for(edges: &[Edge], from: usize, to: usize) -> Vec<&Edge> {
-        edges
-            .iter()
-            .filter(|e| match &e.target {
-                Some(a) => a.start < to && a.end > from,
-                None => false,
-            })
-            .collect()
-    }
-
-    /// Doc comments already reach the AST as attributes; plain ones are the reason this
-    /// module exists.
-    pub fn is_plain(c: &CommentRef) -> bool {
-        matches!(c.kind, Kind::Line | Kind::Block)
-    }
-
-    fn byte_of(src: &str, c: &CommentRef) -> usize {
-        // `abs_line` is 1-based; walk to that line then find the comment text on it.
-        let mut at = 0usize;
-        for _ in 1..c.abs_line {
-            match src[at..].find('\n') {
-                Some(i) => at += i + 1,
-                None => break,
-            }
-        }
-        let line_end = src[at..].find('\n').map(|i| at + i).unwrap_or(src.len());
-        let first = c.text.lines().next().unwrap_or("");
-        src[at..line_end].find(first).map(|i| at + i).unwrap_or(at)
-    }
-}
-
-#[cfg(test)]
-mod describes_tests {
-    use super::comments;
-    use super::compose;
-    use super::describes::*;
-
-    const SRC: &str = "\
-/// documented
-fn outer() {
-    // sets the seed
-    let seed = 7;
-    let x = compute(seed); // trailing note
-    match x {
-        // the happy path
-        Ok(v) => use_it(v),
-        Err(_) => {}
-    }
-}
-";
-
-    fn edges_for(src: &str) -> Vec<Edge> {
-        let nodes = compose::scan("t.rs", src).unwrap();
-        let cs = comments::extract("t.rs", src, &nodes);
-        let anchors = anchors(src).unwrap();
-        bind(src, &cs, &anchors)
-    }
-
-    /// Query 1: what is this comment describing?
-    #[test]
-    fn a_comment_resolves_to_the_element_it_describes() {
-        let edges = edges_for(SRC);
-        let find = |needle: &str| {
-            edges
-                .iter()
-                .find(|e| e.comment.text.contains(needle))
-                .unwrap_or_else(|| panic!("no comment matching {needle}"))
-        };
-
-        let seed = find("sets the seed");
-        assert_eq!(seed.relation, Relation::Precedes);
-        let t = seed.target.as_ref().expect("has a target");
-        assert_eq!(t.kind, "stmt");
-        assert!(SRC[t.start..t.end].starts_with("let seed"), "{:?}", &SRC[t.start..t.end]);
-
-        // A trailing comment describes the code to its LEFT, not the next line.
-        let trailing = find("trailing note");
-        assert_eq!(trailing.relation, Relation::Trailing);
-        let t = trailing.target.as_ref().expect("has a target");
-        assert!(SRC[t.start..t.end].contains("compute(seed)"), "{:?}", &SRC[t.start..t.end]);
-
-        // Sub-item granularity: a comment inside a match binds to the arm.
-        let arm = find("happy path");
-        let t = arm.target.as_ref().expect("has a target");
-        assert_eq!(t.kind, "match_arm");
-        assert!(SRC[t.start..t.end].starts_with("Ok(v)"), "{:?}", &SRC[t.start..t.end]);
-    }
-
-    /// Query 2: what commentary applies to this region of code?
-    #[test]
-    fn a_region_resolves_to_the_commentary_about_it() {
-        let edges = edges_for(SRC);
-        let match_start = SRC.find("match x").unwrap();
-        let match_end = SRC[match_start..].find("\n    }").unwrap() + match_start;
-
-        let found = comments_for(&edges, match_start, match_end);
-        let texts: Vec<&str> = found.iter().map(|e| e.comment.text.trim()).collect();
-        assert!(
-            texts.iter().any(|t| t.contains("happy path")),
-            "the arm's comment belongs to the match region: {texts:?}"
-        );
-        assert!(
-            !texts.iter().any(|t| t.contains("sets the seed")),
-            "a comment about an earlier statement does not: {texts:?}"
-        );
-    }
-
-    /// Over a real repo: how much commentary actually binds to something?
-    #[test]
-    fn binding_census() {
-        let repo = std::env::var("CORRODE_SCAN_REPO").unwrap_or_else(|_| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .to_string_lossy()
-                .into_owned()
-        });
-        let out = std::process::Command::new("git")
-            .arg("-C").arg(&repo).args(["ls-files", "-s", "-z"])
-            .output().expect("git");
-        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .split('\0')
-            .filter_map(|r| {
-                let (m, p) = r.split_once('\t')?;
-                (matches!(m.split_whitespace().next()?, "100644" | "100755") && p.ends_with(".rs"))
-                    .then(|| p.to_string())
-            })
-            .collect();
-
-        let (mut bound, mut unbound) = (0usize, 0usize);
-        let mut rel: std::collections::BTreeMap<&'static str, usize> = Default::default();
-        let mut kinds: std::collections::BTreeMap<&'static str, usize> = Default::default();
-        for f in &files {
-            let Ok(src) = std::fs::read_to_string(std::path::Path::new(&repo).join(f)) else { continue };
-            let Ok(nodes) = compose::scan(f, &src) else { continue };
-            let Ok(a) = anchors(&src) else { continue };
-            for e in bind(&src, &comments::extract(f, &src, &nodes), &a) {
-                if !is_plain(&e.comment) { continue; }
-                match &e.target {
-                    Some(t) => {
-                        bound += 1;
-                        *kinds.entry(t.kind).or_default() += 1;
-                        *rel.entry(match e.relation {
-                            Relation::Precedes => "precedes",
-                            Relation::Trailing => "trailing",
-                            Relation::Encloses => "encloses",
-                        }).or_default() += 1;
-                    }
-                    None => unbound += 1,
-                }
-            }
-        }
-        eprintln!("--- comment binding over {} files ---", files.len());
-        eprintln!("  plain comments bound to an element: {bound}, unbound: {unbound}");
-        eprintln!("  relation: {}", rel.iter().map(|(k,v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
-        eprintln!("  target kinds: {}", kinds.iter().map(|(k,v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
         assert!(!files.is_empty());
     }
 }

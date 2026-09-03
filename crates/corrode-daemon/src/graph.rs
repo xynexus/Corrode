@@ -48,6 +48,56 @@ pub trait GraphStore: Send + Sync {
     /// a shrunk/shifted doc never leaves stale chunks serving deleted content.
     fn replace_doc(&self, doc: &DocWrite) -> anyhow::Result<()>;
 
+    /// Replace a source file and ALL its nodes atomically: the `file` node, each code
+    /// node with its verbatim text, each comment node, and the edges binding them
+    /// (`part_of` file, `in_node`, `describes`). Prunes anything previously linked to
+    /// this file that is not in the write — so re-ingesting a shrunk or reordered file
+    /// never leaves a node serving deleted code.
+    ///
+    /// Same contract as [`GraphStore::replace_doc`], for the same reason: re-ingest is
+    /// how staleness is prevented, and it is only safe if replacement is atomic.
+    ///
+    /// Default is a no-op error so a store that has not implemented it fails loudly
+    /// rather than silently accepting writes it drops.
+    fn replace_file(&self, _file: &crate::projection::ingest::FileWrite) -> anyhow::Result<()> {
+        anyhow::bail!("replace_file is not implemented by this store")
+    }
+
+    /// Text search over ingested SOURCE, for `search_files`: BM25 over code and comment
+    /// nodes, returning `(node_key, text)` best first. Keys are `code:{path}#{order}` and
+    /// `comment:{path}#{n}`, so a hit carries its own path and — via the order key — the
+    /// means to derive a line number without re-reading the file.
+    ///
+    /// This is the soft half of search. A literal scan finds `foo_bar`; this finds the
+    /// function whose comment says "parses the bar out of a foo". Default is empty so a
+    /// store without it degrades to literal-only rather than erroring.
+    fn code_search(&self, _query: &str, _k: usize) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
+    /// Place a file in its directory and record what it describes.
+    ///
+    /// This is what joins the two graphs. Until it is called, `DocIngest` builds
+    /// doc->chunk and `replace_file` builds file->code with nothing between them, so the
+    /// prose explaining a subsystem cannot be reached from the subsystem's code.
+    ///
+    /// `describes` comes from [`projection::docmap`](crate::projection::docmap), which
+    /// derives every link and guesses none.
+    fn place_file(&self, _path: &str, _describes: &[String]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Every code node of one file, in order, as projection nodes — so a caller can
+    /// `project` them and get a `Placement` per node.
+    ///
+    /// This is how a line number is *derived* rather than stored. A line written at
+    /// ingest time is invalidated by the next edit anywhere above it; replaying the
+    /// file's own nodes is correct by construction, which is the property the sparse
+    /// order key and byte-exact composition were built to give.
+    fn file_nodes(&self, _path: &str) -> anyhow::Result<Vec<crate::projection::Node>> {
+        Ok(Vec::new())
+    }
+
     /// Every ingested document as `(doc_id, title)`, so the UI can show what the
     /// doc GraphRAG holds (ingest -> list -> ask). Chunks/provenance nodes are
     /// excluded (kind == "doc" only).
@@ -134,7 +184,9 @@ pub mod embedded {
     const VEC_LABEL: &str = "embedding";
     const REL_EMBEDDING: &str = "embedding_of";
     /// Relations `neighbors` walks (out-edge scans are per-label in helix).
-    const NEIGHBOR_RELS: &[&str] = &["part_of", "emitted_from", "produced_by", "has_chunk"];
+    const NEIGHBOR_RELS: &[&str] =
+        &["part_of", "emitted_from", "produced_by", "has_chunk", "has_code", "has_comment",
+          "in_node", "in_dir", "describes", "about", "noted_by", "supersedes"];
 
     /// insert_v/search_v want a filter type even when unused (helix's own tests
     /// pass this fn-pointer turbofish).
@@ -426,7 +478,7 @@ pub mod embedded {
             let new_ids: std::collections::HashSet<&str> =
                 doc.chunks.iter().map(|(id, _, _)| id.as_str()).collect();
             for stale in existing.iter().filter(|k| !new_ids.contains(k.as_str())) {
-                self.drop_chunk_in(&mut txn, &arena, stale)?;
+                self.drop_node_in(&mut txn, &arena, stale)?;
             }
 
             for (chunk_id, text, embedding) in &doc.chunks {
@@ -436,13 +488,151 @@ pub mod embedded {
                 let doc_id = self
                     .find_id(&txn, &arena, &doc.doc_id)
                     .ok_or_else(|| anyhow::anyhow!("doc node vanished mid-write"))?;
-                match G::new_mut(&self.storage, &arena, &mut txn)
-                    .add_edge("has_chunk", None, doc_id, node_id, false, true)
-                    .collect_to_obj()
-                {
-                    Ok(_) => {}
-                    Err(e) if format!("{e:?}").contains("DuplicateKey") => {}
-                    Err(e) => return Err(anyhow::anyhow!("link chunk {chunk_id}: {e:?}")),
+                self.link_in(&mut txn, &arena, "has_chunk", doc_id, node_id)?;
+            }
+            txn.commit()?;
+            Ok(())
+        }
+
+        fn code_search(&self, query: &str, k: usize) -> anyhow::Result<Vec<(String, String)>> {
+            // Decompose first. BM25 sums per-term contributions, which IS blending: a
+            // document matching one clause emphatically outranks one matching every
+            // clause moderately. Measured on near-identical siblings, blended scoring
+            // plateaued where per-axis scoring rank-combined did not, so each axis gets
+            // its own search and the rankings are combined.
+            //
+            // `query_axes` returns the whole query when there is nothing to split, so a
+            // single-clause search runs exactly one pass — unchanged from before.
+            let axes = crate::projection::query_axes(query);
+            if axes.len() < 2 {
+                return self.code_search_one(query, k);
+            }
+            // Over-fetch per axis: a document mid-table on one axis and top on another
+            // must still reach the combiner, and `k` alone would cut it first.
+            let fetch = k * 4;
+            let mut per_axis: Vec<Vec<String>> = Vec::with_capacity(axes.len());
+            let mut text_of: std::collections::HashMap<String, String> = Default::default();
+            for axis in &axes {
+                let hits = self.code_search_one(axis, fetch)?;
+                per_axis.push(hits.iter().map(|(key, _)| key.clone()).collect());
+                text_of.extend(hits);
+            }
+            // A document absent from an axis ranked below everything that axis returned.
+            // Charge it rather than treating a missing value as free.
+            Ok(crate::projection::rank_combine(&per_axis, fetch + 1)
+                .into_iter()
+                .take(k)
+                .filter_map(|key| text_of.remove(&key).map(|t| (key, t)))
+                .collect())
+        }
+
+        /// Every code node of one file, as projection nodes in order.
+        ///
+        /// This is what makes a line number derivable from the graph instead of stored:
+        /// `project` returns a `Placement` per node, so "which line is this hit on" is
+        /// answered by replaying the file's own nodes, not by trusting a number written
+        /// at ingest time that any later edit would invalidate.
+        fn file_nodes(&self, path: &str) -> anyhow::Result<Vec<crate::projection::Node>> {
+            let arena = Bump::new();
+            let txn = self.storage.graph_env.read_txn()?;
+            let Some(fid) = self.find_id(&txn, &arena, &format!("file:{path}")) else {
+                return Ok(Vec::new());
+            };
+            let kids: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
+                .n_from_id(&fid)
+                .out_node("has_code")
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("code nodes of {path}: {e:?}"))?;
+            let mut nodes: Vec<crate::projection::Node> = kids
+                .iter()
+                .filter_map(|n| {
+                    let key = prop_str(n, "key");
+                    let order: u64 = key.rsplit('#').next()?.parse().ok()?;
+                    Some(crate::projection::Node {
+                        path: path.to_string(),
+                        order,
+                        // `kind` is `&'static str` in the projection and arrives here as
+                        // a runtime string; projection only compares it against
+                        // "trivia", so that is the distinction worth preserving.
+                        kind: if prop_str(n, "kind") == "trivia" { "trivia" } else { "item" },
+                        text: prop_str(n, "label"),
+                    })
+                })
+                .collect();
+            nodes.sort_by_key(|n| n.order);
+            Ok(nodes)
+        }
+
+        fn place_file(&self, path: &str, describes: &[String]) -> anyhow::Result<()> {
+            let arena = Bump::new();
+            let mut txn = self.storage.graph_env.write_txn()?;
+
+            let file_node = self.upsert_in(&mut txn, &arena, &format!("file:{path}"), "source_file", path)?;
+            if let Some((parent, _)) = path.rsplit_once('/') {
+                let dir = self.upsert_in(&mut txn, &arena, &format!("dir:{parent}"), "dir", parent)?;
+                self.link_in(&mut txn, &arena, "in_dir", file_node, dir)?;
+            }
+            for target in describes {
+                // The described directory may hold no ingested file yet — a doc can name
+                // a subsystem before its code is walked — so the node is upserted rather
+                // than looked up, and the edge is never dropped for arriving early.
+                let dir = self.upsert_in(&mut txn, &arena, &format!("dir:{target}"), "dir", target)?;
+                self.link_in(&mut txn, &arena, "describes", file_node, dir)?;
+            }
+            txn.commit()?;
+            Ok(())
+        }
+
+        fn replace_file(&self, file: &crate::projection::ingest::FileWrite) -> anyhow::Result<()> {
+            let arena = Bump::new();
+            let mut txn = self.storage.graph_env.write_txn()?;
+
+            // What this file currently owns, so a re-ingest that shrinks or reorders it
+            // prunes rather than leaving a node serving deleted code. Same reason
+            // `replace_doc` collects chunks first.
+            let mut existing: Vec<String> = Vec::new();
+            if let Some(fid) = self.find_id(&txn, &arena, &file.file_id) {
+                for rel in ["has_code", "has_comment"] {
+                    let kids: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
+                        .n_from_id(&fid)
+                        .out_node(rel)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| anyhow::anyhow!("list {rel} of {}: {e:?}", file.path))?;
+                    existing.extend(kids.iter().map(|c| prop_str(c, "key")));
+                }
+            }
+
+            let file_node = self.upsert_in(&mut txn, &arena, &file.file_id, "source_file", &file.path)?;
+
+            let fresh: std::collections::HashSet<&str> = file
+                .code
+                .iter()
+                .map(|c| c.id.as_str())
+                .chain(file.comments.iter().map(|c| c.id.as_str()))
+                .collect();
+            for stale in existing.iter().filter(|k| !fresh.contains(k.as_str())) {
+                self.drop_node_in(&mut txn, &arena, stale)?;
+            }
+
+            // `label` carries the node's VERBATIM text, which is also what the BM25
+            // index sees on write — so a text search lands on the item containing the
+            // term rather than on the file. The order key is not stored separately: ids
+            // are `code:{path}#{order}`, so it is recoverable from the key, and a second
+            // copy could disagree with the id after a rebalance.
+            let mut ids: std::collections::HashMap<&str, u128> = Default::default();
+            for c in &file.code {
+                let id = self.upsert_in(&mut txn, &arena, &c.id, c.kind, &c.text)?;
+                ids.insert(c.id.as_str(), id);
+                self.link_in(&mut txn, &arena, "has_code", file_node, id)?;
+            }
+            for c in &file.comments {
+                let id = self.upsert_in(&mut txn, &arena, &c.id, "comment", &c.text)?;
+                self.link_in(&mut txn, &arena, "has_comment", file_node, id)?;
+                // The comment -> code binding, which is the whole point of extracting
+                // comments as their own pass: "what does this comment describe" is an
+                // edge traversal, not a line-number comparison.
+                if let Some(target) = c.in_node.as_deref().and_then(|k| ids.get(k)) {
+                    self.link_in(&mut txn, &arena, "in_node", id, *target)?;
                 }
             }
             txn.commit()?;
@@ -547,7 +737,93 @@ pub mod embedded {
         /// ponytail: drop_node does NOT remove the node's BM25 doc at helix v2.3.5,
         /// so a pruned chunk lingers in BM25 text search until the index is rebuilt;
         /// the vector + node are gone, so vector search and graph walks are clean.
-        fn drop_chunk_in<'a>(
+        /// One BM25 pass. `code_search` runs this once per query axis.
+        fn code_search_one(&self, query: &str, k: usize) -> anyhow::Result<Vec<(String, String)>> {
+            let arena = Bump::new();
+            let txn = self.storage.graph_env.read_txn()?;
+            // Over-fetch and post-filter, like `doc_search`: one BM25 corpus holds docs,
+            // provenance and now source. ponytail: with source ingested the corpus is
+            // genuinely crowded — millions of code nodes against thousands of chunks —
+            // so the doc side is the one that will lose recall first. The upgrade is a
+            // per-corpus label rather than a bigger over-fetch; do it when doc recall
+            // measurably drops.
+            let fetch = (k * 8).max(64);
+            let bm: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
+                .search_bm25(LABEL, query, fetch)
+                .map_err(|e| anyhow::anyhow!("bm25 search: {e:?}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("bm25 collect: {e:?}"))?;
+            let mut out = Vec::new();
+            for h in &bm {
+                if out.len() >= k {
+                    break;
+                }
+                let key = prop_str(h, "key");
+                // Trivia is whitespace between items: it can match a query only by
+                // accident, and a hit on it points at nothing a reader wants.
+                if prop_str(h, "kind") == "trivia" {
+                    continue;
+                }
+                if !(key.starts_with("code:") || key.starts_with("comment:")) {
+                    continue;
+                }
+                let text = prop_str(h, "label");
+                // Drop hits that matched on IDENTITY rather than content.
+                //
+                // helix BM25-indexes every property (`bm25::term_counts_for_node`
+                // iterates the whole map), and our key is `code:{path}#{order}` — so a
+                // query naming any path fragment matches every node in every file
+                // beneath it, whatever those nodes say. Measured: "frobnicator" hits
+                // both nodes of `drivers/frobnicator/widget.c` although the word appears
+                // nowhere in the source. On a kernel-sized tree "drm" would return
+                // millions of nodes on identity alone.
+                //
+                // The real fix is field-selective indexing, which means forking the
+                // vendored engine. This filter costs nothing and removes the false hits;
+                // it does not recover the write time or the storage they cost.
+                let lower = text.to_lowercase();
+                let terms: Vec<String> = query
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|t| t.len() > 2)
+                    .map(|t| t.to_lowercase())
+                    .collect();
+                // With no term long enough to check against, the filter cannot tell an
+                // identity match from a content one — so it must pass the hit through
+                // rather than discard it. `.any()` over an empty iterator is false, and
+                // the first version of this returned NOTHING for every query made only
+                // of short tokens: `fd`, `mm`, `sk`, `nr`, `rq` are ordinary C
+                // identifiers, so that silently broke a whole class of searches.
+                if terms.is_empty() || terms.iter().any(|t| lower.contains(t)) {
+                    out.push((key, text));
+                }
+            }
+            Ok(out)
+        }
+
+        /// A duplicate-tolerant edge write inside an open txn.
+        ///
+        /// `is_unique=true` makes helix refuse a second `(from, rel, to)`, which is
+        /// exactly the idempotence a re-ingest needs — so the refusal is swallowed
+        /// rather than propagated.
+        fn link_in<'a>(
+            &'a self,
+            txn: &mut heed3::RwTxn<'a>,
+            arena: &'a Bump,
+            rel: &'static str,
+            from: u128,
+            to: u128,
+        ) -> anyhow::Result<()> {
+            match G::new_mut(&self.storage, arena, txn)
+                .add_edge(rel, None, from, to, false, true)
+                .collect_to_obj()
+            {
+                Ok(_) => Ok(()),
+                Err(e) if format!("{e:?}").contains("DuplicateKey") => Ok(()),
+                Err(e) => Err(anyhow::anyhow!("link -{rel}-> : {e:?}")),
+            }
+        }
+
+        fn drop_node_in<'a>(
             &'a self,
             txn: &mut heed3::RwTxn<'a>,
             arena: &'a Bump,
@@ -560,7 +836,7 @@ pub mod embedded {
                 .n_from_id(&node_id)
                 .out_vec(REL_EMBEDDING, false)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("embeddings of stale chunk {key}: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("embeddings of stale node {key}: {e:?}"))?;
             for v in &vecs {
                 self.storage
                     .drop_vector(txn, &v.id())
@@ -568,7 +844,7 @@ pub mod embedded {
             }
             self.storage
                 .drop_node(txn, &node_id)
-                .map_err(|e| anyhow::anyhow!("drop stale chunk {key}: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("drop stale node {key}: {e:?}"))?;
             Ok(())
         }
     }
@@ -608,6 +884,362 @@ pub mod embedded {
                 .unwrap()
                 .is_empty());
 
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// The register row that has been UNTESTED for want of anything to test against:
+        /// does a re-ingest after an edit leave the index fresh?
+        ///
+        /// Ingest a file, edit it so one item changes and one is removed, re-ingest, and
+        /// check that the store now serves the new text and no longer serves the old.
+        /// Staleness here is the failure mode that matters — an index that answers with
+        /// deleted code is worse than one that answers nothing.
+        #[test]
+        fn reingest_after_an_edit_leaves_no_stale_nodes() {
+            use crate::projection::{self, ingest};
+            // Tag must be unique across tests: it is the store path, and two tests
+            // opening one LMDB env fails with "Env already open".
+            let dir = scratch_dir("reingest-file");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let path = "src/lib.rs";
+            let lang = projection::for_path(path);
+            let v1 = "// greet\nfn hello() { 1 }\n\n// doomed\nfn removed() { 2 }\n";
+            let fw1 = ingest::file(lang.as_ref(), path, v1).unwrap();
+            store.replace_file(&fw1).unwrap();
+
+            // The file node owns its code and comments.
+            let kids = store.neighbors(&fw1.file_id).unwrap();
+            assert!(kids.len() > 1, "file node should have code/comment neighbours");
+            assert!(
+                kids.iter().any(|n| n.label.contains("doomed")),
+                "the comment that is about to be deleted must be there first"
+            );
+
+            // Edit: one item's body changes, the second item and its comment go away.
+            let v2 = "// greet\nfn hello() { 42 }\n";
+            let fw2 = ingest::file(lang.as_ref(), path, v2).unwrap();
+            store.replace_file(&fw2).unwrap();
+
+            let after = store.neighbors(&fw2.file_id).unwrap();
+            let labels: Vec<&str> = after.iter().map(|n| n.label.as_str()).collect();
+            assert!(
+                labels.iter().any(|l| l.contains("42")),
+                "the edited body must be served: {labels:?}"
+            );
+            assert!(
+                !labels.iter().any(|l| l.contains("doomed")),
+                "a deleted comment must be pruned, not left serving removed code: {labels:?}"
+            );
+            assert!(
+                !labels.iter().any(|l| l.contains("fn removed")),
+                "a deleted item must be pruned: {labels:?}"
+            );
+
+            // And the file still projects byte-exactly from what the store now holds.
+            assert_eq!(ingest::project(&fw2), v2);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// The payoff: a search hit carries a line number the graph DERIVED.
+        ///
+        /// Nothing stores a line. The store returns the file's code nodes in order,
+        /// `project` replays them and reports where each landed, and the hit's order key
+        /// picks its placement — so the number is correct after an edit above it, which a
+        /// stored line would not be.
+        #[test]
+        fn code_search_hits_carry_a_derived_line_number() {
+            use crate::projection::{self, ingest};
+            let dir = scratch_dir("codesearch");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let path = "src/net.rs";
+            let lang = projection::for_path(path);
+            let src = "fn first() { 1 }\n\n\
+                       /// Resolves a hostname through the configured resolver.\n\
+                       fn resolve_hostname() { 2 }\n";
+            let fw = ingest::file(lang.as_ref(), path, src).unwrap();
+            store.replace_file(&fw).unwrap();
+
+            // BM25 over words that appear in the doc comment, not in the identifier a
+            // literal scan would need — this is the soft half doing something grep cannot.
+            let hits = store.code_search("resolver hostname", 8).unwrap();
+            assert!(!hits.is_empty(), "expected a BM25 hit on the ingested source");
+
+            let nodes = store.file_nodes(path).unwrap();
+            assert!(!nodes.is_empty(), "file_nodes must return the file's code nodes");
+            // What the store holds still composes back to the original file.
+            assert_eq!(projection::project(&nodes).0, src, "graph must project byte-exactly");
+
+            let places = projection::project(&nodes).1;
+            let lines: Vec<usize> = hits
+                .iter()
+                .filter(|(k, _)| k.starts_with("code:"))
+                .filter_map(|(k, _)| k.rsplit('#').next()?.parse::<u64>().ok())
+                .filter_map(|order| places.iter().find(|p| p.order == order))
+                .map(|p| p.start_line)
+                .collect();
+            assert!(
+                !lines.is_empty(),
+                "a code hit must resolve to a placement: {hits:?}"
+            );
+            // Line 3, not 4: a doc comment is part of its item's span in `syn`, so the
+            // node — and therefore the hit — starts at `/// Resolves…` rather than at
+            // `fn`. That is the right answer for "where is this item", and it is why the
+            // line is derived from the node cover rather than from a grep of the text.
+            assert!(
+                lines.contains(&3),
+                "derived line should point at the item including its doc comment, got {lines:?}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// The join: from code, reach the prose that describes it.
+        ///
+        /// Before `place_file` the store held two disconnected graphs — doc->chunk and
+        /// file->code — so a subsystem's documentation sat in the same database as its
+        /// code with no path between them. This walks the path that now exists.
+        #[test]
+        fn prose_is_reachable_from_the_code_it_describes() {
+            use crate::projection::{self, docmap, ingest};
+            let dir = scratch_dir("docjoin");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let known: std::collections::BTreeSet<String> =
+                ["drivers/pci"].iter().map(|s| s.to_string()).collect();
+
+            // The code, placed in its directory.
+            let code_path = "drivers/pci/quirks.c";
+            let src = "/* Work around a broken BIOS. */\nvoid quirk(void) { }\n";
+            let lang = projection::for_path(code_path);
+            store.replace_file(&ingest::file(lang.as_ref(), code_path, src).unwrap()).unwrap();
+            store.place_file(code_path, &[]).unwrap();
+
+            // The prose, which NAMES that directory.
+            let doc_path = "Documentation/PCI/quirks.rst";
+            let doc = "Quirk handling\n\nThe workarounds live in drivers/pci/quirks.c.";
+            let links = docmap::describes(doc_path, doc, &known);
+            assert_eq!(links, vec!["drivers/pci"], "the doc must cite the code's directory");
+            let dlang = projection::for_path(doc_path);
+            store.replace_file(&ingest::file(dlang.as_ref(), doc_path, doc).unwrap()).unwrap();
+            store.place_file(doc_path, &links).unwrap();
+
+            // Walk it: code file -> its directory -> everything describing that directory.
+            let around_code = store.neighbors(&format!("file:{code_path}")).unwrap();
+            let dir_node = around_code
+                .iter()
+                .find(|n| n.id == "dir:drivers/pci")
+                .expect("code file should be placed in its directory");
+
+            let around_dir = store.neighbors(&dir_node.id).unwrap();
+            assert!(
+                around_dir.iter().any(|n| n.id == format!("file:{doc_path}")),
+                "the documentation must be reachable from the directory: {:?}",
+                around_dir.iter().map(|n| &n.id).collect::<Vec<_>>()
+            );
+            // And a source file must not claim to describe a directory just for naming
+            // it — that guard is what keeps the edges meaningful.
+            assert!(docmap::describes(code_path, src, &known).is_empty());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// Node ids are BM25-indexed along with content, so a path fragment used to match
+        /// every node in that file. This pins the filter that stops it.
+        ///
+        /// helix tokenises EVERY property (`bm25::term_counts_for_node` iterates the
+        /// whole map), and our `key` is `code:{path}#{order}`. That makes identity
+        /// searchable as if it were content: a query naming a directory hits every node
+        /// of every file under it, whatever those nodes actually say.
+        #[test]
+        fn path_fragments_do_not_match_content() {
+            use crate::projection::{self, ingest};
+            let dir = scratch_dir("keyleak");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let path = "drivers/frobnicator/widget.c";
+            let src = "void a(int fd) { }\n\nvoid b(int mm) { }\n";
+            let lang = projection::for_path(path);
+            store.replace_file(&ingest::file(lang.as_ref(), path, src).unwrap()).unwrap();
+
+            // "frobnicator" appears nowhere in the file's TEXT — only in its path.
+            assert!(!src.contains("frobnicator"));
+            // A query of only SHORT tokens must still work. `fd`, `mm`, `sk`, `nr` are
+            // ordinary C identifiers, and a filter that needs a >2-char term to confirm
+            // a match would silently return nothing for every one of them.
+            // Upstream limit, pinned so it is not rediscovered as a mystery: helix's
+            // BM25 tokeniser drops any token of 2 characters or fewer, at index time and
+            // at query time alike (`bm25.rs`, `if SHOULD_FILTER && token.len() <= 2`).
+            // So `code_search` CANNOT find `fd`, `mm`, `sk`, `nr`, `id`, `rq` — a large
+            // share of C identifiers — however plainly they appear in the source. This
+            // is why `search_files` appends BM25 to its literal scan instead of replacing
+            // it: grep finds exactly the identifiers BM25 is blind to.
+            assert!(src.contains("fd") && src.contains("mm"));
+            assert!(store.code_search("fd", 16).unwrap().is_empty(), "≤2-char terms are dropped upstream");
+            assert!(!store.code_search("void", 16).unwrap().is_empty(), "longer terms are found");
+
+            let hits = store.code_search("frobnicator", 16).unwrap();
+            assert!(
+                hits.is_empty(),
+                "a term present only in the path must not match content: {hits:?}"
+            );
+            // A term that IS in the text still matches, so the filter has not simply
+            // disabled search.
+            let real = store.code_search("void", 16).unwrap();
+            assert!(!real.is_empty(), "content search must still work");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A re-ingest through the store must PRESERVE keys, not renumber the file.
+        ///
+        /// This is the end-to-end version of what `reconcile` proves in isolation: read
+        /// the stored nodes back, reconcile the new source against them, write. If the
+        /// daemon skips the read-back it re-addresses every node for a one-line change,
+        /// and the sparse key buys nothing in production however well it tests.
+        #[test]
+        fn reingest_through_the_store_preserves_order_keys() {
+            use crate::projection::{self, ingest};
+            let dir = scratch_dir("keypreserve");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let path = "src/lib.rs";
+            let lang = projection::for_path(path);
+            let v1 = "fn a() { 1 }\n\nfn b() { 2 }\n";
+            let (fw1, _) = ingest::file_against(lang.as_ref(), path, v1, &[]).unwrap();
+            store.replace_file(&fw1).unwrap();
+            let before: Vec<u64> = store.file_nodes(path).unwrap().iter().map(|n| n.order).collect();
+
+            // Insert a leading item: every EXISTING node must keep its key.
+            let v2 = "use std::io;\n\nfn a() { 1 }\n\nfn b() { 2 }\n";
+            let stored = store.file_nodes(path).unwrap();
+            let (fw2, update) = ingest::file_against(lang.as_ref(), path, v2, &stored).unwrap();
+            store.replace_file(&fw2).unwrap();
+
+            let after: Vec<u64> = store.file_nodes(path).unwrap().iter().map(|n| n.order).collect();
+            assert!(!update.rebalanced, "an insert at the top must not force a rebalance");
+            for key in &before {
+                assert!(
+                    after.contains(key),
+                    "existing node {key} was renumbered; keys before {before:?} after {after:?}"
+                );
+            }
+            assert!(after.len() > before.len(), "the new item should have been added");
+            // And the store still composes the edited file byte-exactly.
+            assert_eq!(projection::project(&store.file_nodes(path).unwrap()).0, v2);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A multi-clause query must not be won by a document that nails one clause.
+        ///
+        /// This is the blended-scoring failure, reproduced against the real store: one
+        /// file is emphatic about producers and silent about progress guarantees, one is
+        /// emphatic about wait-freedom and silent about producers, and one covers both
+        /// moderately. BM25 sums per-term contributions, so a single pass rewards the
+        /// emphatic file; per-axis search rank-combined rewards the file that answers
+        /// the whole question.
+        #[test]
+        fn a_multi_clause_query_prefers_the_file_answering_every_clause() {
+            use crate::projection::{self, ingest};
+            let dir = scratch_dir("axes");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let files = [
+                // Emphatic on producers only.
+                ("src/many.rs", "// many producer threads producer threads producer threads enqueue here\nfn a() { }\n"),
+                // Emphatic on progress only.
+                ("src/wait.rs", "// waitfree progress waitfree progress bounded steps guaranteed\nfn b() { }\n"),
+                // Moderate on both — the correct answer to a query asking for both.
+                ("src/both.rs", "// many producer threads with waitfree progress\nfn c() { }\n"),
+            ];
+            for (path, src) in files {
+                let lang = projection::for_path(path);
+                store.replace_file(&ingest::file(lang.as_ref(), path, src).unwrap()).unwrap();
+            }
+
+            let hits = store
+                .code_search("many producer threads and waitfree progress", 8)
+                .unwrap();
+            assert!(!hits.is_empty(), "expected hits for a two-clause query");
+            // Assert on the FILE, not the node kind: the text lives in a comment here,
+            // so `comment:src/both.rs#0` winning is the right answer and `code:` would
+            // be the wrong thing to require.
+            let top = &hits[0].0;
+            assert!(
+                top.contains("src/both.rs"),
+                "a two-clause query should be won by the file answering both clauses, got {top}"
+            );
+
+            // And the decomposition must not have broken single-clause search.
+            let single = store.code_search("waitfree progress", 8).unwrap();
+            assert!(
+                single.iter().any(|(k, _)| k.contains("src/wait.rs")),
+                "single-clause search must still find the emphatic file: {single:?}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A corrected note stays in the store, attributed, alongside what corrected it.
+        ///
+        /// The design bet is that wrong notes are unavoidable and what matters is what
+        /// happens to them. So this asserts the uncomfortable half: after a correction,
+        /// the WRONG note is still there, still says what it said, and still names the
+        /// task that wrote it — with a `supersedes` edge pointing at it. Deleting it
+        /// would destroy the evidence that a claim was ever contested.
+        #[test]
+        fn a_corrected_note_survives_with_its_supersession() {
+            let dir = scratch_dir("notes");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+
+            let file = "file:src/graph.rs";
+            store.upsert_node(file, "source_file", "src/graph.rs").unwrap();
+
+            // Task 1 asserts something false — the shape of a real mistake: plausible,
+            // and wrong. No filter on the way in could have caught it.
+            store.upsert_node("task-1", "task", "task-1").unwrap();
+            store.upsert_node("note:task-1#0", "asserted", "replace_file is not implemented").unwrap();
+            store.add_edge("note:task-1#0", "noted_by", "task-1").unwrap();
+            store.add_edge("note:task-1#0", "about", file).unwrap();
+
+            // Task 2 observes the opposite and supersedes it.
+            store.upsert_node("task-2", "task", "task-2").unwrap();
+            store.upsert_node("note:task-2#0", "observed", "run tests\n1 passed replace_file writes").unwrap();
+            store.add_edge("note:task-2#0", "noted_by", "task-2").unwrap();
+            store.add_edge("note:task-2#0", "about", file).unwrap();
+            store.add_edge("note:task-2#0", "supersedes", "note:task-1#0").unwrap();
+
+            // Both notes hang off the file: the correction did not remove the claim.
+            let around = store.neighbors(file).unwrap();
+            let ids: Vec<&str> = around.iter().map(|n| n.id.as_str()).collect();
+            assert!(ids.contains(&"note:task-1#0"), "the superseded note must remain: {ids:?}");
+            assert!(ids.contains(&"note:task-2#0"), "the correcting note must be present: {ids:?}");
+
+            // The wrong note keeps its text and its provenance, so a reader can see both
+            // that it was a claim and who made it.
+            let wrong = around.iter().find(|n| n.id == "note:task-1#0").unwrap();
+            assert_eq!(wrong.kind, "asserted");
+            assert!(wrong.label.contains("not implemented"));
+            let from_wrong = store.neighbors("note:task-1#0").unwrap();
+            assert!(
+                from_wrong.iter().any(|n| n.id == "task-1"),
+                "attribution must survive correction: {:?}",
+                from_wrong.iter().map(|n| &n.id).collect::<Vec<_>>()
+            );
+            // And the supersession is reachable from the note it corrects.
+            assert!(
+                from_wrong.iter().any(|n| n.id == "note:task-2#0"),
+                "the correction must be reachable from the claim it corrects"
+            );
+
+            // Provenance distinguishes them, which is the whole point: one is a tool
+            // result, the other an agent's sentence.
+            let right = around.iter().find(|n| n.id == "note:task-2#0").unwrap();
+            assert_eq!(right.kind, "observed");
             std::fs::remove_dir_all(&dir).ok();
         }
 

@@ -17,15 +17,23 @@ mod doctor;
 #[cfg(feature = "fuse")]
 mod fuse;
 mod graph;
+mod graphvfs;
 mod hipfire;
+mod normalize;
 #[cfg(feature = "docling")]
 mod ingest;
 mod plan_graph;
 mod project;
 mod planner;
 mod roles;
-// Projection-fidelity checks. Test-only until a projector exists that uses them at
-// runtime — better than an allow(dead_code) on a module that looks like API.
+mod bench_ingest;
+#[cfg(test)]
+mod bench_history;
+#[cfg(test)]
+mod bench_siblings;
+mod projection;
+// Projection-fidelity checks. Test-only: these MEASURE the projection rather than
+// performing it, and their corpora are whole repositories.
 #[cfg(test)]
 mod roundtrip;
 mod sandbox;
@@ -35,6 +43,7 @@ mod skills;
 mod swarm;
 mod telemetry;
 mod terminal;
+mod trace;
 mod toolcall;
 mod tools;
 mod vfs;
@@ -50,6 +59,16 @@ async fn main() -> anyhow::Result<()> {
     // `corrode-daemon doctor` — host readiness checks, then exit (no server).
     if std::env::args().nth(1).as_deref() == Some("doctor") {
         let ok = doctor::run().await;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
+    // `corrode-daemon normalize [--write]` — bring the repo to its formatters' normal
+    // form, or report what would change. Checking is the default: the writing form
+    // rewrites every tracked file.
+    if std::env::args().nth(1).as_deref() == Some("normalize") {
+        let write = std::env::args().any(|a| a == "--write");
+        let root = std::env::var("CORRODE_REPO").unwrap_or_else(|_| ".".to_string());
+        let ok = normalize::main(&project::Project::load(std::path::Path::new(&root)), write);
         std::process::exit(if ok { 0 } else { 1 });
     }
 
