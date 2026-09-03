@@ -66,6 +66,24 @@ pub enum ParseFormat {
     /// live: zaya1-8b picks the right tool with correct args in this shape once tools
     /// are declared — reliable native tool-calling WITHOUT the Needle shim.
     ZyphraXml,
+    /// Qwen's native tool call: one call per `<tool_call>` block, in EITHER of the two
+    /// shapes served Qwen builds emit.
+    ///
+    /// - `<tool_call>{"name":"f","arguments":{"p":"v"}}</tool_call>` — Hermes-style JSON,
+    ///   what upstream Qwen documents.
+    /// - `<tool_call><invoke name="f"><parameter name="p">v</parameter></invoke></tool_call>`
+    ///   — what `Qwen3.5-9B--oq4.25++` actually emits here, verified live 2026-09-03.
+    ///
+    /// Both are accepted because the artifact decides which, not the model family: the
+    /// documented shape was assumed first and the live model emitted the other one, so
+    /// pinning to either alone silently drops every call the model makes.
+    ///
+    /// This is the shape that was already being thrown away. `tools.rs` records a 35B
+    /// "emitting `<tool_call>` blocks nothing read" while the swarm answered repository
+    /// questions by guessing — the model was calling tools and the harness had no parser
+    /// for it. Distinct from [`ParseFormat::JsonArray`], which expects one JSON *array*
+    /// rather than a block per call.
+    QwenToolCall,
 }
 
 /// A model's tool dialect: how to render tool schemas, how to parse its calls, and the
@@ -157,7 +175,10 @@ impl ToolDialect {
     /// and the reply is parsed directly — no Needle in the loop. False for dialects
     /// whose calls are constructed for the model (the Needle-flat / json-array default).
     pub fn emits_own_calls(&self) -> bool {
-        matches!(self.parse, ParseFormat::MiniCpmXml | ParseFormat::ZyphraXml)
+        matches!(
+            self.parse,
+            ParseFormat::MiniCpmXml | ParseFormat::ZyphraXml | ParseFormat::QwenToolCall
+        )
     }
 
     /// Tools rendered for the `tools` field of a chat/responses request.
@@ -187,6 +208,7 @@ impl ToolDialect {
                 .map_err(|e| anyhow::anyhow!("parsing tool calls from {trimmed:?}: {e}"))?,
             ParseFormat::MiniCpmXml => parse_minicpm_xml(raw),
             ParseFormat::ZyphraXml => parse_zyphra_xml(raw),
+            ParseFormat::QwenToolCall => parse_qwen_tool_call(raw),
         };
         Ok(calls
             .into_iter()
@@ -220,6 +242,13 @@ impl Default for Dialects {
                 (
                     "*zaya*".to_string(),
                     ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::ZyphraXml, HashMap::new()),
+                ),
+                // Qwen emits Hermes-style `<tool_call>` JSON once tools are declared. It
+                // was doing so already and being ignored, which is how a capable model
+                // ended up answering from guesswork — see `ParseFormat::QwenToolCall`.
+                (
+                    "*qwen*".to_string(),
+                    ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::QwenToolCall, HashMap::new()),
                 ),
             ],
             default: ToolDialect::default(),
@@ -305,6 +334,7 @@ impl ProfileConfig {
         let parse = match self.parse.as_str() {
             "json-array" => ParseFormat::JsonArray,
             "minicpm-xml" => ParseFormat::MiniCpmXml,
+            "qwen-tool-call" => ParseFormat::QwenToolCall,
             "zyphra-xml" => ParseFormat::ZyphraXml,
             other => anyhow::bail!("unknown parse format `{other}`"),
         };
@@ -396,6 +426,69 @@ mod tests {
     }
 
     #[test]
+    fn parse_qwen_tool_call_reads_the_hermes_shape() {
+        let d = ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::QwenToolCall, HashMap::new());
+
+        // The shape Qwen emits once tools are declared, reasoning and all.
+        let raw = "I should look at the file first.\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/lib.rs\"}}\n</tool_call>";
+        let calls = d.parse(raw).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/lib.rs");
+
+        // Several blocks, not one array — the difference from `JsonArray`.
+        let two = "<tool_call>{\"name\":\"list_dir\",\"arguments\":{\"path\":\".\"}}</tool_call>\n<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.rs\"}}</tool_call>";
+        assert_eq!(d.parse(two).unwrap().len(), 2);
+
+        // A malformed block must not discard the good one beside it: the model made that
+        // call correctly and dropping it costs a real action.
+        let mixed = "<tool_call>{not json}</tool_call><tool_call>{\"name\":\"list_dir\",\"arguments\":{\"path\":\".\"}}</tool_call>";
+        let ok = d.parse(mixed).unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].name, "list_dir");
+
+        // Truncated at the token cap: the call is complete, only the tag is missing.
+        let cut = "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"x\"}}";
+        assert_eq!(d.parse(cut).unwrap().len(), 1);
+
+        // No tool call at all is an answer, not an error.
+        assert!(d.parse("The file defines two functions.").unwrap().is_empty());
+
+        // The shape Qwen3.5-9B--oq4.25++ ACTUALLY emits, verbatim from a live run. The
+        // documented Hermes JSON was assumed first and this arrived instead, so both are
+        // parsed — pinning to either alone drops every call the model makes.
+        let invoke = "<tool_call>\n<invoke name=\"read_file\">\n<parameter name=\"path\">src/lib.rs</parameter>\n</invoke>\n</tool_call>";
+        let calls = d.parse(invoke).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/lib.rs");
+
+        // Multi-parameter, and a value containing `<` must not truncate the argument.
+        let two_params = "<tool_call><invoke name=\"write_file\"><parameter name=\"path\">a.rs</parameter><parameter name=\"contents\">if a < b { 1 }</parameter></invoke></tool_call>";
+        let w = d.parse(two_params).unwrap();
+        assert_eq!(w[0].arguments["path"], "a.rs");
+        assert_eq!(w[0].arguments["contents"], "if a < b { 1 }");
+
+        // An EMPTY block is not a call. This was the first live result: the harness read
+        // it as "no tool call", i.e. a final answer, and the swarm answered by guessing.
+        assert!(d.parse("<tool_call>\n</tool_call>").unwrap().is_empty());
+    }
+
+    #[test]
+    fn qwen_models_emit_their_own_calls_by_default() {
+        // The regression this closes: a Qwen model was emitting <tool_call> blocks that
+        // nothing parsed, so the swarm answered repo questions by guessing.
+        let d = Dialects::default();
+        for id in ["Qwen3.5-9B--oq4.25++", "Qwen3.6--35B-A3B.oq4.25++", "qwen3.8-27b"] {
+            let dialect = d.resolve(id);
+            assert!(dialect.emits_own_calls(), "{id} should route natively");
+            assert_eq!(dialect.parse, ParseFormat::QwenToolCall);
+        }
+        // Anything unrecognised still falls to the Needle default.
+        assert!(!d.resolve("some-other-model").emits_own_calls());
+    }
+
+    #[test]
     fn parse_maps_exposed_names_back_to_canonical() {
         let names = HashMap::from([("run_command".to_string(), "bash".to_string())]);
         let d = ToolDialect::new(SchemaFormat::NeedleFlat, ParseFormat::JsonArray, names);
@@ -462,6 +555,66 @@ mod tests {
 /// ponytail: string scan, not an XML parser. The grammar in hipfire constrains this
 /// shape at the token level, and values arrive either plain or CDATA-wrapped; a real
 /// parser buys nothing until the dialect grows attributes or nesting.
+/// Parse Qwen's `<tool_call>{…}</tool_call>` blocks.
+///
+/// Tolerant on purpose, because every deviation here costs a tool call the model made
+/// correctly: reasoning before the first block is skipped, a run of blocks yields a run
+/// of calls, and a block whose JSON does not parse is dropped rather than failing the
+/// whole reply — one malformed call should not discard the well-formed ones beside it.
+/// An unterminated final block is also read, since a reply truncated at the token cap
+/// otherwise loses a complete call.
+fn parse_qwen_tool_call(raw: &str) -> Vec<ToolCall> {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    let mut calls = Vec::new();
+    let mut rest = raw;
+    while let Some(at) = rest.find(OPEN) {
+        let after = &rest[at + OPEN.len()..];
+        let (body, next) = match after.find(CLOSE) {
+            Some(end) => (&after[..end], &after[end + CLOSE.len()..]),
+            None => (after, ""), // truncated tail: read it rather than lose the call
+        };
+        let body = body.trim();
+        if let Ok(c) = serde_json::from_str::<ToolCall>(body) {
+            if !c.name.is_empty() {
+                calls.push(c);
+            }
+        } else if let Some(c) = parse_invoke_xml(body) {
+            calls.push(c);
+        }
+        rest = next;
+    }
+    calls
+}
+
+/// `<invoke name="f"><parameter name="p">v</parameter>…</invoke>` — the body shape
+/// `Qwen3.5-9B--oq4.25++` emits inside its `<tool_call>` tags.
+fn parse_invoke_xml(body: &str) -> Option<ToolCall> {
+    const INVOKE: &str = "<invoke name=\"";
+    const PARAM: &str = "<parameter name=\"";
+    let at = body.find(INVOKE)?;
+    let after = &body[at + INVOKE.len()..];
+    let (name, mut rest) = after.split_once('"')?;
+    if name.is_empty() {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    while let Some(p) = rest.find(PARAM) {
+        let after = &rest[p + PARAM.len()..];
+        let Some((key, tail)) = after.split_once('"') else { break };
+        let Some((_, value_and_rest)) = tail.split_once('>') else { break };
+        // Values may contain `<`, so close on the parameter's own end tag rather than on
+        // the next `<`.
+        let (value, next) = match value_and_rest.split_once("</parameter>") {
+            Some((v, n)) => (v, n),
+            None => (value_and_rest, ""),
+        };
+        args.insert(key.to_string(), serde_json::Value::String(value.trim().to_string()));
+        rest = next;
+    }
+    Some(ToolCall { name: name.to_string(), arguments: serde_json::Value::Object(args) })
+}
+
 fn parse_minicpm_xml(raw: &str) -> Vec<ToolCall> {
     const FN_OPEN: &str = "<function name=\"";
     const PARAM_OPEN: &str = "<param name=\"";

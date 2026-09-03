@@ -1194,6 +1194,37 @@ already takes the whole prompt and leaves exactly the logits wanted. One prefill
 of the walk: **168 ms per pair, 11.4x**, with identical accuracy — the same logits,
 obtained the cheap way (hipfire #409).
 
+### A Qwen tool dialect
+
+`tools.rs` records a 35B "emitting `<tool_call>` blocks nothing read" while the swarm
+answered repository questions by guessing. That was still true: every Qwen model fell to
+the Needle default, and its own calls went unparsed.
+
+`ParseFormat::QwenToolCall` reads them, and `*qwen*` routes natively by default. Two
+shapes are accepted, because **the artifact decides which, not the model family**:
+
+- `<tool_call>{"name":"f","arguments":{…}}</tool_call>` — the Hermes JSON upstream
+  documents, and what this was written for first.
+- `<tool_call><invoke name="f"><parameter name="p">v</parameter></invoke></tool_call>` —
+  what `Qwen3.5-9B--oq4.25++` actually emits, found by running it.
+
+Assuming the documented shape produced an **empty** parse on the first live run: the model
+sent `invoke` XML, the parser wanted JSON, the block yielded no call, and the loop read
+that as a final answer — the identical failure the dialect was added to fix, one layer
+further in. Both shapes are parsed now, and the malformed-block case is a test rather than
+a discovery.
+
+Measured on the demo repo, same prompt and model, before and after:
+
+```
+before   settled: 3 outputs, 0 tool results
+after    settled: 5 outputs, 1 tool result
+```
+
+The parser is deliberately forgiving — a malformed block does not discard the well-formed
+ones beside it, and a reply truncated at the token cap still yields its last complete call
+— because every strictness here costs a tool call the model made correctly.
+
 ### Notes from traces, and what happens to the wrong ones
 
 Cold-generated documentation measured badly (a 9B calling a `Waitfree_MPMC_Queue`
@@ -1282,6 +1313,15 @@ The first store read returned **0 notes from a write that had happened** — the
 for neighbours of provenance `code:` nodes, and notes attach to `file:{path}`. Nearly
 recorded as "persistence is broken". `record_trace` now reports what it wrote, so the next
 such gap is visible from the log rather than from a guess.
+
+**Note yield tracks trouble, not work.** The 25% above came from a run where the agent
+was fighting its own tool-call formatting. Re-run after Qwen was given a native dialect —
+so its calls parsed and executed cleanly — the same prompt produced **zero** notes: the
+tool that ran was `read_file`, which the outcome/content split excludes by design, and
+nothing failed. That is the filter behaving correctly and it bounds what notes are for.
+They capture what went wrong or was discovered, not what a task did. A store of them will
+be a gotcha index, which is what the commit-message measurement already suggested, and it
+will be sparse on repositories where the swarm has an easy time.
 
 **The transcript fix is unvalidated, and the corpus is why.** The session used a shell for
 everything — 1,139 of 1,761 steps map to `run_command`, including greps and file reads —
