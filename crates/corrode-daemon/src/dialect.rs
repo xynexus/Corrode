@@ -84,6 +84,12 @@ pub enum ParseFormat {
     /// for it. Distinct from [`ParseFormat::JsonArray`], which expects one JSON *array*
     /// rather than a block per call.
     QwenToolCall,
+    /// `tool_name: f` / `tool_args:` with indented `key: value` lines — the shape
+    /// `Qwen3.6--35B-A3B.oq4.25++` and `Qwen3.8-27B--oq4.25++` emit, verified live
+    /// 2026-09-03. No delimiter and no JSON, so parsing is anchored to a line that
+    /// STARTS with `tool_name:`; anything looser would read prose mentioning a tool as a
+    /// call.
+    YamlToolCall,
 }
 
 /// A model's tool dialect: how to render tool schemas, how to parse its calls, and the
@@ -177,7 +183,10 @@ impl ToolDialect {
     pub fn emits_own_calls(&self) -> bool {
         matches!(
             self.parse,
-            ParseFormat::MiniCpmXml | ParseFormat::ZyphraXml | ParseFormat::QwenToolCall
+            ParseFormat::MiniCpmXml
+                | ParseFormat::ZyphraXml
+                | ParseFormat::QwenToolCall
+                | ParseFormat::YamlToolCall
         )
     }
 
@@ -209,6 +218,7 @@ impl ToolDialect {
             ParseFormat::MiniCpmXml => parse_minicpm_xml(raw),
             ParseFormat::ZyphraXml => parse_zyphra_xml(raw),
             ParseFormat::QwenToolCall => parse_qwen_tool_call(raw),
+            ParseFormat::YamlToolCall => parse_yaml_tool_call(raw),
         };
         Ok(calls
             .into_iter()
@@ -257,6 +267,14 @@ impl Default for Dialects {
                 // shape-agnostic: it builds the call from a plain-English line, so a new
                 // artifact's private format costs nothing. Add a rule here per artifact
                 // once its shape is verified, never per family.
+                // Qwen3.6-35B emits `tool_name:`/`tool_args:` YAML — a third shape
+                // within one model line, which is why these rules name artifacts. The
+                // 27B was assumed to share it and does not: it emits prose announcing
+                // intent and no call at all, so it stays on Needle.
+                (
+                    "*qwen3.6*".to_string(),
+                    ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::YamlToolCall, HashMap::new()),
+                ),
                 (
                     "*qwen3.5-9b*".to_string(),
                     ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::QwenToolCall, HashMap::new()),
@@ -346,6 +364,7 @@ impl ProfileConfig {
             "json-array" => ParseFormat::JsonArray,
             "minicpm-xml" => ParseFormat::MiniCpmXml,
             "qwen-tool-call" => ParseFormat::QwenToolCall,
+            "yaml-tool-call" => ParseFormat::YamlToolCall,
             "zyphra-xml" => ParseFormat::ZyphraXml,
             other => anyhow::bail!("unknown parse format `{other}`"),
         };
@@ -486,6 +505,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_yaml_tool_call_reads_the_live_35b_shape() {
+        let d = ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::YamlToolCall, HashMap::new());
+
+        // Verbatim from Qwen3.6--35B-A3B.oq4.25++.
+        let raw = "tool_name: read_file\ntool_args:\n  path: /home/x/../src/lib.rs\n";
+        let calls = d.parse(raw).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "/home/x/../src/lib.rs");
+
+        // A value keeping its own colons.
+        let url = d.parse("tool_name: run_command\ntool_args:\n  command: curl http://x/y\n").unwrap();
+        assert_eq!(url[0].arguments["command"], "curl http://x/y");
+
+        // Prose that merely mentions a tool is not a call.
+        assert!(d.parse("I will use tool_name here to read the file.").unwrap().is_empty());
+        // A call with no args still parses — some tools take none.
+        assert_eq!(d.parse("tool_name: list_dir\n").unwrap()[0].name, "list_dir");
+    }
+
+    #[test]
     fn native_routing_is_per_artifact_not_per_family() {
         let d = Dialects::default();
         // Verified live: this build emits `<tool_call>` blocks that were being discarded.
@@ -496,11 +536,15 @@ mod tests {
         // The rest of the family must NOT be assumed to share it. Measured, they do not:
         // the 35B emits `tool_name:/tool_args:` YAML and the 0.8b emits prose with no
         // call at all, and routing them natively cost them their tools entirely.
-        for id in ["Qwen3.6--35B-A3B.oq4.25++", "Qwen3.8-27B--oq4.25++", "Qwen3.5--0.8b-oq4++"] {
-            assert!(
-                !d.resolve(id).emits_own_calls(),
-                "{id} was not verified to emit its own calls; Needle is shape-agnostic and safe"
-            );
+        // A third shape in the same line: the 35B emits `tool_name:`/`tool_args:` YAML.
+        assert_eq!(d.resolve("Qwen3.6--35B-A3B.oq4.25++").parse, ParseFormat::YamlToolCall);
+
+        // These two emit prose announcing intent and NO call in any format, so no parser
+        // can serve them — only a GENERATOR like Needle can. Note the sizes: a 27B and a
+        // 0.8b, while a 1B MiniCPM emits perfect native calls. The ability to emit a call
+        // does not track model size, which is why it has to be measured per artifact.
+        for id in ["Qwen3.8-27B--oq4.25++", "Qwen3.5--0.8b-oq4++"] {
+            assert!(!d.resolve(id).emits_own_calls(), "{id} must stay on Needle");
         }
         assert!(!d.resolve("some-other-model").emits_own_calls());
     }
@@ -600,6 +644,43 @@ fn parse_qwen_tool_call(raw: &str) -> Vec<ToolCall> {
             calls.push(c);
         }
         rest = next;
+    }
+    calls
+}
+
+/// `tool_name: f` followed by `tool_args:` and indented `key: value` lines.
+///
+/// Anchored to a line that starts with `tool_name:` so prose that merely mentions a tool
+/// is not read as a call. Values are taken verbatim after the first `:` so a path or a
+/// URL keeps its colons; args end at the first line that is not indented.
+fn parse_yaml_tool_call(raw: &str) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    let mut lines = raw.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(name) = line.strip_prefix("tool_name:") else { continue };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let mut args = serde_json::Map::new();
+        if lines.peek().is_some_and(|l| l.trim_start().starts_with("tool_args:")) {
+            lines.next();
+            while let Some(l) = lines.peek() {
+                // Indentation is what scopes the argument block; the first flush line
+                // ends it, so a following `tool_name:` starts a fresh call.
+                if l.trim().is_empty() || !l.starts_with(char::is_whitespace) {
+                    break;
+                }
+                let l = lines.next().unwrap();
+                if let Some((k, v)) = l.trim().split_once(':') {
+                    args.insert(
+                        k.trim().to_string(),
+                        serde_json::Value::String(v.trim().to_string()),
+                    );
+                }
+            }
+        }
+        calls.push(ToolCall { name: name.to_string(), arguments: serde_json::Value::Object(args) });
     }
     calls
 }

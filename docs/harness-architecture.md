@@ -1252,6 +1252,39 @@ For comparison, `MiniCPM5--1B.oq4.25++` on its own native dialect produced **12 
 results in 12 outputs** — when the shape is right, native routing is very good, which is
 what makes assuming it tempting.
 
+#### Can the Needle shim be cut?
+
+The question is worth asking: it is 2,813 lines plus **51 MB of committed weights**, a
+candle dependency, a feature flag, and a second tool loop — and that last cost was paid
+during this session, when trace recording was added to one loop and not the other, so
+every model on the native path silently wrote no notes.
+
+The deciding distinction is that **Needle is a generator and a dialect is a parser**. A
+parser can only read a call the model emitted; Needle builds one from a plain-English
+line. So the question is not "can we write more dialects" but "does every model we care
+about emit a call at all".
+
+Measured across all six served artifacts, with a YAML dialect added for the third shape:
+
+| artifact | emits | routed |
+|---|---|---|
+| `MiniCPM5--1B.oq4.25++` | MiniCPM XML — 12 calls in 12 turns | native |
+| `Qwen3.5-9B--oq4.25++` | `<tool_call><invoke>` XML | native |
+| `Qwen3.6--35B-A3B.oq4.25++` | `tool_name:`/`tool_args:` YAML | native |
+| `ZAYA1--8b.oq4++` | Zyphra XML | native |
+| **`Qwen3.8-27B--oq4.25++`** | **prose: "I'll read the file…", no call** | **Needle** |
+| **`Qwen3.5--0.8b-oq4++`** | **prose, invents file contents** | **Needle** |
+
+**So: not yet.** Cutting the shim would take tools from the 27B, and the hypothesis that
+Needle only serves models too small to matter is false — a **1B emits perfect native
+calls while a 27B emits none**. Whether a model can emit a tool call does not track its
+size, which is the same lesson as the family glob one layer up: it is a property of the
+artifact, and the only way to know is to run it.
+
+Three assumptions died here in sequence — that a model family shares a call shape, that
+the shape correlates with capability, and that the 27B shared the 35B's YAML. Each was
+plausible, each was wrong, and each cost one measurement to find.
+
 ### Notes from traces, and what happens to the wrong ones
 
 Cold-generated documentation measured badly (a 9B calling a `Waitfree_MPMC_Queue`
