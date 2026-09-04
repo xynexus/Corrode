@@ -1517,7 +1517,7 @@ async fn run_native_tool_loop(
             return Ok(format!("{last}\n[stopped: turn budget reached]"));
         }
         let prompt = planner::native_tool_prompt(prefix, role, task, &scratchpad);
-        let (text, _reasoning) = client
+        let (text, _reasoning, server_calls) = client
             .respond_full(model, &prompt, band, toolbox.owner_token(), Some(&tools), Some(&effort))
             .await?;
         let _ = events
@@ -1528,7 +1528,16 @@ async fn run_native_tool_loop(
             .await;
         last = text.clone();
 
-        let calls = dialect.parse(&text).unwrap_or_default();
+        // Prefer what the server parsed. A `function_call` output item is hipfire's own
+        // reading of the model's call — no dialect, no per-model syntax. Falling back to
+        // the dialect is not legacy: an architecture whose calls hipfire does not parse
+        // (measured: zaya returns `<zyphra_tool_call>` text even with template rendering
+        // on) has no output item, and neither does an older hipfire.
+        let calls = if server_calls.is_empty() {
+            dialect.parse(&text).unwrap_or_default()
+        } else {
+            server_calls
+        };
         let Some(call) = calls.first() else {
             steps.push(crate::trace::Step {
                 said: text.clone(),
@@ -2803,7 +2812,7 @@ mod tests {
 
         // Thinking off: the model deliberates itself out of calling when it is on, and
         // a direct imperative is what the tool loop should be issuing anyway.
-        let (answer, reasoning) = client
+        let (answer, reasoning, _calls) = client
             .respond_full(
                 &model,
                 "Read the file src/lib.rs.",

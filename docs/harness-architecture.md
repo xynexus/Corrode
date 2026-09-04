@@ -1225,6 +1225,39 @@ The parser is deliberately forgiving — a malformed block does not discard the 
 ones beside it, and a reply truncated at the token cap still yields its last complete call
 — because every strictness here costs a tool call the model made correctly.
 
+#### Withdrawn: the shape table was an artifact of a hipfire flag
+
+Everything below this heading, up to the `SELF_TALK` section, was measured against a
+hipfire in which **Jinja chat rendering was off for the qwen35 architecture** — so the
+template's `{% if tools %}` branch never fired, the models were never told a tool existed,
+and they improvised call syntax as free text. That is where the "eight shapes" came from.
+One model produced different syntax under different prompt wordings because it was
+guessing, not because the artifact has a shape.
+
+With rendering on, all three Qwen versions return **structured tool calls** and hipfire
+parses them itself. `code_search`'s companion dialects for those shapes
+(`QwenToolCall`, `YamlToolCall`, the invoke/function/JSON payload matching) are removed:
+they parsed text that should never have been text.
+
+What survives, and why it is not the same mistake:
+
+- **`MiniCpmXml` and `ZyphraXml` stay.** Measured: llama (arch 0) and zaya (arch 16)
+  render their templates unconditionally — the flag never gated their paths — and hipfire
+  does **not** parse their calls into structured form. Zaya still returns
+  `<zyphra_tool_call>` text with rendering on. Those dialects read genuinely-templated
+  output and always did, which is why MiniCPM scored 12/12 while Qwen produced noise.
+- **The client now prefers the server's `function_call` output items** and falls back to
+  the dialect when there are none. Empty is not "the model called nothing": an arch whose
+  calls hipfire does not parse, or an older hipfire, returns no item.
+
+Measured after the change, same prompt and repo: **1 tool result -> 10**.
+
+Upstream this needed three hipfire fixes — the log claimed a template was adopted when it
+could not reach the prompt (#411), the flag was env-only so it could not be set per model
+(#413), and `/v1/responses` dropped the tool calls it had already parsed (#414). The
+original table is kept below rather than deleted, because the wrong conclusions are the
+reusable part.
+
 #### The shape is a property of the artifact, not the model family
 
 Routing `*qwen*` natively was wrong, and testing the family rather than the one model
