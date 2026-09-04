@@ -1447,6 +1447,23 @@ The filter keeps lines that state an outcome and drops narration, the same shape
 commit-message binding concentrate signal (19% of commits carry a rationale word, 38% of
 bindings do).
 
+**Run against a working swarm.** Once hipfire rendered the qwen35 template and returned
+structured calls (#413, #414), the same demo-repo turn went from **0 tool results to 11**,
+and the trace path was exercised for the first time on real activity: **22 notes, 37
+edges, 4 tasks**.
+
+That surfaced two defects the earlier runs were too quiet to reach:
+
+- **Task nodes were keyed by their prompt text.** A long task description exceeds LMDB's
+  511-byte `key` index limit, so every such task failed to record — `cannot record task
+  node (add_n Review the work this plan just completed…`. The key is now the task id and
+  the text is the label, which is the same rule the code nodes already follow. Before:
+  4 notes with two tasks silently failing. After: 22/22.
+- **The e2e's approval invariant passed by vacuity.** It asserts that no mutating call
+  executes without an approval event, and `CORRODE_AUTO_APPROVE` approves without emitting
+  one — so the assertion only held while the swarm was calling no tools at all. It now
+  accounts for auto-approve, which is the gate being open by policy rather than bypassed.
+
 **Persisted.** A note is `upsert_node` and each edge is `add_edge` — no new store method.
 The note's `kind` *is* its node kind (`observed` / `asserted`), so provenance is not a
 property a query has to remember to ask for. Edges: `noted_by` to the task that wrote it,

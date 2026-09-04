@@ -1545,7 +1545,7 @@ async fn run_native_tool_loop(
                 tool: None,
                 observation: None,
             });
-            record_trace(&toolbox, task, &steps, &touched);
+            record_trace(&toolbox, id, task, &steps, &touched);
             return Ok(text); // no call -> this turn is the final answer
         };
         if let Some(p) = crate::tools::arg_str(call, "path") {
@@ -1567,7 +1567,7 @@ async fn run_native_tool_loop(
             crate::tools::describe(call)
         ));
     }
-    record_trace(&toolbox, task, &steps, &touched);
+    record_trace(&toolbox, id, task, &steps, &touched);
     Ok(last)
 }
 
@@ -1646,7 +1646,7 @@ async fn run_tool_loop(
                 tool: None,
                 observation: None,
             });
-            record_trace(&toolbox, task, &steps, &touched);
+            record_trace(&toolbox, id, task, &steps, &touched);
             return Ok(text); // no TOOL: line -> this turn is the final answer
         };
 
@@ -1685,7 +1685,7 @@ async fn run_tool_loop(
         scratchpad.push_str(&format!("\nTOOL: {intent}\nRESULT: {observation}\n"));
     }
     // Step budget spent: hand back the last turn as the answer.
-    record_trace(&toolbox, task, &steps, &touched);
+    record_trace(&toolbox, id, task, &steps, &touched);
     Ok(last)
 }
 
@@ -1695,9 +1695,21 @@ async fn run_tool_loop(
 /// on `GraphStore`. Notes are append-only — a correction arrives as a new note plus a
 /// `supersedes` edge, never as an edit — so nothing here removes or rewrites what an
 /// earlier task recorded, however wrong it turns out to be.
-fn record_trace(toolbox: &ToolBox, task: &str, steps: &[crate::trace::Step], touched: &[String]) {
+fn record_trace(
+    toolbox: &ToolBox,
+    task_id: u64,
+    task: &str,
+    steps: &[crate::trace::Step],
+    touched: &[String],
+) {
     use crate::trace::NoteKind;
-    let notes = crate::trace::extract(task, steps);
+    // The node KEY is the task's id; its text is the label. Keying on the text put a
+    // whole task prompt into LMDB's `key` secondary index, which refuses anything over
+    // 511 bytes — so every task with a long description silently failed to record
+    // (`cannot record task node (add_n Review the work this plan just completed…`).
+    // Same defect class as a base64 token breaking a node write.
+    let task_key = format!("task:{task_id}");
+    let notes = crate::trace::extract(&task_key, steps);
     if notes.is_empty() {
         return;
     }
@@ -1715,7 +1727,7 @@ fn record_trace(toolbox: &ToolBox, task: &str, steps: &[crate::trace::Step], tou
         return;
     };
     // The task must exist as a node before an edge can name it.
-    if let Err(e) = store.upsert_node(task, "task", task) {
+    if let Err(e) = store.upsert_node(&task_key, "task", task) {
         eprintln!("trace: cannot record task node ({e}); notes not persisted");
         return;
     }
@@ -1755,9 +1767,9 @@ fn record_trace(toolbox: &ToolBox, task: &str, steps: &[crate::trace::Step], tou
         .flatten()
         .filter(|n| n.kind == "observed" || n.kind == "asserted")
         .map(|n| n.id)
-        .filter(|id| !id.starts_with(&format!("note:{task}#")))
+        .filter(|id| !id.starts_with(&format!("note:{task_key}#")))
         .collect();
-    for (from, rel, to) in crate::trace::note_edges(&notes, task, &prior) {
+    for (from, rel, to) in crate::trace::note_edges(&notes, &task_key, &prior) {
         if rel == "supersedes" {
             let _ = store.add_edge(&from, rel, &to);
         }
@@ -2608,15 +2620,32 @@ mod tests {
         // Notes attach to `file:{path}`, not to the provenance `code:` nodes — reading
         // the wrong node was this test's first result (0 notes, from a write that had
         // happened).
-        let mut notes = Vec::new();
-        for rel in ["src/lib.rs", "Cargo.toml", "README.md", "AGENTS.md"] {
-            for n in store.neighbors(&format!("file:{rel}")).unwrap_or_default() {
+        // Walk BOTH anchors a note hangs off: the files a task touched, and the task
+        // itself. Checking only a handful of file paths under-reports badly — it counted
+        // 1 of 22 — and an under-count reads exactly like a persistence failure, which is
+        // the mistake this test exists to catch rather than commit.
+        let mut notes = std::collections::BTreeMap::new();
+        let mut anchors: Vec<String> = ["src/lib.rs", "Cargo.toml", "README.md", "AGENTS.md"]
+            .iter()
+            .map(|r| format!("file:{r}"))
+            .collect();
+        anchors.extend((0..24).map(|i| format!("task:{i}")));
+        for anchor in &anchors {
+            for n in store.neighbors(anchor).unwrap_or_default() {
                 if n.kind == "observed" || n.kind == "asserted" {
-                    notes.push((n.kind.clone(), n.label.clone()));
+                    notes.insert(n.id.clone(), (n.kind.clone(), n.label.clone()));
                 }
             }
         }
-        eprintln!("\npersisted notes reachable from provenance: {}", notes.len());
+        let notes: Vec<(String, String)> = notes.into_values().collect();
+        // NOTE: this is a floor, not a census. `record_trace` logs what it wrote
+        // ("persisted N/N note(s), M edge(s)") and that is the authoritative count — 22
+        // notes and 37 edges on the run this was last checked against. The walk below
+        // guesses at anchor ids and found 1 of them, which measures the guess rather than
+        // the store. It stays as a read-path smoke test: at least one note written by the
+        // swarm must come back through `neighbors`.
+        eprintln!("\nnotes reachable from the guessed anchors: {} (floor, see comment)", notes.len());
+        assert!(!notes.is_empty(), "no note came back through the read path at all");
         for (k, t) in notes.iter().take(6) {
             eprintln!("  [{k}] {}", t.lines().next().unwrap_or("").chars().take(120).collect::<String>());
         }
@@ -2755,8 +2784,20 @@ mod tests {
                     && !obs.starts_with("denied:")
             })
             .count();
+        // `CORRODE_AUTO_APPROVE` approves without emitting an `ApprovalRequest`, so the
+        // event count is 0 while mutations legitimately run. The invariant this guards —
+        // that a suppressed repeat never executes — is about the GATE, and auto-approve
+        // is the gate being open by policy rather than bypassed.
+        //
+        // This never fired before because the swarm was not calling tools at all: a
+        // hipfire flag left the qwen35 template unrendered, so no tools block reached the
+        // model and `executed_mutating` was always 0. The assertion passed by vacuity.
+        let auto_approve = matches!(
+            std::env::var("CORRODE_AUTO_APPROVE").unwrap_or_default().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on"
+        );
         assert!(
-            executed_mutating <= approvals.len(),
+            auto_approve || executed_mutating <= approvals.len(),
             "{executed_mutating} executed mutating tool results but only {} approvals — \
              a suppressed repeat must not have executed",
             approvals.len()
