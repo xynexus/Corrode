@@ -1341,6 +1341,34 @@ The design this argues for, unbuilt: parse natively first, and **fall back to Ne
 no call parses**. That costs a wasted turn only when the native path fails, and it is the
 one arrangement where a new shape degrades instead of breaking.
 
+#### Forcing a shared chat template does not fix it
+
+hipfire honours `HIPFIRE_CHAT_TEMPLATE_FILE` (global, `hipfire-prompt/src/lib.rs`), so the
+hypothesis is directly testable: if the shape is a template property, forcing one template
+across versions should unify it. Two templates were tried, with the override verified
+active in the daemon's environment and in the serve log each time:
+
+- **3.5's own embedded template**, extracted from `tokenizer_config.chat_template` in the
+  `.hfq`. It is explicit — *"If you choose to call a function ONLY reply in the following
+  format"* — and the format it specifies is `<tool_call><function=…><parameter=…>`, which
+  is **not** the `<invoke>` shape the 9B was observed emitting. The model drifts from its
+  own template.
+- **`froggeric/Qwen-Fixed-Chat-Templates`**, a 28 KB template covering 3.5 through 3.8.
+
+**Neither changed anything.** Outputs were identical with and without the override, for
+3.5, 3.6 and 3.8. So the shape is not template-determined in the way the version
+correlation suggested, and a shared template does not unify these artifacts.
+
+**A caveat that weakens several results above.** The 3.8 emitted a well-formed
+`<function_calls><invoke>` call earlier in this session on essentially the request used
+here, and now returns empty output consistently — 5 of 5, and unchanged by tool-schema
+detail. That earlier success could not be reproduced and the cause is unknown. Single-run
+probes are therefore weaker evidence than they were treated as: the eight-shape table is a
+record of things observed, not a stable characterisation of what each artifact does. The
+conclusion it supports — that shape-chasing with parsers is a losing game and a generator
+is invariant — survives that caveat, because it only needs the shapes to be unstable,
+which is exactly what could not be pinned down.
+
 Four assumptions died here in sequence — that a model family shares a call shape, that the
 shape correlates with capability, that the 27B shared the 35B's YAML, and that a model
 narrating instead of calling is a model that cannot call. Each was plausible; each was one
