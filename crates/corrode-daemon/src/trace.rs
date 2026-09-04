@@ -116,6 +116,24 @@ fn produces_outcome(tool: Option<&str>) -> bool {
     !matches!(tool, Some("read_file") | Some("list_dir") | Some("search_files"))
 }
 
+/// Talk about the harness rather than the repository.
+///
+/// Measured on a real swarm turn: two of four notes were the agent narrating its own
+/// tool-call formatting errors ("the previous tool call failed because I tried to use
+/// JSON syntax"). Those trip the finding filter honestly — they contain "failed" and
+/// "because" — and they are facts about the agent's interaction with the harness, not
+/// about the code. A store of code notes that fills with them teaches a later agent
+/// nothing about the repository.
+const SELF_TALK: &[&str] = &[
+    "tool call", "tool-call", "json syntax", "the system expects", "plain english",
+    "i need to construct", "my previous", "let me try again", "i tried to use",
+];
+
+fn is_self_talk(line: &str) -> bool {
+    let l = line.to_lowercase();
+    SELF_TALK.iter().any(|w| l.contains(w))
+}
+
 fn is_finding(line: &str) -> bool {
     let l = line.to_lowercase();
     FINDING.iter().any(|w| l.contains(w))
@@ -153,6 +171,11 @@ pub fn extract(task: &str, steps: &[Step]) -> Vec<Note> {
             // The model's `TOOL:` line is an instruction, not a finding, and its prose is
             // only worth keeping when it states something.
             if line.is_empty() || line.starts_with("TOOL:") || !is_finding(line) {
+                continue;
+            }
+            // An agent's account of its own tool-call trouble is not repository
+            // knowledge, however genuinely it reports a failure.
+            if is_self_talk(line) {
                 continue;
             }
             out.push(Note {
@@ -292,6 +315,23 @@ mod tests {
         let ran = extract("task-7", &[step("", Some("run it"), Some("error handling below"))]);
         assert_eq!(ran.len(), 1);
         assert_eq!(ran[0].kind, NoteKind::Observed);
+    }
+
+    #[test]
+    fn the_agent_narrating_its_own_tool_trouble_is_not_a_note() {
+        // Both of these are real lines from a swarm turn. They contain "failed" and
+        // "because", so the finding filter keeps them — and they say nothing about the
+        // code, which is what the note store is for.
+        let notes = extract("task-8", &[step(
+            "The previous tool call failed because I tried to use JSON syntax inside a plain English tool call.",
+            None,
+            None,
+        )]);
+        assert!(notes.is_empty(), "harness self-talk must not become a code note: {notes:?}");
+
+        // A real finding about the code still lands.
+        let real = extract("task-8", &[step("is_prime is O(n) with a TODO to optimize", None, None)]);
+        assert_eq!(real.len(), 1);
     }
 
     #[test]

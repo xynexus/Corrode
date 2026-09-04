@@ -1498,6 +1498,11 @@ async fn run_native_tool_loop(
     let effort = std::env::var("CORRODE_REASONING_EFFORT").unwrap_or_else(|_| "none".to_string());
     let mut scratchpad = String::new();
     let mut last = String::new();
+    // Traces are recorded on BOTH capability paths. Instrumenting only the Needle loop
+    // meant a model that emits its own calls (the `*minicpm*` / `*zaya*` dialects) wrote
+    // no notes at all — silently, since nothing reports notes it never tried to make.
+    let mut steps: Vec<crate::trace::Step> = Vec::new();
+    let mut touched: Vec<String> = Vec::new();
     for _ in 0..MAX_TOOL_STEPS {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
         // tool call that is half-applied is worse than a turn that runs long, and
@@ -1525,16 +1530,35 @@ async fn run_native_tool_loop(
 
         let calls = dialect.parse(&text).unwrap_or_default();
         let Some(call) = calls.first() else {
+            steps.push(crate::trace::Step {
+                said: text.clone(),
+                intent: None,
+                tool: None,
+                observation: None,
+            });
+            record_trace(&toolbox, task, &steps, &touched);
             return Ok(text); // no call -> this turn is the final answer
         };
+        if let Some(p) = crate::tools::arg_str(call, "path") {
+            if !touched.iter().any(|t| t == p) {
+                touched.push(p.to_string());
+            }
+        }
         let observation =
             gate_and_execute(call, &toolbox, approvals, events, id, written, seen, read_only)
                 .await;
+        steps.push(crate::trace::Step {
+            said: text.clone(),
+            intent: Some(crate::tools::describe(call)),
+            tool: Some(call.name.clone()),
+            observation: Some(observation.clone()),
+        });
         scratchpad.push_str(&format!(
             "\nCALLED: {}\nRESULT: {observation}\n",
             crate::tools::describe(call)
         ));
     }
+    record_trace(&toolbox, task, &steps, &touched);
     Ok(last)
 }
 
@@ -1678,13 +1702,15 @@ fn record_trace(toolbox: &ToolBox, task: &str, steps: &[crate::trace::Step], tou
     );
 
     let Some(store) = toolbox.graph() else {
-        return; // no store (base build): extraction still runs and reports.
+        eprintln!("trace: no store on this session; notes extracted but not persisted");
+        return;
     };
     // The task must exist as a node before an edge can name it.
     if let Err(e) = store.upsert_node(task, "task", task) {
         eprintln!("trace: cannot record task node ({e}); notes not persisted");
         return;
     }
+    let (mut wrote, mut edges) = (0usize, 0usize);
     for n in &notes {
         // `kind` carries the provenance, so a reader can weigh a tool result against a
         // claim rather than the store flattening both into "a note".
@@ -1692,14 +1718,25 @@ fn record_trace(toolbox: &ToolBox, task: &str, steps: &[crate::trace::Step], tou
             eprintln!("trace: note {} failed ({e})", n.id());
             continue;
         }
-        let _ = store.add_edge(&n.id(), "noted_by", task);
+        wrote += 1;
+        if store.add_edge(&n.id(), "noted_by", task).is_ok() {
+            edges += 1;
+        }
         for path in touched {
             // Bound to the file, not to a node inside it: a finding like "this loader is
             // never called" is about the file's role, and binding it to whichever node
             // happened to be read would be a precision the trace does not have.
-            let _ = store.add_edge(&n.id(), "about", &format!("file:{path}"));
+            // The file node may not exist yet — a task can read a file the ingest pass
+            // has not walked — so create it rather than dropping the edge.
+            let file_id = format!("file:{path}");
+            let _ = store.upsert_node(&file_id, "source_file", path);
+            match store.add_edge(&n.id(), "about", &file_id) {
+                Ok(()) => edges += 1,
+                Err(e) => eprintln!("trace: binding {} to {file_id} failed ({e})", n.id()),
+            }
         }
     }
+    eprintln!("trace: persisted {wrote}/{} note(s), {edges} edge(s)", notes.len());
 
     // Supersede prior notes on the same files. The claim is ordering — this note was
     // written with more of the trace behind it — not correctness.
@@ -2489,6 +2526,94 @@ mod tests {
     //
     // The turn's end is explicit (AgentEvent::TurnComplete): the drain exits on it,
     // and the per-event timeout is only a guard against a wedged run.
+    /// The note store, end to end: run a real turn against a real store and check what
+    /// landed.
+    ///
+    /// Extraction was measured on transcripts, but persistence never ran against anything
+    /// — the e2e above passes `None` for the graph, so every note it reported went
+    /// nowhere. This is the claim that matters: after a turn, the notes an agent produced
+    /// are queryable, carry their provenance, and are attached to what the task touched.
+    #[cfg(all(feature = "needle", feature = "helix"))]
+    #[tokio::test]
+    #[ignore = "requires a live hipfire + Needle assets + the demo-repo submodule"]
+    async fn a_turn_persists_its_notes_to_the_store() {
+        use std::time::Duration;
+        let Some(repo) = demo_repo() else {
+            eprintln!("skipped: fixtures/demo-repo not checked out");
+            return;
+        };
+        let base_url = std::env::var("HIPFIRE_BASE_URL")
+            .unwrap_or_else(|_| crate::hipfire::DEFAULT_BASE_URL.to_string());
+        let client = Client::new(&base_url, std::env::var("HIPFIRE_API_KEY").ok());
+        let Ok(models) = client.list_models().await else {
+            eprintln!("skipped: no hipfire at {base_url}");
+            return;
+        };
+        let model = std::env::var("CORRODE_MODEL")
+            .ok()
+            .or_else(|| models.first().cloned())
+            .expect("hipfire serves at least one model");
+
+        let dir = std::env::temp_dir().join(format!("corrode-notes-e2e-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store: Arc<dyn crate::graph::GraphStore> =
+            Arc::new(crate::graph::embedded::HelixStore::open(dir.to_str().unwrap()).unwrap());
+
+        let embed = crate::roles::default_embedding_model(&models).map(str::to_string);
+        let skills = SkillContext::build(&repo, &client, embed.clone(), &GlobalSkills::default()).await;
+        let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
+            .expect("load Needle")
+            .expect("Needle assets present");
+        let daemon = Arc::new(Daemon::new(
+            Swarm::new(client, 4),
+            RoleModels::uniform(&model),
+            Some(Arc::clone(&store)),
+            Arc::new(PassthroughVfs::new(&repo)),
+            skills,
+            embed,
+            Some(Arc::new(caller)),
+            repo.clone(),
+            Project::load(&repo),
+            Arc::new(Dialects::load()),
+        ));
+
+        let (ctx, crx) = mpsc::channel(16);
+        let (etx, mut erx) = mpsc::channel(64);
+        tokio::spawn(Arc::clone(&daemon).run(crx, etx));
+        ctx.send(AgentCommand::Prompt {
+            text: "Report which functions src/lib.rs defines.".into(),
+            priority: Priority::Default,
+        })
+        .await
+        .unwrap();
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(180), erx.recv()).await {
+            if let AgentEvent::ApprovalRequest { id, .. } = ev {
+                let _ = ctx.send(AgentCommand::ApprovalResponse { id, approved: true }).await;
+            } else if matches!(ev, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+
+        // What landed. `code_nodes` is the provenance view; notes are their own kinds, so
+        // walk the tasks the turn created and read their notes back.
+        // Notes attach to `file:{path}`, not to the provenance `code:` nodes — reading
+        // the wrong node was this test's first result (0 notes, from a write that had
+        // happened).
+        let mut notes = Vec::new();
+        for rel in ["src/lib.rs", "Cargo.toml", "README.md", "AGENTS.md"] {
+            for n in store.neighbors(&format!("file:{rel}")).unwrap_or_default() {
+                if n.kind == "observed" || n.kind == "asserted" {
+                    notes.push((n.kind.clone(), n.label.clone()));
+                }
+            }
+        }
+        eprintln!("\npersisted notes reachable from provenance: {}", notes.len());
+        for (k, t) in notes.iter().take(6) {
+            eprintln!("  [{k}] {}", t.lines().next().unwrap_or("").chars().take(120).collect::<String>());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[cfg(feature = "needle")]
     #[tokio::test]
     #[ignore = "requires a live hipfire + Needle assets + the demo-repo submodule"]

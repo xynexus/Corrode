@@ -1194,6 +1194,187 @@ already takes the whole prompt and leaves exactly the logits wanted. One prefill
 of the walk: **168 ms per pair, 11.4x**, with identical accuracy — the same logits,
 obtained the cheap way (hipfire #409).
 
+### A Qwen tool dialect
+
+`tools.rs` records a 35B "emitting `<tool_call>` blocks nothing read" while the swarm
+answered repository questions by guessing. That was still true: every Qwen model fell to
+the Needle default, and its own calls went unparsed.
+
+`ParseFormat::QwenToolCall` reads them, and `*qwen*` routes natively by default. Two
+shapes are accepted, because **the artifact decides which, not the model family**:
+
+- `<tool_call>{"name":"f","arguments":{…}}</tool_call>` — the Hermes JSON upstream
+  documents, and what this was written for first.
+- `<tool_call><invoke name="f"><parameter name="p">v</parameter></invoke></tool_call>` —
+  what `Qwen3.5-9B--oq4.25++` actually emits, found by running it.
+
+Assuming the documented shape produced an **empty** parse on the first live run: the model
+sent `invoke` XML, the parser wanted JSON, the block yielded no call, and the loop read
+that as a final answer — the identical failure the dialect was added to fix, one layer
+further in. Both shapes are parsed now, and the malformed-block case is a test rather than
+a discovery.
+
+Measured on the demo repo, same prompt and model, before and after:
+
+```
+before   settled: 3 outputs, 0 tool results
+after    settled: 5 outputs, 1 tool result
+```
+
+The parser is deliberately forgiving — a malformed block does not discard the well-formed
+ones beside it, and a reply truncated at the token cap still yields its last complete call
+— because every strictness here costs a tool call the model made correctly.
+
+#### The shape is a property of the artifact, not the model family
+
+Routing `*qwen*` natively was wrong, and testing the family rather than the one model
+showed it. Same prompt, same repo, one served artifact each:
+
+| artifact | emits | tool results |
+|---|---|---|
+| `Qwen3.5-9B--oq4.25++` | `<tool_call><invoke name=…>` XML | 1 |
+| `Qwen3.6--35B-A3B.oq4.25++` | `tool_name:` / `tool_args:` YAML | 0 |
+| `Qwen3.8-27B--oq4.25++` | — | 0 |
+| `Qwen3.5--0.8b-oq4++` | prose, no call at all | 0 |
+
+Three different shapes across four builds of one model line. The family glob routed the
+other three natively and **cost them their tools**: the 0.8b answered by inventing the
+contents of `src/lib.rs` rather than reading it, which is the precise failure native
+routing was added to fix, reintroduced one layer along. Narrowed to `*qwen3.5-9b*`, the
+0.8b goes back through Needle and gets a tool result again.
+
+So the rule is per artifact and never per family, and **Needle is the right default
+because it is shape-agnostic** — it builds the call from a plain-English line, so a new
+artifact's private format costs nothing. A native dialect is an optimisation that has to
+be measured for the exact build it names.
+
+For comparison, `MiniCPM5--1B.oq4.25++` on its own native dialect produced **12 tool
+results in 12 outputs** — when the shape is right, native routing is very good, which is
+what makes assuming it tempting.
+
+#### Can the Needle shim be cut?
+
+The question is worth asking: it is 2,813 lines plus **51 MB of committed weights**, a
+candle dependency, a feature flag, and a second tool loop — and that last cost was paid
+during this session, when trace recording was added to one loop and not the other, so
+every model on the native path silently wrote no notes.
+
+The deciding distinction is that **Needle is a generator and a dialect is a parser**. A
+parser can only read a call the model emitted; Needle builds one from a plain-English
+line. So the question is not "can we write more dialects" but "does every model we care
+about emit a call at all".
+
+Measured across all six served artifacts, with a YAML dialect added for the third shape:
+
+| artifact | emits | routed |
+|---|---|---|
+| `MiniCPM5--1B.oq4.25++` | MiniCPM XML — 12 calls in 12 turns | native |
+| `Qwen3.5-9B--oq4.25++` | `<tool_call><invoke>` XML | native |
+| `Qwen3.6--35B-A3B.oq4.25++` | `tool_name:`/`tool_args:` YAML | native |
+| `ZAYA1--8b.oq4++` | Zyphra XML | native |
+| `Qwen3.8-27B--oq4.25++` | `<function_calls><invoke>` / `<function=…>` | native |
+| **`Qwen3.5--0.8b-oq4++`** | **prose, invents file contents** | **Needle** |
+
+**The 27B row above was wrong, and finding out why mattered more than the table.** It was
+measured as "emits prose, no call" and that was an artefact of how corrode asked. Three
+separate faults, each of which alone hid the model's calls:
+
+1. **The parser keyed on the wrapper.** `Qwen3.5-9B` wraps its payload in `<tool_call>`,
+   the 27B in `<function_calls>` — the same `<invoke>` body. Scanning for `<invoke>`
+   regardless of envelope fixes it.
+2. **One artifact emits more than one shape**, depending on wording: `<invoke>` when asked
+   plainly, `<function=f><parameter=p>` — the shape zaya uses — when the prompt actively
+   invites a call. So the parser tries every known payload rather than one per model.
+3. **Corrode's own prompt suppressed the call.** `native_tool_prompt` ended with "reply
+   with your final answer and **no tool call**", and bisecting it against the live model
+   showed that clause alone turning a call into narration:
+
+   | prompt | result |
+   |---|---|
+   | bare task | emits a call |
+   | task + `[role: coder]` | *"I don't have access to your file system"* |
+   | task + "You have tools available. Call one when you need it" | emits a call |
+   | task + "reply with your final answer and no tool call" | **no call** |
+
+Reworded to "Once the tool results answer the task, give your final answer", the 27B goes
+from **0 to 1 tool result** in corrode.
+
+#### The shape is not stable, so parsers cannot win
+
+The version keys the shape — 3.5 wraps `<invoke>` in `<tool_call>`, 3.6 emits YAML, 3.8
+wraps `<invoke>` in `<function_calls>` — but that is not the whole story either. Probing
+the same two builds with four wordings of the same instruction produced **eight distinct
+shapes**:
+
+```
+<tool_call><invoke name=…>          <function_calls><invoke name=…>
+<tool_call><function=…>             tool_name: / tool_args: YAML
+```json {"name":…,"arguments":…}    ```json {"tool_call":{…}}
+<tool_use> {…}                      ```bash read_file src/lib.rs
+```
+
+One model, one task, different wording, different syntax. So the parser now matches the
+**payload** rather than the wrapper — any JSON object carrying a `name` wherever it sits,
+any `<invoke>` block whatever encloses it — which is strictly more robust than a tag per
+build.
+
+**Prompt tuning was tried and abandoned.** Three wordings, each trading one model for
+another:
+
+| wording | 9B | 27B |
+|---|---|---|
+| "…and no tool call" (original) | **1 call** | 0 |
+| "Once the tool results answer the task…" | 0 | **1 call** |
+| "…not a description of it, and not a code block" | 0 | 0 |
+
+No wording served both, and an isolated probe did not predict corrode's behaviour — the
+full prefix and role framing change the answer. The prompt is back to the original, since
+churning it on failed tuning leaves the system worse than it was found.
+
+**This reverses the shim conclusion above.** The argument for cutting Needle was that
+enough dialects make it redundant; the evidence is that the target moves under prompt
+wording, so a parser set is never finished. Needle is invariant to all of it: the 9B
+saying "I need to read the file src/lib.rs" is a perfectly good input to a generator, in
+every one of the eight cases. **Keep the shim.**
+
+The design this argues for, unbuilt: parse natively first, and **fall back to Needle when
+no call parses**. That costs a wasted turn only when the native path fails, and it is the
+one arrangement where a new shape degrades instead of breaking.
+
+#### Forcing a shared chat template does not fix it
+
+hipfire honours `HIPFIRE_CHAT_TEMPLATE_FILE` (global, `hipfire-prompt/src/lib.rs`), so the
+hypothesis is directly testable: if the shape is a template property, forcing one template
+across versions should unify it. Two templates were tried, with the override verified
+active in the daemon's environment and in the serve log each time:
+
+- **3.5's own embedded template**, extracted from `tokenizer_config.chat_template` in the
+  `.hfq`. It is explicit — *"If you choose to call a function ONLY reply in the following
+  format"* — and the format it specifies is `<tool_call><function=…><parameter=…>`, which
+  is **not** the `<invoke>` shape the 9B was observed emitting. The model drifts from its
+  own template.
+- **`froggeric/Qwen-Fixed-Chat-Templates`**, a 28 KB template covering 3.5 through 3.8.
+
+**Neither changed anything.** Outputs were identical with and without the override, for
+3.5, 3.6 and 3.8. So the shape is not template-determined in the way the version
+correlation suggested, and a shared template does not unify these artifacts.
+
+**A caveat that weakens several results above.** The 3.8 emitted a well-formed
+`<function_calls><invoke>` call earlier in this session on essentially the request used
+here, and now returns empty output consistently — 5 of 5, and unchanged by tool-schema
+detail. That earlier success could not be reproduced and the cause is unknown. Single-run
+probes are therefore weaker evidence than they were treated as: the eight-shape table is a
+record of things observed, not a stable characterisation of what each artifact does. The
+conclusion it supports — that shape-chasing with parsers is a losing game and a generator
+is invariant — survives that caveat, because it only needs the shapes to be unstable,
+which is exactly what could not be pinned down.
+
+Four assumptions died here in sequence — that a model family shares a call shape, that the
+shape correlates with capability, that the 27B shared the 35B's YAML, and that a model
+narrating instead of calling is a model that cannot call. Each was plausible; each was one
+measurement from being disproved. The last one held only because someone said "the 27B
+definitely can" and I went and checked instead of trusting my own table.
+
 ### Notes from traces, and what happens to the wrong ones
 
 Cold-generated documentation measured badly (a 9B calling a `Waitfree_MPMC_Queue`
@@ -1261,7 +1442,38 @@ a command makes something happen, and only the second can yield an observed find
 (Unknown tools count as outcome-producing, so a new mutating tool is not silently dropped
 by an out-of-date list.)
 
-**That fix is unvalidated, and the corpus is why.** The session used a shell for
+**Run against a real swarm turn.** The demo repo, a 9B, a live HelixDB store, both tool
+loops instrumented (only the Needle loop was, so a model on a native dialect wrote no
+notes at all — silently, since nothing reports notes it never tried to make):
+
+```
+trace: 1 note(s) from 2 step(s) — 0 observed, 1 asserted
+trace: 1 note(s) from 6 step(s) — 1 observed, 0 asserted
+persisted 2/2 notes, 4 edges; both readable back from file:src/lib.rs
+```
+
+The first run of that produced **4** notes, and two were the agent narrating its own
+tool-call formatting errors — "the previous tool call failed because I tried to use JSON
+syntax". Those pass the finding filter honestly (they contain "failed" and "because") and
+say nothing about the code. A `SELF_TALK` filter drops them, taking yield from 50% to 25%
+and leaving the two that are about the repository, including the one worth having:
+`is_prime` is O(n) with a TODO to make it O(sqrt n).
+
+The first store read returned **0 notes from a write that had happened** — the query asked
+for neighbours of provenance `code:` nodes, and notes attach to `file:{path}`. Nearly
+recorded as "persistence is broken". `record_trace` now reports what it wrote, so the next
+such gap is visible from the log rather than from a guess.
+
+**Note yield tracks trouble, not work.** The 25% above came from a run where the agent
+was fighting its own tool-call formatting. Re-run after Qwen was given a native dialect —
+so its calls parsed and executed cleanly — the same prompt produced **zero** notes: the
+tool that ran was `read_file`, which the outcome/content split excludes by design, and
+nothing failed. That is the filter behaving correctly and it bounds what notes are for.
+They capture what went wrong or was discovered, not what a task did. A store of them will
+be a gotcha index, which is what the commit-message measurement already suggested, and it
+will be sparse on repositories where the swarm has an easy time.
+
+**The transcript fix is unvalidated, and the corpus is why.** The session used a shell for
 everything — 1,139 of 1,761 steps map to `run_command`, including greps and file reads —
 so the split has almost nothing to separate here and the numbers are unchanged. In
 corrode's own toolset `read_file` and `search_files` are distinct tools and it would bite,
