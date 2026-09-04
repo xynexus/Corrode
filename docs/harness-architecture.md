@@ -1459,14 +1459,21 @@ That surfaced two defects the earlier runs were too quiet to reach:
   node (add_n Review the work this plan just completed…`. The key is now the task id and
   the text is the label, which is the same rule the code nodes already follow. Before:
   4 notes with two tasks silently failing. After: 22/22.
+- **Notes hung off a task node the plan did not own.** `record_trace` keyed tasks
+  `task:{id}` while `PlanGraph::provenance` writes `{plan}:task:{id}`, so every turn wrote
+  a *second*, disconnected task node — and task 0 of every turn collided on one of them.
+  The join back to the plan that `Note::task` documents did not exist. The turn's plan id
+  now rides on `ToolBox` (which the loops already carry; `run_task` takes 16 arguments
+  without it) and `ToolBox::task_ref` is the single place that shape is spelled.
 - **Every note's `noted_by` edge named the wrong node.** The edge was built from the
   task's prompt *text* while the node had just been written under its id, so all 22 notes
   were attributed to a node that does not exist: stored, and unreachable from the task
   that produced them. `add_edge`'s error was `.is_ok()`-swallowed, so the write counter
   reported a clean run either way — which is why this survived the key fix above and read
-  as "the readback query is too narrow" for two runs. The e2e now walks the task nodes and
-  asserts reachability, since a count of successful writes says nothing about whether the
-  edges naming them resolve.
+  as "the readback query is too narrow" for two runs. The e2e now walks the real lineage — plan
+  -> tasks -> notes — and asserts reachability, since a count of successful writes says
+  nothing about whether the edges naming them resolve, and an id-range walk would still
+  pass with the notes hanging off nodes disconnected from the plan.
 - **The e2e's approval invariant passed by vacuity.** It asserts that no mutating call
   executes without an approval event, and `CORRODE_AUTO_APPROVE` approves without emitting
   one — so the assertion only held while the swarm was calling no tools at all. It now

@@ -196,6 +196,11 @@ pub struct ToolBox {
     /// BM25 over ingested code and comments, on top of the literal scan. `None` in the
     /// base build, where search stays literal-only.
     graph: Option<Arc<dyn crate::graph::GraphStore>>,
+    /// The turn's plan id, so a trace note can name the SAME task node the plan graph
+    /// writes (`{plan}:task:{id}`). Carried here rather than threaded through
+    /// `run_task`/`run_tool_loop`/`run_native_tool_loop`, which already take 16 args.
+    /// `None` outside a turn -> bare `task:{id}`.
+    plan: Option<String>,
     /// hipfire client + model for cross-encoder reranking of graph hits. `None` unless
     /// `CORRODE_RERANK_MODEL` names a served reranker, so search is unchanged by default.
     reranker: Option<(Arc<crate::hipfire::Client>, String)>,
@@ -215,6 +220,7 @@ impl ToolBox {
             owner_token: None,
             graph: None,
             reranker: None,
+            plan: None,
         }
     }
 
@@ -244,6 +250,20 @@ impl ToolBox {
     pub fn with_owner_token(mut self, owner_token: Option<String>) -> Self {
         self.owner_token = owner_token;
         self
+    }
+
+    pub fn with_plan(mut self, plan: &str) -> Self {
+        self.plan = Some(plan.to_string());
+        self
+    }
+
+    /// The graph node id for a task in this turn. Must match `PlanGraph::node_ref`, or a
+    /// note attaches to a second, disconnected task node instead of joining the plan.
+    pub fn task_ref(&self, id: u64) -> String {
+        match &self.plan {
+            Some(plan) => format!("{plan}:task:{id}"),
+            None => format!("task:{id}"),
+        }
     }
 
     /// The per-user hipfire bearer for `respond` calls in the tool loops.

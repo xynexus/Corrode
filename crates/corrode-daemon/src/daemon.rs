@@ -412,6 +412,7 @@ impl Daemon {
                     // The swarm-knowledge digest rides the divergent tail — the
                     // shared prefix stays byte-identical (KV reuse).
                     let seen = Arc::clone(&turn_seen);
+                    let plan_for_task = plan_id.clone();
                     let prompt = match seen.lock().unwrap().digest(TURN_DIGEST_LINES) {
                         Some(d) => format!("{}\n\n{d}", task.prompt),
                         None => task.prompt.clone(),
@@ -429,7 +430,8 @@ impl Daemon {
                             .with_sandbox(sandbox)
                             .with_graph(graph)
                             .with_reranker(reranker)
-                            .with_owner_token(owner_token);
+                            .with_owner_token(owner_token)
+                            .with_plan(&plan_for_task);
                         let started = std::time::Instant::now();
                         let output = if role == Role::Coder && fanout > 1 {
                             run_fanout(
@@ -1703,12 +1705,15 @@ fn record_trace(
     touched: &[String],
 ) {
     use crate::trace::NoteKind;
-    // The node KEY is the task's id; its text is the label. Keying on the text put a
+    // The node KEY is the task's plan-scoped ref — the SAME id `PlanGraph::provenance`
+    // writes. A bare `task:{id}` made a second, disconnected node: the notes were
+    // reachable, but not from the plan, so the join `Note::task` documents did not
+    // exist, and task 0 of every turn collided on one node. Its text is the label. Keying on the text put a
     // whole task prompt into LMDB's `key` secondary index, which refuses anything over
     // 511 bytes — so every task with a long description silently failed to record
     // (`cannot record task node (add_n Review the work this plan just completed…`).
     // Same defect class as a base64 token breaking a node write.
-    let task_key = format!("task:{task_id}");
+    let task_key = toolbox.task_ref(task_id);
     let notes = crate::trace::extract(&task_key, steps);
     if notes.is_empty() {
         return;
@@ -2607,6 +2612,7 @@ mod tests {
 
         let (ctx, crx) = mpsc::channel(16);
         let (etx, mut erx) = mpsc::channel(64);
+        let mut turn_plan: Option<String> = None;
         tokio::spawn(Arc::clone(&daemon).run(crx, etx));
         ctx.send(AgentCommand::Prompt {
             text: "Report which functions src/lib.rs defines.".into(),
@@ -2617,37 +2623,44 @@ mod tests {
         while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(180), erx.recv()).await {
             if let AgentEvent::ApprovalRequest { id, .. } = ev {
                 let _ = ctx.send(AgentCommand::ApprovalResponse { id, approved: true }).await;
-            } else if matches!(ev, AgentEvent::TurnComplete { .. }) {
+            } else if let AgentEvent::TurnComplete { plan_id } = ev {
+                turn_plan = Some(plan_id);
                 break;
             }
         }
+        let plan_id = turn_plan.expect("the turn must report its plan id");
 
         // What landed. `code_nodes` is the provenance view; notes are their own kinds, so
         // walk the tasks the turn created and read their notes back.
         // Notes attach to `file:{path}`, not to the provenance `code:` nodes — reading
         // the wrong node was this test's first result (0 notes, from a write that had
         // happened).
-        // Walk from the task nodes. Ids are a per-PlanGraph counter from 0, so this
-        // covers the turn; the `about` edges to file nodes are a second path to the same
-        // notes and are unioned in rather than assumed to agree.
+        // Walk the LINEAGE, not a guessed id range: plan -> its tasks -> their notes.
+        // This is the join `Note::task` claims to provide, so walking it is what actually
+        // tests the claim — an id range would still pass if the notes hung off nodes
+        // disconnected from the plan, which is precisely the bug this replaced.
         let mut notes = std::collections::BTreeMap::new();
-        let mut anchors: Vec<String> = (0..64).map(|i| format!("task:{i}")).collect();
-        anchors.extend(
-            ["src/lib.rs", "Cargo.toml", "README.md", "AGENTS.md"].iter().map(|r| format!("file:{r}")),
-        );
-        for anchor in &anchors {
-            for n in store.neighbors(anchor).unwrap_or_default() {
+        let tasks: Vec<String> = store
+            .neighbors(&plan_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| n.kind == "task" || n.kind == "contract")
+            .map(|n| n.id)
+            .collect();
+        assert!(!tasks.is_empty(), "no task node is reachable from plan {plan_id}");
+        for t in &tasks {
+            for n in store.neighbors(t).unwrap_or_default() {
                 if n.kind == "observed" || n.kind == "asserted" {
                     notes.insert(n.id.clone(), (n.kind.clone(), n.label.clone()));
                 }
             }
         }
         let notes: Vec<(String, String)> = notes.into_values().collect();
-        eprintln!("\nnotes reachable from the turn's task nodes: {}", notes.len());
+        eprintln!("\nnotes reachable from plan {plan_id} via {} task(s): {}", tasks.len(), notes.len());
         // A note that is written but unreachable is the failure this asserts against:
         // `record_trace` counting a successful write says nothing about whether the edge
         // naming it points at a node that exists.
-        assert!(!notes.is_empty(), "notes were written but none is reachable from any task node");
+        assert!(!notes.is_empty(), "notes were written but none is reachable from the plan");
         for (k, t) in notes.iter().take(6) {
             eprintln!("  [{k}] {}", t.lines().next().unwrap_or("").chars().take(120).collect::<String>());
         }
