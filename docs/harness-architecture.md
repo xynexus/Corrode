@@ -1299,9 +1299,47 @@ separate faults, each of which alone hid the model's calls:
 Reworded to "Once the tool results answer the task, give your final answer", the 27B goes
 from **0 to 1 tool result** in corrode.
 
-So the shim question is still open on its merits, but the evidence that decided it was
-wrong: only `Qwen3.5--0.8b-oq4++` now needs a generator rather than a parser. The
-remaining argument for keeping Needle is one 0.8B model.
+#### The shape is not stable, so parsers cannot win
+
+The version keys the shape — 3.5 wraps `<invoke>` in `<tool_call>`, 3.6 emits YAML, 3.8
+wraps `<invoke>` in `<function_calls>` — but that is not the whole story either. Probing
+the same two builds with four wordings of the same instruction produced **eight distinct
+shapes**:
+
+```
+<tool_call><invoke name=…>          <function_calls><invoke name=…>
+<tool_call><function=…>             tool_name: / tool_args: YAML
+```json {"name":…,"arguments":…}    ```json {"tool_call":{…}}
+<tool_use> {…}                      ```bash read_file src/lib.rs
+```
+
+One model, one task, different wording, different syntax. So the parser now matches the
+**payload** rather than the wrapper — any JSON object carrying a `name` wherever it sits,
+any `<invoke>` block whatever encloses it — which is strictly more robust than a tag per
+build.
+
+**Prompt tuning was tried and abandoned.** Three wordings, each trading one model for
+another:
+
+| wording | 9B | 27B |
+|---|---|---|
+| "…and no tool call" (original) | **1 call** | 0 |
+| "Once the tool results answer the task…" | 0 | **1 call** |
+| "…not a description of it, and not a code block" | 0 | 0 |
+
+No wording served both, and an isolated probe did not predict corrode's behaviour — the
+full prefix and role framing change the answer. The prompt is back to the original, since
+churning it on failed tuning leaves the system worse than it was found.
+
+**This reverses the shim conclusion above.** The argument for cutting Needle was that
+enough dialects make it redundant; the evidence is that the target moves under prompt
+wording, so a parser set is never finished. Needle is invariant to all of it: the 9B
+saying "I need to read the file src/lib.rs" is a perfectly good input to a generator, in
+every one of the eight cases. **Keep the shim.**
+
+The design this argues for, unbuilt: parse natively first, and **fall back to Needle when
+no call parses**. That costs a wasted turn only when the native path fails, and it is the
+one arrangement where a new shape degrades instead of breaking.
 
 Four assumptions died here in sequence — that a model family shares a call shape, that the
 shape correlates with capability, that the 27B shared the 35B's YAML, and that a model

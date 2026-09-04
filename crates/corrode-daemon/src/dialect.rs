@@ -267,21 +267,40 @@ impl Default for Dialects {
                 // shape-agnostic: it builds the call from a plain-English line, so a new
                 // artifact's private format costs nothing. Add a rule here per artifact
                 // once its shape is verified, never per family.
-                // Qwen3.6-35B emits `tool_name:`/`tool_args:` YAML — a third shape
-                // within one model line, which is why these rules name artifacts. The
-                // 27B was assumed to share it and does not: it emits prose announcing
-                // intent and no call at all, so it stays on Needle.
+                // FIRST: these rules are matched in declaration order. Unlike the
+                // config path, `Default` does not sort by specificity, so a narrower glob
+                // must be declared before the broader one it refines — `*qwen3.5*` would
+                // otherwise swallow this.
+                //
+                // Capability is a SECOND axis, independent of shape. Qwen3.5--0.8b would
+                // emit the 3.5 shape if it emitted anything; it does not — it narrates,
+                // and once invented a file's contents rather than reading them. Needle
+                // builds the call for it from a plain-English line, which is the whole
+                // reason a generator earns its place beside the parsers. Declared first so
+                // it is matched before the `*qwen3.5*` rule below.
+                (
+                    "*qwen3.5--0.8b*".to_string(),
+                    ToolDialect::default(),
+                ),
+                // Qwen's tool-call shape tracks the model VERSION, not the family and
+                // not the individual artifact — it is a chat-template property, so every
+                // 3.8 build emits what 3.8 emits. Measured across four served artifacts:
+                //
+                //   3.5  `<tool_call>` wrapping `<invoke name=…>`
+                //   3.6  `tool_name:` / `tool_args:` YAML
+                //   3.8  `<function_calls>` wrapping `<invoke name=…>`, and
+                //        `<function=f><parameter=p>` when the prompt invites a call
+                //
+                // Keying on the version makes a new artifact of a known version work
+                // without measuring it again; a new VERSION still has to be measured.
+                (
+                    "*qwen3.5*".to_string(),
+                    ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::QwenToolCall, HashMap::new()),
+                ),
                 (
                     "*qwen3.6*".to_string(),
                     ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::YamlToolCall, HashMap::new()),
                 ),
-                (
-                    "*qwen3.5-9b*".to_string(),
-                    ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::QwenToolCall, HashMap::new()),
-                ),
-                // Qwen3.8-27B emits the same `<invoke>` payload wrapped in
-                // `<function_calls>` instead of `<tool_call>`. It was measured as
-                // "emits prose, no call" only because the parser keyed on the wrapper.
                 (
                     "*qwen3.8*".to_string(),
                     ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::QwenToolCall, HashMap::new()),
@@ -527,6 +546,26 @@ mod tests {
         assert_eq!(f[0].name, "read_file");
         assert_eq!(f[0].arguments["path"], "src/lib.rs");
 
+        // JSON payloads, wherever they sit. All three came from live models under
+        // different prompt wordings, from the same two builds.
+        for raw in [
+            "```json\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/lib.rs\"}}\n```",
+            "```json\n{\"tool_call\": {\"name\": \"read_file\", \"arguments\": {\"path\": \"src/lib.rs\"}}}\n```",
+            "<tool_use> {\"name\": \"read_file\", \"arguments\": {\"path\": \"src/lib.rs\"}}",
+        ] {
+            let c = d.parse(raw).unwrap();
+            assert_eq!(c.len(), 1, "no call parsed from {raw:?}");
+            assert_eq!(c[0].name, "read_file");
+            assert_eq!(c[0].arguments["path"], "src/lib.rs");
+        }
+
+        // A brace inside a string argument must not end the object early.
+        let braced = "{\"name\":\"write_file\",\"arguments\":{\"contents\":\"fn f() { 1 }\"}}";
+        assert_eq!(d.parse(braced).unwrap()[0].arguments["contents"], "fn f() { 1 }");
+
+        // Prose containing a JSON-looking fragment with no name is not a call.
+        assert!(d.parse("the config is {\"debug\": true}").unwrap().is_empty());
+
         // An EMPTY block is not a call. This was the first live result: the harness read
         // it as "no tool call", i.e. a final answer, and the swarm answered by guessing.
         assert!(d.parse("<tool_call>\n</tool_call>").unwrap().is_empty());
@@ -554,29 +593,28 @@ mod tests {
     }
 
     #[test]
-    fn native_routing_is_per_artifact_not_per_family() {
+    fn the_tool_call_shape_tracks_the_model_version() {
         let d = Dialects::default();
-        // Verified live: this build emits `<tool_call>` blocks that were being discarded.
-        let nine_b = d.resolve("Qwen3.5-9B--oq4.25++");
-        assert!(nine_b.emits_own_calls());
-        assert_eq!(nine_b.parse, ParseFormat::QwenToolCall);
-
-        // The rest of the family must NOT be assumed to share it. Measured, they do not:
-        // the 35B emits `tool_name:/tool_args:` YAML and the 0.8b emits prose with no
-        // call at all, and routing them natively cost them their tools entirely.
-        // A third shape in the same line: the 35B emits `tool_name:`/`tool_args:` YAML.
+        // Three versions, three shapes — measured, not assumed.
+        assert_eq!(d.resolve("Qwen3.5-9B--oq4.25++").parse, ParseFormat::QwenToolCall);
         assert_eq!(d.resolve("Qwen3.6--35B-A3B.oq4.25++").parse, ParseFormat::YamlToolCall);
-
-        // These two emit prose announcing intent and NO call in any format, so no parser
-        // can serve them — only a GENERATOR like Needle can. Note the sizes: a 27B and a
-        // 0.8b, while a 1B MiniCPM emits perfect native calls. The ability to emit a call
-        // does not track model size, which is why it has to be measured per artifact.
-        // The 27B emits `<invoke>` in a `<function_calls>` wrapper — a real call that a
-        // wrapper-keyed parser missed, not an incapable model.
         assert_eq!(d.resolve("Qwen3.8-27B--oq4.25++").parse, ParseFormat::QwenToolCall);
-        // The 0.8b emits prose with no call in any format, so only a GENERATOR can serve
-        // it — the distinction that decides whether the shim can be removed.
-        assert!(!d.resolve("Qwen3.5--0.8b-oq4++").emits_own_calls());
+
+        // Keying on the version means an unseen artifact of a KNOWN version works without
+        // being measured again. That is the payoff of version-keying over artifact-keying.
+        assert_eq!(d.resolve("Qwen3.8-4B--oq4++").parse, ParseFormat::QwenToolCall);
+        assert_eq!(d.resolve("Qwen3.6--80B-A3B.oq4++").parse, ParseFormat::YamlToolCall);
+
+        // Capability is a separate axis: the 0.8b would emit the 3.5 shape if it emitted
+        // anything, and it does not — so it stays on Needle despite being a 3.5. The more
+        // specific glob has to win over `*qwen3.5*` for that to hold.
+        assert!(
+            !d.resolve("Qwen3.5--0.8b-oq4++").emits_own_calls(),
+            "the 0.8b must route to Needle, not to the 3.5 shape rule"
+        );
+
+        // An unknown version is not guessed at; Needle is shape-agnostic and safe.
+        assert!(!d.resolve("Qwen4.0-12B").emits_own_calls());
         assert!(!d.resolve("some-other-model").emits_own_calls());
     }
 
@@ -688,12 +726,80 @@ fn parse_qwen_tool_call(raw: &str) -> Vec<ToolCall> {
         return by_function;
     }
 
+    // Then any JSON object carrying a `name`, wherever it sits. Measured across four
+    // Qwen artifacts, ONE model emits different shapes for different prompt wordings:
+    // ```json {"name":…,"arguments":…}```, ```json {"tool_call":{…}}```, and
+    // `<tool_use> {…}` all appeared from the same builds. Chasing each wrapper with its
+    // own parser loses that race by construction, so the payload is what is matched.
+    let by_json = json_object_calls(raw);
+    if !by_json.is_empty() {
+        return by_json;
+    }
+
     // Otherwise scan for `<invoke>` blocks WITHOUT caring about the wrapper. The payload
     // is identical across builds and only the envelope changes: `Qwen3.5-9B` wraps it in
     // `<tool_call>`, `Qwen3.8-27B` in `<function_calls>`. Keying on the wrapper meant the
     // 27B's calls were read as prose and the model looked incapable of calling tools at
     // all — it was emitting them correctly the whole time.
     invoke_blocks(raw)
+}
+
+/// Any JSON object in `raw` that looks like a call — bare, or under a `tool_call` key.
+///
+/// Scans for balanced `{…}` runs rather than a fence or a tag, because the enclosing
+/// syntax is the part that keeps changing: a markdown ```json fence, `<tool_use>`, and a
+/// bare object were all observed from the same two models under different prompts.
+fn json_object_calls(raw: &str) -> Vec<ToolCall> {
+    let b = raw.as_bytes();
+    let mut calls = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        // Balanced scan, skipping braces inside strings so a path or a snippet in an
+        // argument cannot end the object early.
+        let (mut depth, mut j, mut in_str, mut esc) = (0i32, i, false, false);
+        while j < b.len() {
+            let c = b[j];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+            } else if c == b'"' {
+                in_str = true;
+            } else if c == b'{' {
+                depth += 1;
+            } else if c == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        if depth != 0 || j >= b.len() {
+            break; // unbalanced tail
+        }
+        let candidate = &raw[i..=j];
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+            // `{"tool_call": {…}}` and a bare `{"name": …}` are the same payload with and
+            // without a wrapper key.
+            let inner = v.get("tool_call").unwrap_or(&v);
+            if let Ok(c) = serde_json::from_value::<ToolCall>(inner.clone()) {
+                if !c.name.is_empty() {
+                    calls.push(c);
+                }
+            }
+        }
+        i = j + 1;
+    }
+    calls
 }
 
 /// Every `<invoke name="f">…</invoke>` in `raw`, whatever encloses them.
