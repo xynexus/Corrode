@@ -1740,8 +1740,15 @@ fn record_trace(
             continue;
         }
         wrote += 1;
-        if store.add_edge(&n.id(), "noted_by", task).is_ok() {
-            edges += 1;
+        // `task_key`, NOT `task`: the edge has to name the node that was just written,
+        // and `task` is the prompt text. Pointing it at the text left every note
+        // attributed to a node that does not exist, so a walk from the task found
+        // nothing — the notes were stored and unreachable, which reads exactly like
+        // they were never stored. Reported rather than `.is_ok()`-swallowed: the silent
+        // discard is what let a dangling edge look like a clean write for two runs.
+        match store.add_edge(&n.id(), "noted_by", &task_key) {
+            Ok(()) => edges += 1,
+            Err(e) => eprintln!("trace: attributing {} to {task_key} failed ({e})", n.id()),
         }
         for path in touched {
             // Bound to the file, not to a node inside it: a finding like "this loader is
@@ -2620,16 +2627,14 @@ mod tests {
         // Notes attach to `file:{path}`, not to the provenance `code:` nodes — reading
         // the wrong node was this test's first result (0 notes, from a write that had
         // happened).
-        // Walk BOTH anchors a note hangs off: the files a task touched, and the task
-        // itself. Checking only a handful of file paths under-reports badly — it counted
-        // 1 of 22 — and an under-count reads exactly like a persistence failure, which is
-        // the mistake this test exists to catch rather than commit.
+        // Walk from the task nodes. Ids are a per-PlanGraph counter from 0, so this
+        // covers the turn; the `about` edges to file nodes are a second path to the same
+        // notes and are unioned in rather than assumed to agree.
         let mut notes = std::collections::BTreeMap::new();
-        let mut anchors: Vec<String> = ["src/lib.rs", "Cargo.toml", "README.md", "AGENTS.md"]
-            .iter()
-            .map(|r| format!("file:{r}"))
-            .collect();
-        anchors.extend((0..24).map(|i| format!("task:{i}")));
+        let mut anchors: Vec<String> = (0..64).map(|i| format!("task:{i}")).collect();
+        anchors.extend(
+            ["src/lib.rs", "Cargo.toml", "README.md", "AGENTS.md"].iter().map(|r| format!("file:{r}")),
+        );
         for anchor in &anchors {
             for n in store.neighbors(anchor).unwrap_or_default() {
                 if n.kind == "observed" || n.kind == "asserted" {
@@ -2638,14 +2643,11 @@ mod tests {
             }
         }
         let notes: Vec<(String, String)> = notes.into_values().collect();
-        // NOTE: this is a floor, not a census. `record_trace` logs what it wrote
-        // ("persisted N/N note(s), M edge(s)") and that is the authoritative count — 22
-        // notes and 37 edges on the run this was last checked against. The walk below
-        // guesses at anchor ids and found 1 of them, which measures the guess rather than
-        // the store. It stays as a read-path smoke test: at least one note written by the
-        // swarm must come back through `neighbors`.
-        eprintln!("\nnotes reachable from the guessed anchors: {} (floor, see comment)", notes.len());
-        assert!(!notes.is_empty(), "no note came back through the read path at all");
+        eprintln!("\nnotes reachable from the turn's task nodes: {}", notes.len());
+        // A note that is written but unreachable is the failure this asserts against:
+        // `record_trace` counting a successful write says nothing about whether the edge
+        // naming it points at a node that exists.
+        assert!(!notes.is_empty(), "notes were written but none is reachable from any task node");
         for (k, t) in notes.iter().take(6) {
             eprintln!("  [{k}] {}", t.lines().next().unwrap_or("").chars().take(120).collect::<String>());
         }
