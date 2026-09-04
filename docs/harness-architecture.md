@@ -1272,18 +1272,42 @@ Measured across all six served artifacts, with a YAML dialect added for the thir
 | `Qwen3.5-9B--oq4.25++` | `<tool_call><invoke>` XML | native |
 | `Qwen3.6--35B-A3B.oq4.25++` | `tool_name:`/`tool_args:` YAML | native |
 | `ZAYA1--8b.oq4++` | Zyphra XML | native |
-| **`Qwen3.8-27B--oq4.25++`** | **prose: "I'll read the file…", no call** | **Needle** |
+| `Qwen3.8-27B--oq4.25++` | `<function_calls><invoke>` / `<function=…>` | native |
 | **`Qwen3.5--0.8b-oq4++`** | **prose, invents file contents** | **Needle** |
 
-**So: not yet.** Cutting the shim would take tools from the 27B, and the hypothesis that
-Needle only serves models too small to matter is false — a **1B emits perfect native
-calls while a 27B emits none**. Whether a model can emit a tool call does not track its
-size, which is the same lesson as the family glob one layer up: it is a property of the
-artifact, and the only way to know is to run it.
+**The 27B row above was wrong, and finding out why mattered more than the table.** It was
+measured as "emits prose, no call" and that was an artefact of how corrode asked. Three
+separate faults, each of which alone hid the model's calls:
 
-Three assumptions died here in sequence — that a model family shares a call shape, that
-the shape correlates with capability, and that the 27B shared the 35B's YAML. Each was
-plausible, each was wrong, and each cost one measurement to find.
+1. **The parser keyed on the wrapper.** `Qwen3.5-9B` wraps its payload in `<tool_call>`,
+   the 27B in `<function_calls>` — the same `<invoke>` body. Scanning for `<invoke>`
+   regardless of envelope fixes it.
+2. **One artifact emits more than one shape**, depending on wording: `<invoke>` when asked
+   plainly, `<function=f><parameter=p>` — the shape zaya uses — when the prompt actively
+   invites a call. So the parser tries every known payload rather than one per model.
+3. **Corrode's own prompt suppressed the call.** `native_tool_prompt` ended with "reply
+   with your final answer and **no tool call**", and bisecting it against the live model
+   showed that clause alone turning a call into narration:
+
+   | prompt | result |
+   |---|---|
+   | bare task | emits a call |
+   | task + `[role: coder]` | *"I don't have access to your file system"* |
+   | task + "You have tools available. Call one when you need it" | emits a call |
+   | task + "reply with your final answer and no tool call" | **no call** |
+
+Reworded to "Once the tool results answer the task, give your final answer", the 27B goes
+from **0 to 1 tool result** in corrode.
+
+So the shim question is still open on its merits, but the evidence that decided it was
+wrong: only `Qwen3.5--0.8b-oq4++` now needs a generator rather than a parser. The
+remaining argument for keeping Needle is one 0.8B model.
+
+Four assumptions died here in sequence — that a model family shares a call shape, that the
+shape correlates with capability, that the 27B shared the 35B's YAML, and that a model
+narrating instead of calling is a model that cannot call. Each was plausible; each was one
+measurement from being disproved. The last one held only because someone said "the 27B
+definitely can" and I went and checked instead of trusting my own table.
 
 ### Notes from traces, and what happens to the wrong ones
 

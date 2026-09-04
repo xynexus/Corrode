@@ -279,6 +279,13 @@ impl Default for Dialects {
                     "*qwen3.5-9b*".to_string(),
                     ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::QwenToolCall, HashMap::new()),
                 ),
+                // Qwen3.8-27B emits the same `<invoke>` payload wrapped in
+                // `<function_calls>` instead of `<tool_call>`. It was measured as
+                // "emits prose, no call" only because the parser keyed on the wrapper.
+                (
+                    "*qwen3.8*".to_string(),
+                    ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::QwenToolCall, HashMap::new()),
+                ),
             ],
             default: ToolDialect::default(),
         }
@@ -499,6 +506,27 @@ mod tests {
         assert_eq!(w[0].arguments["path"], "a.rs");
         assert_eq!(w[0].arguments["contents"], "if a < b { 1 }");
 
+        // `<function_calls>` wrapping the same payload — verbatim from
+        // Qwen3.8-27B--oq4.25++ on /v1/responses. Keying on the wrapper made this model
+        // look incapable of calling tools; it had been emitting them correctly all along.
+        let fc = "<function_calls>\n<invoke name=\"read_file\">\n<parameter name=\"path\">src/lib.rs</parameter>\n</invoke>\n</function_calls>";
+        let calls = d.parse(fc).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/lib.rs");
+
+        // Two invokes in one wrapper.
+        let two_invokes = "<function_calls><invoke name=\"list_dir\"><parameter name=\"path\">.</parameter></invoke><invoke name=\"read_file\"><parameter name=\"path\">a.rs</parameter></invoke></function_calls>";
+        assert_eq!(d.parse(two_invokes).unwrap().len(), 2);
+
+        // The `<function=…>` payload, which Qwen3.8-27B emits when the prompt invites a
+        // call — one artifact producing more than one shape depending on wording.
+        let fn_shape = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/lib.rs\n</parameter>\n</function>\n</tool_call>";
+        let f = d.parse(fn_shape).unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].name, "read_file");
+        assert_eq!(f[0].arguments["path"], "src/lib.rs");
+
         // An EMPTY block is not a call. This was the first live result: the harness read
         // it as "no tool call", i.e. a final answer, and the swarm answered by guessing.
         assert!(d.parse("<tool_call>\n</tool_call>").unwrap().is_empty());
@@ -543,9 +571,12 @@ mod tests {
         // can serve them — only a GENERATOR like Needle can. Note the sizes: a 27B and a
         // 0.8b, while a 1B MiniCPM emits perfect native calls. The ability to emit a call
         // does not track model size, which is why it has to be measured per artifact.
-        for id in ["Qwen3.8-27B--oq4.25++", "Qwen3.5--0.8b-oq4++"] {
-            assert!(!d.resolve(id).emits_own_calls(), "{id} must stay on Needle");
-        }
+        // The 27B emits `<invoke>` in a `<function_calls>` wrapper — a real call that a
+        // wrapper-keyed parser missed, not an incapable model.
+        assert_eq!(d.resolve("Qwen3.8-27B--oq4.25++").parse, ParseFormat::QwenToolCall);
+        // The 0.8b emits prose with no call in any format, so only a GENERATOR can serve
+        // it — the distinction that decides whether the shim can be removed.
+        assert!(!d.resolve("Qwen3.5--0.8b-oq4++").emits_own_calls());
         assert!(!d.resolve("some-other-model").emits_own_calls());
     }
 
@@ -628,6 +659,8 @@ fn parse_qwen_tool_call(raw: &str) -> Vec<ToolCall> {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
     let mut calls = Vec::new();
+
+    // Hermes JSON first, which only ever appears inside `<tool_call>` tags.
     let mut rest = raw;
     while let Some(at) = rest.find(OPEN) {
         let after = &rest[at + OPEN.len()..];
@@ -635,15 +668,49 @@ fn parse_qwen_tool_call(raw: &str) -> Vec<ToolCall> {
             Some(end) => (&after[..end], &after[end + CLOSE.len()..]),
             None => (after, ""), // truncated tail: read it rather than lose the call
         };
-        let body = body.trim();
-        if let Ok(c) = serde_json::from_str::<ToolCall>(body) {
+        if let Ok(c) = serde_json::from_str::<ToolCall>(body.trim()) {
             if !c.name.is_empty() {
                 calls.push(c);
             }
-        } else if let Some(c) = parse_invoke_xml(body) {
-            calls.push(c);
         }
         rest = next;
+    }
+    if !calls.is_empty() {
+        return calls;
+    }
+
+    // `<function=f><parameter=p>v</parameter></function>` — a fifth payload shape, and
+    // the same one zaya uses. Qwen3.8-27B emits it when the prompt actively invites a
+    // call, and `<invoke>` otherwise: one artifact, more than one shape, depending on
+    // wording. Reusing the existing parser rather than writing a sixth.
+    let by_function = parse_zyphra_xml(raw);
+    if !by_function.is_empty() {
+        return by_function;
+    }
+
+    // Otherwise scan for `<invoke>` blocks WITHOUT caring about the wrapper. The payload
+    // is identical across builds and only the envelope changes: `Qwen3.5-9B` wraps it in
+    // `<tool_call>`, `Qwen3.8-27B` in `<function_calls>`. Keying on the wrapper meant the
+    // 27B's calls were read as prose and the model looked incapable of calling tools at
+    // all — it was emitting them correctly the whole time.
+    invoke_blocks(raw)
+}
+
+/// Every `<invoke name="f">…</invoke>` in `raw`, whatever encloses them.
+fn invoke_blocks(raw: &str) -> Vec<ToolCall> {
+    const INVOKE: &str = "<invoke name=\"";
+    let mut calls = Vec::new();
+    let mut rest = raw;
+    while let Some(at) = rest.find(INVOKE) {
+        let after = &rest[at..];
+        let (body, next) = match after.find("</invoke>") {
+            Some(end) => (&after[..end], &after[end..]),
+            None => (after, ""),
+        };
+        if let Some(c) = parse_invoke_xml(body) {
+            calls.push(c);
+        }
+        rest = if next.len() > 1 { &next[1..] } else { "" };
     }
     calls
 }
@@ -651,8 +718,8 @@ fn parse_qwen_tool_call(raw: &str) -> Vec<ToolCall> {
 /// `tool_name: f` followed by `tool_args:` and indented `key: value` lines.
 ///
 /// Anchored to a line that starts with `tool_name:` so prose that merely mentions a tool
-/// is not read as a call. Values are taken verbatim after the first `:` so a path or a
-/// URL keeps its colons; args end at the first line that is not indented.
+/// is not read as a call. Values are taken verbatim after the first `:` so a path or URL
+/// keeps its colons; args end at the first line that is not indented.
 fn parse_yaml_tool_call(raw: &str) -> Vec<ToolCall> {
     let mut calls = Vec::new();
     let mut lines = raw.lines().peekable();
@@ -666,8 +733,8 @@ fn parse_yaml_tool_call(raw: &str) -> Vec<ToolCall> {
         if lines.peek().is_some_and(|l| l.trim_start().starts_with("tool_args:")) {
             lines.next();
             while let Some(l) = lines.peek() {
-                // Indentation is what scopes the argument block; the first flush line
-                // ends it, so a following `tool_name:` starts a fresh call.
+                // Indentation scopes the argument block; the first flush line ends it, so
+                // a following `tool_name:` starts a fresh call.
                 if l.trim().is_empty() || !l.starts_with(char::is_whitespace) {
                     break;
                 }

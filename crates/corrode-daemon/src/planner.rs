@@ -64,8 +64,8 @@ pub fn native_tool_prompt(context_prefix: &str, role: Role, task: &str, scratchp
     format!(
         "{context_prefix}\n\n[role: {}]\n{task}\n{scratchpad}\n\
 You have tools available. Call one when you need it — you will get the result and can \
-continue. Never guess a file's contents: read it first. When you have enough to answer, \
-reply with your final answer and no tool call. Optionally end with:\n\
+continue. Never guess a file's contents: read it first. Once the tool results answer the \
+task, give your final answer. Optionally end with:\n\
 NEXT: <one plain-English follow-up task>",
         role.as_str()
     )
