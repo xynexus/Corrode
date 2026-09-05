@@ -1225,6 +1225,39 @@ The parser is deliberately forgiving — a malformed block does not discard the 
 ones beside it, and a reply truncated at the token cap still yields its last complete call
 — because every strictness here costs a tool call the model made correctly.
 
+#### Withdrawn: the shape table was an artifact of a hipfire flag
+
+Everything below this heading, up to the `SELF_TALK` section, was measured against a
+hipfire in which **Jinja chat rendering was off for the qwen35 architecture** — so the
+template's `{% if tools %}` branch never fired, the models were never told a tool existed,
+and they improvised call syntax as free text. That is where the "eight shapes" came from.
+One model produced different syntax under different prompt wordings because it was
+guessing, not because the artifact has a shape.
+
+With rendering on, all three Qwen versions return **structured tool calls** and hipfire
+parses them itself. `code_search`'s companion dialects for those shapes
+(`QwenToolCall`, `YamlToolCall`, the invoke/function/JSON payload matching) are removed:
+they parsed text that should never have been text.
+
+What survives, and why it is not the same mistake:
+
+- **`MiniCpmXml` and `ZyphraXml` stay.** Measured: llama (arch 0) and zaya (arch 16)
+  render their templates unconditionally — the flag never gated their paths — and hipfire
+  does **not** parse their calls into structured form. Zaya still returns
+  `<zyphra_tool_call>` text with rendering on. Those dialects read genuinely-templated
+  output and always did, which is why MiniCPM scored 12/12 while Qwen produced noise.
+- **The client now prefers the server's `function_call` output items** and falls back to
+  the dialect when there are none. Empty is not "the model called nothing": an arch whose
+  calls hipfire does not parse, or an older hipfire, returns no item.
+
+Measured after the change, same prompt and repo: **1 tool result -> 10**.
+
+Upstream this needed three hipfire fixes — the log claimed a template was adopted when it
+could not reach the prompt (#411), the flag was env-only so it could not be set per model
+(#413), and `/v1/responses` dropped the tool calls it had already parsed (#414). The
+original table is kept below rather than deleted, because the wrong conclusions are the
+reusable part.
+
 #### The shape is a property of the artifact, not the model family
 
 Routing `*qwen*` natively was wrong, and testing the family rather than the one model
@@ -1413,6 +1446,38 @@ have kept all three, since each read perfectly plausible. So instead:
 The filter keeps lines that state an outcome and drops narration, the same shape that made
 commit-message binding concentrate signal (19% of commits carry a rationale word, 38% of
 bindings do).
+
+**Run against a working swarm.** Once hipfire rendered the qwen35 template and returned
+structured calls (#413, #414), the same demo-repo turn went from **0 tool results to 11**,
+and the trace path was exercised for the first time on real activity: **22 notes, 37
+edges, 4 tasks**.
+
+That surfaced two defects the earlier runs were too quiet to reach:
+
+- **Task nodes were keyed by their prompt text.** A long task description exceeds LMDB's
+  511-byte `key` index limit, so every such task failed to record — `cannot record task
+  node (add_n Review the work this plan just completed…`. The key is now the task id and
+  the text is the label, which is the same rule the code nodes already follow. Before:
+  4 notes with two tasks silently failing. After: 22/22.
+- **Notes hung off a task node the plan did not own.** `record_trace` keyed tasks
+  `task:{id}` while `PlanGraph::provenance` writes `{plan}:task:{id}`, so every turn wrote
+  a *second*, disconnected task node — and task 0 of every turn collided on one of them.
+  The join back to the plan that `Note::task` documents did not exist. The turn's plan id
+  now rides on `ToolBox` (which the loops already carry; `run_task` takes 16 arguments
+  without it) and `ToolBox::task_ref` is the single place that shape is spelled.
+- **Every note's `noted_by` edge named the wrong node.** The edge was built from the
+  task's prompt *text* while the node had just been written under its id, so all 22 notes
+  were attributed to a node that does not exist: stored, and unreachable from the task
+  that produced them. `add_edge`'s error was `.is_ok()`-swallowed, so the write counter
+  reported a clean run either way — which is why this survived the key fix above and read
+  as "the readback query is too narrow" for two runs. The e2e now walks the real lineage — plan
+  -> tasks -> notes — and asserts reachability, since a count of successful writes says
+  nothing about whether the edges naming them resolve, and an id-range walk would still
+  pass with the notes hanging off nodes disconnected from the plan.
+- **The e2e's approval invariant passed by vacuity.** It asserts that no mutating call
+  executes without an approval event, and `CORRODE_AUTO_APPROVE` approves without emitting
+  one — so the assertion only held while the swarm was calling no tools at all. It now
+  accounts for auto-approve, which is the gate being open by policy rather than bypassed.
 
 **Persisted.** A note is `upsert_node` and each edge is `add_edge` — no new store method.
 The note's `kind` *is* its node kind (`observed` / `asserted`), so provenance is not a
@@ -1899,3 +1964,109 @@ would look at twice. Measuring found it; reasoning had already missed it once.
 
 **Not expected to break:** byte-exactness, in any language. If a mismatch appears, the
 span cover is wrong and that is a real defect rather than a missing backend.
+
+## Routing: who builds the tool call
+
+Measured 2026-09-05, one model per fresh daemon (a batch sweep exhausted VRAM and every
+model then reported "no call" — that measured the OOM, not the model):
+
+| model | hipfire `function_call` | `contents` |
+|---|---|---|
+| Qwen3.5 0.8b / 9B, Qwen3.6 35B-A3B, Qwen3.8 27B | yes | real newline |
+| MiniCPM5 1B | no — emits `<function …>` XML | dialect parses |
+| ZAYA1 8b | no — emits `<zyphra_tool_call>` XML | dialect parses |
+
+Every served Qwen artifact emits calls hipfire parses server-side, so `*qwen*` carries the
+new `native` flag and takes `run_native_tool_loop`. That matters beyond tidiness: the
+Needle path's `TOOL:` channel is ONE LINE, so a model cannot express a newline in it at
+all. It is not an escaping bug — `C:\Users\x` round-trips correctly, and unescaping
+`\n` in `write_file` would corrupt the 27 files in this repo whose source legitimately
+contains it. The channel simply cannot carry the value.
+
+Needle's extraction is the rest of the gap, and escaping would not touch any of it:
+`he said "hello" loudly` -> `contents: "hello"`; `out.push('\n');` -> path and contents
+SWAPPED; `echo "a b" | grep a` -> `run_skill_script`, the wrong tool.
+
+Same turn, same prompt, before and after routing:
+
+- Needle: 15 tool results, six of them `run_skill_script` failures as the model guessed at
+  `cargo test`, `run_skill_script`, and a full `cd … && …` line as the script name.
+- Native: 5 tool results, `run_skill_script run-tests/test.sh -> exit 0`, and a correct
+  O(sqrt n) rewrite of `is_prime` with the repo's tests still passing. Fewer calls because
+  none are wasted.
+
+### The void failure has a fallback
+
+The residual risk was a future artifact `*qwen*` claims unmeasured: it emits no call, the
+native loop takes the turn as a final answer, and the model works without tools while
+looking like it answered. Silent by construction — the loop's "finished" return and its
+"never started" return were the same value.
+
+`run_native_tool_loop` now reports `NativeOutcome::NoCallsEmitted` when a whole task ran
+without one parsed call, distinct from `Answered`. Per turn that is normal (it is how the
+loop ends); across a whole task it is worth reporting. `run_task` warns — naming the model,
+the task, and whether the reply carried unparsed tool-call markup — and then retries the
+task through the Needle loop, which builds calls from a plain-English line and so works
+for a model whose own syntax we cannot read. With no caller there is nothing to degrade
+to, so the text stands and only the warning fires.
+
+A tool-free answer to a question that needed no tools also trips this and costs one retry.
+That is the intended trade: a spurious warning costs a log line, a missed one costs a model
+its tools until somebody rereads a transcript.
+
+
+## Required arguments are checked before execution
+
+A native emitter was observed sending `write_file` with `path` and no `contents`. It
+reached execution and came back as a per-tool error string written by hand — every tool
+carried its own, so a tool could simply forget one.
+
+`tools::missing_required` drives the check from `EXEC_TOOLS`' own `required` flags, so a
+tool gains it the moment it is declared. `gate_and_execute` refuses an incomplete call
+BEFORE the approval gate: asking a human to approve a `write_file` that carries no
+contents spends the attention the gate exists to protect, on a call that was always going
+to be rejected, and `describe` renders it as a plausible-looking write. `execute` keeps
+the same check, since it is public and a direct caller must not skip it.
+
+Two judgements worth keeping explicit:
+
+- **A present-but-empty string is not missing.** `write_file` with `contents: ""` is a
+  truncation. Rejecting it to catch malformed calls would break a legitimate one.
+- **A refusal is not cached in `SeenCalls`.** The call did nothing, so remembering it
+  would serve a sibling the "already tried this" note for work that never happened —
+  when that sibling may well send the complete call.
+
+The error names what is missing and what did arrive (`missing: contents. Received: path`),
+because the model's next move is to reissue the call and it needs both halves to do it.
+
+
+## Fan-out, measured — and the batching premise behind it
+
+`CORRODE_FANOUT=3` on the demo repo, 2026-09-05: **2 of 3 attempts timed out**, the
+ensemble collapsed to a lone survivor, and a lone survivor skips the judge — so the run
+paid for three explorations and executed the unjudged output of one. The fixed 120s grace
+on the Opportunistic extras was the cause, and the constant's own note had predicted it
+("race extras against attempt 1 + margin if this measurably discards useful proposals").
+Extras are now timed against attempt 1 — same prompt, same tool loop, differing only in
+band — at `FANOUT_STRAGGLER_FACTOR`x, with the old constant kept as a floor.
+
+**But the premise underneath is not currently true.** CLAUDE.md constraint 2 says a wide
+fan-out "collapses into one batched, prefix-shared run". Measured against the live daemon,
+three requests sharing a prefix and sent 0.4 ms apart (inside the 10 ms gather window):
+
+| | wall clock |
+|---|---|
+| 1 request | 14.1 s |
+| 3 concurrent | 72.3 s |
+
+Serial, plus contention — 5.1x the cost of one, not ~1x. Identical on `/v1/chat/completions`
+and `/v1/responses`, so it is not the endpoint. Every static gate passes: qwen3.5 declares
+and registers `ContinuousBatching`, no kill switch is set, `batch_envelope_ok()` holds, and
+`/health` reports `prefill_batch.enabled = true`, capability `supported`. Yet across 191
+scheduled requests `prefill_batch.selected_batch_size = 0`, `decode_batch.total_batches = 0`,
+and `daemon_scheduler.queue_depth_max = 1` — the batcher never had two requests to fuse,
+which points upstream of it rather than at eligibility.
+
+Until that is resolved, every K in a fan-out costs a full K times, speculative attempts are
+not free, and the Opportunistic band buys nothing. The straggler fix above makes the
+ensemble survive that; it does not make it cheap.

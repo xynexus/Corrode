@@ -261,7 +261,12 @@ Coder; no `NEXT:` line -> no emission. ponytail: Needle will be finetuned on Cor
 actual tools (incl. the real tool-execution set: read_file, run_command, ...) so the
 small coders' tools are picked up reliably; then its structured args become trustworthy
 too. Note: the guide's enum/literal token-forcing had a bug (the merged `":"` token
-bypassed it) — fixed in `needle-toolcall-shim/src/guide.rs`.
+bypassed it) — fixed in `needle-toolcall-shim/src/guide.rs`. A second merged-token escape
+in the same file meant NO two-argument call could be built at all: `valid_continuation`
+returned at a key's closing quote without checking the rest of the token, so `"}` closed
+`arguments` before the colon was forced and every `write_file` truncated to
+`{"path":"…","contents"}}`. Single-argument calls (`read_file`) were unaffected, which
+is why it survived. The guide now checks what the token carries past the quote.
 
 **Second use — the tool-execution loop (`tools.rs`), any model.** When a Needle caller
 is present and the role model's dialect doesn't emit its own calls, `run_tool_loop`

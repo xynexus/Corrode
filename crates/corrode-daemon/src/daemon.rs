@@ -412,6 +412,7 @@ impl Daemon {
                     // The swarm-knowledge digest rides the divergent tail — the
                     // shared prefix stays byte-identical (KV reuse).
                     let seen = Arc::clone(&turn_seen);
+                    let plan_for_task = plan_id.clone();
                     let prompt = match seen.lock().unwrap().digest(TURN_DIGEST_LINES) {
                         Some(d) => format!("{}\n\n{d}", task.prompt),
                         None => task.prompt.clone(),
@@ -429,7 +430,8 @@ impl Daemon {
                             .with_sandbox(sandbox)
                             .with_graph(graph)
                             .with_reranker(reranker)
-                            .with_owner_token(owner_token);
+                            .with_owner_token(owner_token)
+                            .with_plan(&plan_for_task);
                         let started = std::time::Instant::now();
                         let output = if role == Role::Coder && fanout > 1 {
                             run_fanout(
@@ -1242,12 +1244,27 @@ const MAX_TOOL_STEPS: usize = 6;
 /// shared prefix stays byte-identical (KV reuse).
 const PROPOSAL_CAP: usize = 4096;
 
-/// How long a speculative extra attempt (Opportunistic band) may keep the ensemble
-/// waiting. Attempt 1 runs at the role's band and is never timed out; without this,
-/// a starved straggler holds the whole Default-band task hostage (priority
-/// inversion). ponytail: fixed grace — race extras against attempt 1 + margin if
-/// this measurably discards useful proposals.
+/// Floor on how long a speculative extra attempt (Opportunistic band) may keep the
+/// ensemble waiting. Attempt 1 runs at the role's band and is never timed out; without
+/// a bound at all, a starved straggler holds the whole Default-band task hostage
+/// (priority inversion).
+///
+/// This used to be the WHOLE budget, fixed at 120s, and the note here said to race the
+/// extras against attempt 1 "if this measurably discards useful proposals". Measured
+/// 2026-09-05 on the demo repo: 2 of 3 attempts timed out, the ensemble collapsed to a
+/// lone survivor, and a lone survivor skips the judge — so a K=3 run paid for three
+/// explorations and got the unjudged output of one. A read-only attempt runs the same
+/// multi-step tool loop as attempt 1; it was never going to fit in a fixed 120s while
+/// attempt 1 took minutes.
 const FANOUT_EXTRA_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How much longer than attempt 1 an extra attempt may run before it is dropped.
+///
+/// Attempt 1 is the honest yardstick: same prompt, same tool loop, same repo, differing
+/// only in band. An extra that has already taken half again as long as the attempt that
+/// finished is not close behind — it is starved, which is what Opportunistic means when
+/// the GPU is busy.
+const FANOUT_STRAGGLER_FACTOR: u32 = 3;
 
 /// Byte cap per task output in the plan-review digest.
 const REVIEW_OUTPUT_CAP: usize = 2048;
@@ -1413,8 +1430,18 @@ async fn gate_and_execute(
     // never across an await (the approval gate can block for minutes). Two tasks
     // racing the same fresh call may both execute — benign, same as pre-sharing.
     let prior = seen.lock().unwrap().repeat(call);
+    // A call missing a required argument cannot do anything, so refuse it before the
+    // approval gate rather than after: asking a human to approve `write_file` with no
+    // `contents` spends their attention on a call that was always going to be rejected,
+    // and `describe` renders it as a plausible-looking write.
+    let missing = crate::tools::missing_required(call);
     let observation = if let Some(prior) = prior {
         prior
+    } else if !missing.is_empty() {
+        let refused = crate::tools::missing_required_error(call, &missing);
+        // Not recorded in `seen`: this call did nothing, and caching it would serve the
+        // "already tried" note to a sibling that might well send the complete call.
+        refused
     } else if read_only && crate::tools::is_mutating(call) {
         let note = format!(
             "read-only pass: {} was not executed. Describe the change in your final \
@@ -1464,7 +1491,25 @@ async fn gate_and_execute(
 ///
 /// Thinking defaults to off (`CORRODE_REASONING_EFFORT` overrides): with reasoning on,
 /// these models talk themselves out of calling — measured on MiniCPM5-1B, which
+/// What the native loop produced.
+///
+/// The distinction exists because "no tool call this turn" is how the native loop ENDS —
+/// it is the final answer — and is also exactly what a model that cannot emit calls looks
+/// like. A model routed native by a stale glob would answer every repo question from the
+/// prefix, guessing, and nothing in the loop would notice: the void failure
+/// (`CLAUDE.md`'s 35B "emitting `<tool_call>` blocks nothing read").
+enum NativeOutcome {
+    /// The model used tools and then answered. Nothing to second-guess.
+    Answered(String),
+    /// The whole task ran without a single parsed call. Might be a legitimately
+    /// tool-free answer; might be a model that cannot emit calls.
+    NoCallsEmitted(String),
+}
+
 /// deliberated past its budget instead of emitting a call it had already chosen.
+///
+/// Reports whether the model emitted ANY call, so [`run_task`] can tell a genuine
+/// tool-free answer from a model that was routed native and cannot emit calls at all.
 #[allow(clippy::too_many_arguments)]
 async fn run_native_tool_loop(
     client: &Client,
@@ -1482,7 +1527,7 @@ async fn run_native_tool_loop(
     read_only: bool,
     seen: &std::sync::Mutex<SeenCalls>,
     deadline: Option<std::time::Instant>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<NativeOutcome> {
     // Per-task values overlay: params with a closed, known set (read/list paths,
     // skill targets) carry a JSON-Schema `enum`, which hipfire's grammar turns into
     // a hard constraint — an invented path becomes unreachable, not merely corrected
@@ -1498,6 +1543,9 @@ async fn run_native_tool_loop(
     let effort = std::env::var("CORRODE_REASONING_EFFORT").unwrap_or_else(|_| "none".to_string());
     let mut scratchpad = String::new();
     let mut last = String::new();
+    // Whether this model ever produced a parsed call. The loop's own exit condition
+    // cannot distinguish "finished" from "never able to start".
+    let mut calls_made = 0usize;
     // Traces are recorded on BOTH capability paths. Instrumenting only the Needle loop
     // meant a model that emits its own calls (the `*minicpm*` / `*zaya*` dialects) wrote
     // no notes at all — silently, since nothing reports notes it never tried to make.
@@ -1514,10 +1562,12 @@ async fn run_native_tool_loop(
                     message: format!("task {id}: stopped at a tool-step boundary (turn budget)"),
                 })
                 .await;
-            return Ok(format!("{last}\n[stopped: turn budget reached]"));
+            return Ok(NativeOutcome::Answered(format!(
+                "{last}\n[stopped: turn budget reached]"
+            )));
         }
         let prompt = planner::native_tool_prompt(prefix, role, task, &scratchpad);
-        let (text, _reasoning) = client
+        let (text, _reasoning, server_calls) = client
             .respond_full(model, &prompt, band, toolbox.owner_token(), Some(&tools), Some(&effort))
             .await?;
         let _ = events
@@ -1528,7 +1578,16 @@ async fn run_native_tool_loop(
             .await;
         last = text.clone();
 
-        let calls = dialect.parse(&text).unwrap_or_default();
+        // Prefer what the server parsed. A `function_call` output item is hipfire's own
+        // reading of the model's call — no dialect, no per-model syntax. Falling back to
+        // the dialect is not legacy: an architecture whose calls hipfire does not parse
+        // (measured: zaya returns `<zyphra_tool_call>` text even with template rendering
+        // on) has no output item, and neither does an older hipfire.
+        let calls = if server_calls.is_empty() {
+            dialect.parse(&text).unwrap_or_default()
+        } else {
+            server_calls
+        };
         let Some(call) = calls.first() else {
             steps.push(crate::trace::Step {
                 said: text.clone(),
@@ -1536,9 +1595,16 @@ async fn run_native_tool_loop(
                 tool: None,
                 observation: None,
             });
-            record_trace(&toolbox, task, &steps, &touched);
-            return Ok(text); // no call -> this turn is the final answer
+            record_trace(&toolbox, id, task, &steps, &touched);
+            // No call THIS turn is the normal end of the loop. No call in the WHOLE
+            // task is the thing worth reporting.
+            return Ok(if calls_made == 0 {
+                NativeOutcome::NoCallsEmitted(text)
+            } else {
+                NativeOutcome::Answered(text)
+            });
         };
+        calls_made += 1;
         if let Some(p) = crate::tools::arg_str(call, "path") {
             if !touched.iter().any(|t| t == p) {
                 touched.push(p.to_string());
@@ -1558,8 +1624,9 @@ async fn run_native_tool_loop(
             crate::tools::describe(call)
         ));
     }
-    record_trace(&toolbox, task, &steps, &touched);
-    Ok(last)
+    record_trace(&toolbox, id, task, &steps, &touched);
+    // Step budget spent. Calls were made to spend it, so this is an answer.
+    Ok(NativeOutcome::Answered(last))
 }
 
 /// The Needle-mediated tool-execution loop for a small model.
@@ -1637,7 +1704,7 @@ async fn run_tool_loop(
                 tool: None,
                 observation: None,
             });
-            record_trace(&toolbox, task, &steps, &touched);
+            record_trace(&toolbox, id, task, &steps, &touched);
             return Ok(text); // no TOOL: line -> this turn is the final answer
         };
 
@@ -1676,7 +1743,7 @@ async fn run_tool_loop(
         scratchpad.push_str(&format!("\nTOOL: {intent}\nRESULT: {observation}\n"));
     }
     // Step budget spent: hand back the last turn as the answer.
-    record_trace(&toolbox, task, &steps, &touched);
+    record_trace(&toolbox, id, task, &steps, &touched);
     Ok(last)
 }
 
@@ -1686,9 +1753,24 @@ async fn run_tool_loop(
 /// on `GraphStore`. Notes are append-only — a correction arrives as a new note plus a
 /// `supersedes` edge, never as an edit — so nothing here removes or rewrites what an
 /// earlier task recorded, however wrong it turns out to be.
-fn record_trace(toolbox: &ToolBox, task: &str, steps: &[crate::trace::Step], touched: &[String]) {
+fn record_trace(
+    toolbox: &ToolBox,
+    task_id: u64,
+    task: &str,
+    steps: &[crate::trace::Step],
+    touched: &[String],
+) {
     use crate::trace::NoteKind;
-    let notes = crate::trace::extract(task, steps);
+    // The node KEY is the task's plan-scoped ref — the SAME id `PlanGraph::provenance`
+    // writes. A bare `task:{id}` made a second, disconnected node: the notes were
+    // reachable, but not from the plan, so the join `Note::task` documents did not
+    // exist, and task 0 of every turn collided on one node. Its text is the label. Keying on the text put a
+    // whole task prompt into LMDB's `key` secondary index, which refuses anything over
+    // 511 bytes — so every task with a long description silently failed to record
+    // (`cannot record task node (add_n Review the work this plan just completed…`).
+    // Same defect class as a base64 token breaking a node write.
+    let task_key = toolbox.task_ref(task_id);
+    let notes = crate::trace::extract(&task_key, steps);
     if notes.is_empty() {
         return;
     }
@@ -1706,7 +1788,7 @@ fn record_trace(toolbox: &ToolBox, task: &str, steps: &[crate::trace::Step], tou
         return;
     };
     // The task must exist as a node before an edge can name it.
-    if let Err(e) = store.upsert_node(task, "task", task) {
+    if let Err(e) = store.upsert_node(&task_key, "task", task) {
         eprintln!("trace: cannot record task node ({e}); notes not persisted");
         return;
     }
@@ -1719,8 +1801,15 @@ fn record_trace(toolbox: &ToolBox, task: &str, steps: &[crate::trace::Step], tou
             continue;
         }
         wrote += 1;
-        if store.add_edge(&n.id(), "noted_by", task).is_ok() {
-            edges += 1;
+        // `task_key`, NOT `task`: the edge has to name the node that was just written,
+        // and `task` is the prompt text. Pointing it at the text left every note
+        // attributed to a node that does not exist, so a walk from the task found
+        // nothing — the notes were stored and unreachable, which reads exactly like
+        // they were never stored. Reported rather than `.is_ok()`-swallowed: the silent
+        // discard is what let a dangling edge look like a clean write for two runs.
+        match store.add_edge(&n.id(), "noted_by", &task_key) {
+            Ok(()) => edges += 1,
+            Err(e) => eprintln!("trace: attributing {} to {task_key} failed ({e})", n.id()),
         }
         for path in touched {
             // Bound to the file, not to a node inside it: a finding like "this loader is
@@ -1746,9 +1835,9 @@ fn record_trace(toolbox: &ToolBox, task: &str, steps: &[crate::trace::Step], tou
         .flatten()
         .filter(|n| n.kind == "observed" || n.kind == "asserted")
         .map(|n| n.id)
-        .filter(|id| !id.starts_with(&format!("note:{task}#")))
+        .filter(|id| !id.starts_with(&format!("note:{task_key}#")))
         .collect();
-    for (from, rel, to) in crate::trace::note_edges(&notes, task, &prior) {
+    for (from, rel, to) in crate::trace::note_edges(&notes, &task_key, &prior) {
         if rel == "supersedes" {
             let _ = store.add_edge(&from, rel, &to);
         }
@@ -1793,12 +1882,49 @@ async fn run_task(
 ) -> anyhow::Result<String> {
     let role_dialect = dialects.resolve(model);
     if role_dialect.emits_own_calls() {
-        run_native_tool_loop(
-            client, model, band, role_dialect, toolbox, approvals, prefix, role, task, events,
-            id, written, read_only, seen, deadline,
+        let outcome = run_native_tool_loop(
+            client, model, band, role_dialect, toolbox.clone(), approvals, prefix, role, task,
+            events, id, written, read_only, seen, deadline,
         )
-        .await
-    } else if let Some(caller) = tool_caller {
+        .await?;
+        let text = match outcome {
+            NativeOutcome::Answered(text) => return Ok(text),
+            NativeOutcome::NoCallsEmitted(text) => text,
+        };
+        // Routed native, but the task finished without one parsed call. Either the task
+        // genuinely needed no tools, or this model cannot emit calls and answered from
+        // the prefix by guessing — the void failure, which is silent by construction:
+        // the loop's success path and its "never started" path are the same return.
+        // Warn either way. A wrong warning costs a log line; a missed one costs a model
+        // its tools for as long as nobody rereads the transcript.
+        let looks_like_a_botched_call = ["<tool_call", "<invoke", "<function", "tool_name:"]
+            .iter()
+            .any(|m| text.contains(m));
+        eprintln!(
+            "warning: {model} is routed native (emits_own_calls) but task {id} ran to \
+             completion with no parsed tool call{}. If this model does not emit calls \
+             hipfire can parse, its dialect rule is wrong and it is working without tools \
+             — see the routing table in docs/harness-architecture.md.",
+            if looks_like_a_botched_call {
+                ", and its reply contains unparsed tool-call markup"
+            } else {
+                ""
+            }
+        );
+        // Degrade rather than hand back a toolless answer: Needle builds calls from a
+        // plain-English line, so it works for a model whose own call syntax we cannot
+        // read. Without a caller there is nothing to fall back TO, so the text stands.
+        let Some(caller) = tool_caller else {
+            return Ok(text);
+        };
+        eprintln!("warning: retrying task {id} through the Needle tool loop");
+        return run_tool_loop(
+            client, model, band, caller, toolbox, approvals, dialects, prefix, role, task,
+            events, id, written, read_only, seen, deadline,
+        )
+        .await;
+    }
+    if let Some(caller) = tool_caller {
         run_tool_loop(
             client, model, band, caller, toolbox, approvals, dialects, prefix, role, task,
             events, id, written, read_only, seen, deadline,
@@ -1862,27 +1988,57 @@ async fn run_fanout(
     seen: &std::sync::Mutex<SeenCalls>,
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<String> {
+    // How long attempt 1 took, published the moment it finishes so the extras can be
+    // timed against it rather than against a constant guessed ahead of the run.
+    let baseline = Arc::new(tokio::sync::Notify::new());
+    let baseline_took = Arc::new(std::sync::Mutex::new(None::<std::time::Duration>));
     let attempts = (0..k).map(|i| {
         let attempt_task = planner::fanout_attempt_task(task, i + 1, k);
         let attempt_band = if i == 0 { band } else { Priority::Opportunistic };
         let toolbox = toolbox.clone();
         let tool_caller = tool_caller.clone();
+        let baseline = Arc::clone(&baseline);
+        let baseline_took = Arc::clone(&baseline_took);
         async move {
             let mut sink = Vec::new(); // read-only: no artifacts can land
             // Attempts get a PRIVATE map: their "read-only pass" notes must never
             // suppress the turn map's real, writable execution of the same call.
             let attempt_seen = std::sync::Mutex::new(SeenCalls::default());
+            let started = std::time::Instant::now();
             let fut = run_task(
                 client, model, attempt_band, dialects, tool_caller, toolbox, approvals,
                 prefix, role, &attempt_task, events, id, &mut sink, true, &attempt_seen,
                 deadline,
             );
             if i == 0 {
-                fut.await
-            } else {
-                match tokio::time::timeout(FANOUT_EXTRA_GRACE, fut).await {
-                    Ok(res) => res,
-                    Err(_) => Err(anyhow::anyhow!("fanout attempt {} timed out", i + 1)),
+                let res = fut.await;
+                *baseline_took.lock().unwrap() = Some(started.elapsed());
+                baseline.notify_waiters();
+                return res;
+            }
+            // Race the extra against attempt 1 plus a margin. Until attempt 1 lands
+            // there is no yardstick, so an extra that finishes first is simply kept.
+            tokio::pin!(fut);
+            let deadline_passed = async {
+                loop {
+                    let notified = baseline.notified();
+                    if let Some(took) = *baseline_took.lock().unwrap() {
+                        return took.saturating_mul(FANOUT_STRAGGLER_FACTOR).max(FANOUT_EXTRA_GRACE);
+                    }
+                    notified.await;
+                }
+            };
+            tokio::select! {
+                res = &mut fut => res,
+                budget = deadline_passed => {
+                    match tokio::time::timeout(budget, fut).await {
+                        Ok(res) => res,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "fanout attempt {} outran attempt 1 by more than {}x",
+                            i + 1,
+                            FANOUT_STRAGGLER_FACTOR
+                        )),
+                    }
                 }
             }
         }
@@ -2253,6 +2409,210 @@ mod tests {
         assert_eq!(emits[0].role, Role::Review);
     }
 
+    // A write_file call carries TWO arguments, and for most of this crate's life the
+    // guide could not produce one: a merged token closed the second key and skipped its
+    // colon, so construction failed with `expected ':'` and the model — told only that
+    // its call was malformed — rewrote the same English and failed identically. Four
+    // turns of a demo-repo run went that way without a file being written. Single-argument
+    // read_file is in here as the control, since it worked throughout and so hid the bug.
+    #[cfg(feature = "needle")]
+    #[tokio::test]
+    #[ignore = "requires Needle assets (CORRODE_NEEDLE_ASSETS or the vendored default)"]
+    async fn needle_builds_a_two_argument_write_file_call() {
+        use crate::toolcall::needle::NeedleToolCaller;
+        let caller = NeedleToolCaller::load_from_env().expect("load Needle").expect("assets");
+        let dialects = Dialects::default();
+        let dialect = dialects.resolve(caller.model_id());
+        let schema = dialect.render(crate::tools::role_tools(Role::Coder), None);
+        for (intent, tool, args) in [
+            ("write the file notes.txt with content hello", "write_file", &["path", "contents"][..]),
+            ("read the file src/lib.rs", "read_file", &["path"][..]),
+        ] {
+            let raw = caller.generate(intent, &schema).expect("generate");
+            let calls = dialect
+                .parse(&raw)
+                .unwrap_or_else(|e| panic!("{intent}: {e}\n  raw: {raw}"));
+            let call = calls.first().unwrap_or_else(|| panic!("{intent}: no call from {raw}"));
+            assert_eq!(call.name, tool, "wrong tool for {intent:?}");
+            for key in args {
+                assert!(
+                    crate::tools::arg_str(call, key).is_some_and(|v| !v.is_empty()),
+                    "{intent:?}: `{key}` missing or empty in {raw}"
+                );
+            }
+        }
+    }
+
+    // The void failure, made deterministic: a model routed native that answers without
+    // ever emitting a call. A fake hipfire returns prose carrying `<tool_call>` markup
+    // nothing can parse — the shape CLAUDE.md records for the 35B. `run_task` must not
+    // hand that back as an answer; with a tool caller present it retries through Needle,
+    // and the retry is what puts a tool result in `written`.
+    #[tokio::test]
+    async fn a_native_model_that_emits_no_call_falls_back_instead_of_answering_toolless() {
+        use axum::{routing::post, Json, Router};
+        // Always replies with unparsed markup and no function_call item: the void shape.
+        // Branches on the REQUEST, because the two loops ask differently: the native
+        // path declares `tools` and expects the model to emit its own call; the Needle
+        // path declares none and expects a plain-English `TOOL:` line. A fake that
+        // ignored the difference could not show the retry reaching Needle at all.
+        let app = Router::new().route(
+            "/v1/responses",
+            post(|body: Json<serde_json::Value>| async move {
+                let native = body.0.get("tools").is_some_and(|t| !t.is_null());
+                Json(serde_json::json!({
+                    "output_text": if native {
+                        // The void shape: markup nothing can parse, no function_call item.
+                        "<tool_call>{\"name\": \"read_file\"}</tool_call>"
+                    } else {
+                        "TOOL: read the file src/lib.rs"
+                    },
+                    "output": [],
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = Client::new(format!("http://{addr}"), None);
+        let repo = std::path::PathBuf::from(".");
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&repo)),
+            repo,
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let dialects = Dialects::default();
+        // Route native, as `*qwen*` does, with no tool caller: the loop must still detect
+        // the void and warn, and with nothing to fall back to it returns the text.
+        let (etx, _erx) = mpsc::channel(64);
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let out = run_task(
+            &client,
+            "Qwen3.5-9B--oq4.25++",
+            Priority::Default,
+            &dialects,
+            None,
+            toolbox,
+            &ApprovalGate::default(),
+            "prefix",
+            Role::Coder,
+            "read src/lib.rs and report what it defines",
+            &etx,
+            7,
+            &mut written,
+            false,
+            &seen,
+            None,
+        )
+        .await
+        .expect("the task completes rather than erroring");
+        assert!(
+            out.contains("<tool_call>"),
+            "with no caller to fall back to, the model's own text stands: {out}"
+        );
+        assert!(written.is_empty(), "a void task writes nothing");
+
+        // Same void reply, but a caller is available: the task must be RETRIED through
+        // Needle rather than answered toolless. The stub caller records that it was
+        // asked, which is the whole claim — that the fallback reaches Needle at all.
+        #[derive(Default)]
+        struct RecordingCaller(std::sync::atomic::AtomicUsize);
+        impl crate::toolcall::ToolCaller for RecordingCaller {
+            fn generate(&self, _query: &str, _tools: &str) -> anyhow::Result<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // No call: ends the Needle loop too, so the test stays deterministic.
+                Ok("[]".to_string())
+            }
+            fn model_id(&self) -> &str {
+                "needle"
+            }
+        }
+        let caller = Arc::new(RecordingCaller::default());
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(std::path::Path::new("."))),
+            std::path::PathBuf::from("."),
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let mut written = Vec::new();
+        let _ = run_task(
+            &client,
+            "Qwen3.5-9B--oq4.25++",
+            Priority::Default,
+            &dialects,
+            Some(caller.clone()),
+            toolbox,
+            &ApprovalGate::default(),
+            "prefix",
+            Role::Coder,
+            "read src/lib.rs and report what it defines",
+            &etx,
+            8,
+            &mut written,
+            false,
+            &seen,
+            None,
+        )
+        .await
+        .expect("the retry completes");
+        assert!(
+            caller.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the void reply must fall back to Needle, not be returned as an answer"
+        );
+    }
+
+    // The gate refuses an incomplete mutating call itself, so no human is ever asked to
+    // approve a `write_file` that carries no `contents` — `describe` would render it as
+    // a plausible write. Approving it would change nothing, which is worse than refusing:
+    // it spends the one attention budget the gate exists to protect.
+    #[tokio::test]
+    async fn an_incomplete_mutating_call_never_reaches_the_approval_gate() {
+        let dir = std::env::temp_dir().join(format!("corrode-gate-req-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let (etx, mut erx) = mpsc::channel(16);
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let call = crate::toolcall::ToolCall {
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({"path": "x.txt"}),
+        };
+        let out = gate_and_execute(
+            &call,
+            &toolbox,
+            &ApprovalGate::default(),
+            &etx,
+            1,
+            &mut written,
+            &seen,
+            false,
+        )
+        .await;
+        assert!(out.contains("missing required argument"), "{out}");
+        assert!(written.is_empty());
+        // The refusal still streams back as a ToolResult — that is how the model learns
+        // what was wrong. What must NOT appear is an ApprovalRequest.
+        while let Ok(ev) = erx.try_recv() {
+            assert!(
+                !matches!(ev, AgentEvent::ApprovalRequest { .. }),
+                "an incomplete call must not ask a human to approve it: {ev:?}"
+            );
+        }
+        // Not cached, so a sibling sending the COMPLETE call still executes rather than
+        // being served the refusal as an "already tried this" note. Asserted on `seen`
+        // directly: driving the complete call through the gate would block on an
+        // approval nobody is there to give, which is the gate working, not a result.
+        assert!(
+            seen.lock().unwrap().repeat(&call).is_none(),
+            "a refused call must not be remembered as attempted"
+        );
+    }
+
     // The harness-enforced repeat suppression: an exact repeat comes back as the prior
     // observation plus the already-tried note, args collide regardless of key order, a
     // successful mutating call clears the memory (a re-read after a write must run for
@@ -2579,6 +2939,7 @@ mod tests {
 
         let (ctx, crx) = mpsc::channel(16);
         let (etx, mut erx) = mpsc::channel(64);
+        let mut turn_plan: Option<String> = None;
         tokio::spawn(Arc::clone(&daemon).run(crx, etx));
         ctx.send(AgentCommand::Prompt {
             text: "Report which functions src/lib.rs defines.".into(),
@@ -2589,25 +2950,44 @@ mod tests {
         while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(180), erx.recv()).await {
             if let AgentEvent::ApprovalRequest { id, .. } = ev {
                 let _ = ctx.send(AgentCommand::ApprovalResponse { id, approved: true }).await;
-            } else if matches!(ev, AgentEvent::TurnComplete { .. }) {
+            } else if let AgentEvent::TurnComplete { plan_id } = ev {
+                turn_plan = Some(plan_id);
                 break;
             }
         }
+        let plan_id = turn_plan.expect("the turn must report its plan id");
 
         // What landed. `code_nodes` is the provenance view; notes are their own kinds, so
         // walk the tasks the turn created and read their notes back.
         // Notes attach to `file:{path}`, not to the provenance `code:` nodes — reading
         // the wrong node was this test's first result (0 notes, from a write that had
         // happened).
-        let mut notes = Vec::new();
-        for rel in ["src/lib.rs", "Cargo.toml", "README.md", "AGENTS.md"] {
-            for n in store.neighbors(&format!("file:{rel}")).unwrap_or_default() {
+        // Walk the LINEAGE, not a guessed id range: plan -> its tasks -> their notes.
+        // This is the join `Note::task` claims to provide, so walking it is what actually
+        // tests the claim — an id range would still pass if the notes hung off nodes
+        // disconnected from the plan, which is precisely the bug this replaced.
+        let mut notes = std::collections::BTreeMap::new();
+        let tasks: Vec<String> = store
+            .neighbors(&plan_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| n.kind == "task" || n.kind == "contract")
+            .map(|n| n.id)
+            .collect();
+        assert!(!tasks.is_empty(), "no task node is reachable from plan {plan_id}");
+        for t in &tasks {
+            for n in store.neighbors(t).unwrap_or_default() {
                 if n.kind == "observed" || n.kind == "asserted" {
-                    notes.push((n.kind.clone(), n.label.clone()));
+                    notes.insert(n.id.clone(), (n.kind.clone(), n.label.clone()));
                 }
             }
         }
-        eprintln!("\npersisted notes reachable from provenance: {}", notes.len());
+        let notes: Vec<(String, String)> = notes.into_values().collect();
+        eprintln!("\nnotes reachable from plan {plan_id} via {} task(s): {}", tasks.len(), notes.len());
+        // A note that is written but unreachable is the failure this asserts against:
+        // `record_trace` counting a successful write says nothing about whether the edge
+        // naming it points at a node that exists.
+        assert!(!notes.is_empty(), "notes were written but none is reachable from the plan");
         for (k, t) in notes.iter().take(6) {
             eprintln!("  [{k}] {}", t.lines().next().unwrap_or("").chars().take(120).collect::<String>());
         }
@@ -2746,8 +3126,20 @@ mod tests {
                     && !obs.starts_with("denied:")
             })
             .count();
+        // `CORRODE_AUTO_APPROVE` approves without emitting an `ApprovalRequest`, so the
+        // event count is 0 while mutations legitimately run. The invariant this guards —
+        // that a suppressed repeat never executes — is about the GATE, and auto-approve
+        // is the gate being open by policy rather than bypassed.
+        //
+        // This never fired before because the swarm was not calling tools at all: a
+        // hipfire flag left the qwen35 template unrendered, so no tools block reached the
+        // model and `executed_mutating` was always 0. The assertion passed by vacuity.
+        let auto_approve = matches!(
+            std::env::var("CORRODE_AUTO_APPROVE").unwrap_or_default().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on"
+        );
         assert!(
-            executed_mutating <= approvals.len(),
+            auto_approve || executed_mutating <= approvals.len(),
             "{executed_mutating} executed mutating tool results but only {} approvals — \
              a suppressed repeat must not have executed",
             approvals.len()
@@ -2803,7 +3195,7 @@ mod tests {
 
         // Thinking off: the model deliberates itself out of calling when it is on, and
         // a direct imperative is what the tool loop should be issuing anyway.
-        let (answer, reasoning) = client
+        let (answer, reasoning, _calls) = client
             .respond_full(
                 &model,
                 "Read the file src/lib.rs.",

@@ -136,9 +136,39 @@ pub struct ResponsesReply {
 pub struct OutputItem {
     #[serde(default)]
     pub reasoning_content: String,
+    /// `message` or `function_call`. A tool call is its OWN output item in the Responses
+    /// shape, not a field on the message — so a reader that only looks at `output_text`
+    /// sees an empty answer and no call at all.
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub name: String,
+    /// The call's arguments, as a JSON *string* — that is what the API sends, and what
+    /// the model actually emitted. Parsed once here rather than re-serialised.
+    #[serde(default)]
+    pub arguments: String,
 }
 
 impl ResponsesReply {
+    /// Tool calls the SERVER parsed, as `function_call` output items.
+    ///
+    /// Preferred over parsing the model's text, because it is the shape hipfire produces
+    /// once it has understood the call: no dialect, no per-model syntax, no guessing. An
+    /// empty result is not "no call" — an older hipfire, or an architecture whose calls
+    /// the server does not parse (measured: zaya still returns `<zyphra_tool_call>` text),
+    /// returns nothing here and the caller must still fall back to its dialect.
+    pub fn tool_calls(&self) -> Vec<crate::toolcall::ToolCall> {
+        self.output
+            .iter()
+            .filter(|item| item.kind == "function_call" && !item.name.is_empty())
+            .map(|item| crate::toolcall::ToolCall {
+                name: item.name.clone(),
+                arguments: serde_json::from_str(&item.arguments)
+                    .unwrap_or(serde_json::Value::Object(Default::default())),
+            })
+            .collect()
+    }
+
     /// The model's reasoning, if it thought and the server surfaced it.
     pub fn reasoning(&self) -> &str {
         self.output
@@ -272,7 +302,12 @@ impl Client {
     }
 
     /// One completion, declaring tools and/or requesting thinking. Returns
-    /// `(answer, reasoning)`.
+    /// `(answer, reasoning, tool_calls)`.
+    ///
+    /// `tool_calls` are the ones the SERVER parsed, from `function_call` output items.
+    /// Empty means hipfire produced none — which is not the same as the model calling
+    /// nothing, since an architecture whose calls hipfire does not parse (zaya) returns
+    /// its call as text instead. The caller falls back to its dialect on empty.
     ///
     /// Declaring tools is what lets a model emit its OWN tool calls — MiniCPM5 answers
     /// in `<function name="…"><param name="…">` once its template renders the `<tools>`
@@ -286,7 +321,7 @@ impl Client {
         owner_token: Option<&str>,
         tools: Option<&serde_json::Value>,
         effort: Option<&str>,
-    ) -> anyhow::Result<(String, String)> {
+    ) -> anyhow::Result<(String, String, Vec<crate::toolcall::ToolCall>)> {
         let req = ResponsesRequest {
             model,
             input,
@@ -298,7 +333,12 @@ impl Client {
         let body = serde_json::to_value(&req)?;
         let reply = self.post_responses(&body, owner_token).await?;
         let reasoning = reply.reasoning().to_string();
-        Ok((answer_or_reasoning(reply.output_text, &reasoning), reasoning))
+        let calls = reply.tool_calls();
+        Ok((
+            answer_or_reasoning(reply.output_text, &reasoning),
+            reasoning,
+            calls,
+        ))
     }
 
     /// POST a `/v1/responses` body, retrying on transient server-side shedding.
@@ -521,6 +561,52 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+
+    /// A `function_call` output item is read without any dialect.
+    #[test]
+    fn server_parsed_tool_calls_are_read_from_output_items() {
+        let reply: ResponsesReply = serde_json::from_str(
+            r#"{"output_text":"","output":[
+                {"type":"function_call","name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}
+            ]}"#,
+        )
+        .unwrap();
+        let calls = reply.tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/lib.rs");
+    }
+
+    /// An empty result is "the server parsed none", NOT "the model called nothing" —
+    /// zaya returns its call as text, and an older hipfire returns no item at all. The
+    /// caller must be free to fall back to its dialect, so this must not invent a call.
+    #[test]
+    fn a_message_only_reply_yields_no_calls() {
+        let reply: ResponsesReply = serde_json::from_str(
+            r#"{"output_text":"<zyphra_tool_call><function=read_file>","output":[
+                {"type":"message"}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(reply.tool_calls().is_empty());
+        // And the text survives for the dialect to parse.
+        assert!(reply.output_text.contains("zyphra_tool_call"));
+    }
+
+    /// Malformed arguments must not drop the call: the name is the part that selects the
+    /// tool, and an empty argument map is recoverable where a lost call is not.
+    #[test]
+    fn a_call_with_unparseable_arguments_still_names_its_tool() {
+        let reply: ResponsesReply = serde_json::from_str(
+            r#"{"output_text":"","output":[
+                {"type":"function_call","name":"list_dir","arguments":"not json"}
+            ]}"#,
+        )
+        .unwrap();
+        let calls = reply.tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list_dir");
+    }
     use super::*;
 
     #[test]

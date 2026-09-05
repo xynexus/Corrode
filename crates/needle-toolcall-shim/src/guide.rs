@@ -384,6 +384,12 @@ impl JsonGuide {
         let Some(node) = trie.node(&self.machine.constrained) else {
             return;
         };
+        // What the grammar owes right after this key's closing quote. A name is followed
+        // by the arguments object, an argument key by its colon.
+        let after_quote = match self.machine.state {
+            JsonState::InName => ",\"arguments\":{",
+            _ => ":",
+        };
 
         let mut valid = vec![false; logits.len()];
         for ch in node
@@ -394,7 +400,9 @@ impl JsonGuide {
         {
             if let Some(ids) = self.first_char.get(&ch) {
                 for id in ids {
-                    if *id < valid.len() && self.valid_continuation(&self.token_text[*id], node) {
+                    if *id < valid.len()
+                        && self.valid_continuation(&self.token_text[*id], node, after_quote)
+                    {
                         valid[*id] = true;
                     }
                 }
@@ -590,11 +598,32 @@ impl JsonGuide {
         ids
     }
 
-    fn valid_continuation(&self, text: &str, node: &TrieNode) -> bool {
+    /// Is `text` a legal next token inside a quoted key?
+    ///
+    /// `after_quote` is what the grammar requires immediately after the key's closing
+    /// quote. Checking it is the whole point: returning `node.terminal` at the quote and
+    /// ignoring the rest of the token let a MERGED token carry structure past the guide.
+    /// `"}` was accepted on the strength of its quote, and the `}` closed `arguments`
+    /// before the `:` branch of `structural_targets` ever got to force a colon — so a
+    /// two-argument call emitted its second key and stopped
+    /// (`{"path":"…","contents"}}`), which is a JSON parse error, not a call. One-argument
+    /// calls were unaffected, which is why `read_file` worked throughout. Same defect as
+    /// the merged `":"` token this guide already had to fix once.
+    fn valid_continuation(&self, text: &str, node: &TrieNode, after_quote: &str) -> bool {
         let mut node = node;
-        for ch in text.chars() {
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
             if ch == '"' {
-                return node.terminal;
+                if !node.terminal {
+                    return false;
+                }
+                // Either side being a prefix of the other is fine: the token may stop
+                // mid-obligation, or run past it into the value (which is free-form and
+                // the state machine tracks anyway).
+                let rest: String = chars.collect();
+                return rest.is_empty()
+                    || after_quote.starts_with(&rest)
+                    || rest.starts_with(after_quote);
             }
             let Some(next) = node.children.get(&ch) else {
                 return false;
@@ -846,6 +875,39 @@ mod tests {
                 r#""review""#.to_string(),
             ]
         );
+        Ok(())
+    }
+
+    // A merged token that closes an argument key AND carries structure past it (`"}`)
+    // must be masked out: after a key's closing quote the grammar owes a `:`, and a token
+    // that instead closes `arguments` skips the colon entirely. This is what truncated
+    // every two-argument call to `{"path":"…","contents"}}` — valid JSON up to the second
+    // key, then a parse error, so `write_file` could never be constructed while
+    // single-argument `read_file` worked.
+    #[test]
+    fn a_merged_token_cannot_close_an_argument_key_and_skip_its_colon() -> Result<()> {
+        let path = "assets/needle/needle.model";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping merged-token test; vendored tokenizer is missing");
+            return Ok(());
+        }
+        let tok = NeedleTokenizer::load(path)?;
+        let tools = r#"[{"name":"write_file","parameters":{"path":"string","contents":"string"}}]"#;
+        let mut guide = JsonGuide::new(tools, &tok)?;
+        let prefix = r#"[{"name":"write_file","arguments":{"path":"notes.txt","contents"#;
+        for id in tok.encode(prefix)? {
+            guide.update(id);
+        }
+        assert_eq!(guide.machine.state, JsonState::InArgKey);
+        let trie = guide.current_trie().unwrap();
+        let node = trie.node(&guide.machine.constrained).unwrap();
+        // The bare closing quote stays legal; the quote that drags `}` along does not.
+        assert!(guide.valid_continuation("\"", node, ":"));
+        assert!(guide.valid_continuation("\":", node, ":"));
+        assert!(!guide.valid_continuation("\"}", node, ":"));
+        assert!(!guide.valid_continuation("\"}}", node, ":"));
+        assert!(!guide.valid_continuation("\"}}]", node, ":"));
+        assert!(!guide.valid_continuation("\",", node, ":"));
         Ok(())
     }
 
