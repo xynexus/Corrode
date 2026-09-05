@@ -1995,6 +1995,21 @@ Same turn, same prompt, before and after routing:
   O(sqrt n) rewrite of `is_prime` with the repo's tests still passing. Fewer calls because
   none are wasted.
 
-The residual risk is a future artifact `*qwen*` claims unmeasured: with no call emitted,
-the native loop takes the turn as a final answer and silently loses its tools. Probe a new
-build before trusting it, or give the native path a Needle fallback so it degrades.
+### The void failure has a fallback
+
+The residual risk was a future artifact `*qwen*` claims unmeasured: it emits no call, the
+native loop takes the turn as a final answer, and the model works without tools while
+looking like it answered. Silent by construction — the loop's "finished" return and its
+"never started" return were the same value.
+
+`run_native_tool_loop` now reports `NativeOutcome::NoCallsEmitted` when a whole task ran
+without one parsed call, distinct from `Answered`. Per turn that is normal (it is how the
+loop ends); across a whole task it is worth reporting. `run_task` warns — naming the model,
+the task, and whether the reply carried unparsed tool-call markup — and then retries the
+task through the Needle loop, which builds calls from a plain-English line and so works
+for a model whose own syntax we cannot read. With no caller there is nothing to degrade
+to, so the text stands and only the warning fires.
+
+A tool-free answer to a question that needed no tools also trips this and costs one retry.
+That is the intended trade: a spurious warning costs a log line, a missed one costs a model
+its tools until somebody rereads a transcript.

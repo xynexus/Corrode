@@ -1466,7 +1466,25 @@ async fn gate_and_execute(
 ///
 /// Thinking defaults to off (`CORRODE_REASONING_EFFORT` overrides): with reasoning on,
 /// these models talk themselves out of calling — measured on MiniCPM5-1B, which
+/// What the native loop produced.
+///
+/// The distinction exists because "no tool call this turn" is how the native loop ENDS —
+/// it is the final answer — and is also exactly what a model that cannot emit calls looks
+/// like. A model routed native by a stale glob would answer every repo question from the
+/// prefix, guessing, and nothing in the loop would notice: the void failure
+/// (`CLAUDE.md`'s 35B "emitting `<tool_call>` blocks nothing read").
+enum NativeOutcome {
+    /// The model used tools and then answered. Nothing to second-guess.
+    Answered(String),
+    /// The whole task ran without a single parsed call. Might be a legitimately
+    /// tool-free answer; might be a model that cannot emit calls.
+    NoCallsEmitted(String),
+}
+
 /// deliberated past its budget instead of emitting a call it had already chosen.
+///
+/// Reports whether the model emitted ANY call, so [`run_task`] can tell a genuine
+/// tool-free answer from a model that was routed native and cannot emit calls at all.
 #[allow(clippy::too_many_arguments)]
 async fn run_native_tool_loop(
     client: &Client,
@@ -1484,7 +1502,7 @@ async fn run_native_tool_loop(
     read_only: bool,
     seen: &std::sync::Mutex<SeenCalls>,
     deadline: Option<std::time::Instant>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<NativeOutcome> {
     // Per-task values overlay: params with a closed, known set (read/list paths,
     // skill targets) carry a JSON-Schema `enum`, which hipfire's grammar turns into
     // a hard constraint — an invented path becomes unreachable, not merely corrected
@@ -1500,6 +1518,9 @@ async fn run_native_tool_loop(
     let effort = std::env::var("CORRODE_REASONING_EFFORT").unwrap_or_else(|_| "none".to_string());
     let mut scratchpad = String::new();
     let mut last = String::new();
+    // Whether this model ever produced a parsed call. The loop's own exit condition
+    // cannot distinguish "finished" from "never able to start".
+    let mut calls_made = 0usize;
     // Traces are recorded on BOTH capability paths. Instrumenting only the Needle loop
     // meant a model that emits its own calls (the `*minicpm*` / `*zaya*` dialects) wrote
     // no notes at all — silently, since nothing reports notes it never tried to make.
@@ -1516,7 +1537,9 @@ async fn run_native_tool_loop(
                     message: format!("task {id}: stopped at a tool-step boundary (turn budget)"),
                 })
                 .await;
-            return Ok(format!("{last}\n[stopped: turn budget reached]"));
+            return Ok(NativeOutcome::Answered(format!(
+                "{last}\n[stopped: turn budget reached]"
+            )));
         }
         let prompt = planner::native_tool_prompt(prefix, role, task, &scratchpad);
         let (text, _reasoning, server_calls) = client
@@ -1548,8 +1571,15 @@ async fn run_native_tool_loop(
                 observation: None,
             });
             record_trace(&toolbox, id, task, &steps, &touched);
-            return Ok(text); // no call -> this turn is the final answer
+            // No call THIS turn is the normal end of the loop. No call in the WHOLE
+            // task is the thing worth reporting.
+            return Ok(if calls_made == 0 {
+                NativeOutcome::NoCallsEmitted(text)
+            } else {
+                NativeOutcome::Answered(text)
+            });
         };
+        calls_made += 1;
         if let Some(p) = crate::tools::arg_str(call, "path") {
             if !touched.iter().any(|t| t == p) {
                 touched.push(p.to_string());
@@ -1570,7 +1600,8 @@ async fn run_native_tool_loop(
         ));
     }
     record_trace(&toolbox, id, task, &steps, &touched);
-    Ok(last)
+    // Step budget spent. Calls were made to spend it, so this is an answer.
+    Ok(NativeOutcome::Answered(last))
 }
 
 /// The Needle-mediated tool-execution loop for a small model.
@@ -1826,12 +1857,49 @@ async fn run_task(
 ) -> anyhow::Result<String> {
     let role_dialect = dialects.resolve(model);
     if role_dialect.emits_own_calls() {
-        run_native_tool_loop(
-            client, model, band, role_dialect, toolbox, approvals, prefix, role, task, events,
-            id, written, read_only, seen, deadline,
+        let outcome = run_native_tool_loop(
+            client, model, band, role_dialect, toolbox.clone(), approvals, prefix, role, task,
+            events, id, written, read_only, seen, deadline,
         )
-        .await
-    } else if let Some(caller) = tool_caller {
+        .await?;
+        let text = match outcome {
+            NativeOutcome::Answered(text) => return Ok(text),
+            NativeOutcome::NoCallsEmitted(text) => text,
+        };
+        // Routed native, but the task finished without one parsed call. Either the task
+        // genuinely needed no tools, or this model cannot emit calls and answered from
+        // the prefix by guessing — the void failure, which is silent by construction:
+        // the loop's success path and its "never started" path are the same return.
+        // Warn either way. A wrong warning costs a log line; a missed one costs a model
+        // its tools for as long as nobody rereads the transcript.
+        let looks_like_a_botched_call = ["<tool_call", "<invoke", "<function", "tool_name:"]
+            .iter()
+            .any(|m| text.contains(m));
+        eprintln!(
+            "warning: {model} is routed native (emits_own_calls) but task {id} ran to \
+             completion with no parsed tool call{}. If this model does not emit calls \
+             hipfire can parse, its dialect rule is wrong and it is working without tools \
+             — see the routing table in docs/harness-architecture.md.",
+            if looks_like_a_botched_call {
+                ", and its reply contains unparsed tool-call markup"
+            } else {
+                ""
+            }
+        );
+        // Degrade rather than hand back a toolless answer: Needle builds calls from a
+        // plain-English line, so it works for a model whose own call syntax we cannot
+        // read. Without a caller there is nothing to fall back TO, so the text stands.
+        let Some(caller) = tool_caller else {
+            return Ok(text);
+        };
+        eprintln!("warning: retrying task {id} through the Needle tool loop");
+        return run_tool_loop(
+            client, model, band, caller, toolbox, approvals, dialects, prefix, role, task,
+            events, id, written, read_only, seen, deadline,
+        )
+        .await;
+    }
+    if let Some(caller) = tool_caller {
         run_tool_loop(
             client, model, band, caller, toolbox, approvals, dialects, prefix, role, task,
             events, id, written, read_only, seen, deadline,
@@ -2318,6 +2386,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    // The void failure, made deterministic: a model routed native that answers without
+    // ever emitting a call. A fake hipfire returns prose carrying `<tool_call>` markup
+    // nothing can parse — the shape CLAUDE.md records for the 35B. `run_task` must not
+    // hand that back as an answer; with a tool caller present it retries through Needle,
+    // and the retry is what puts a tool result in `written`.
+    #[tokio::test]
+    async fn a_native_model_that_emits_no_call_falls_back_instead_of_answering_toolless() {
+        use axum::{routing::post, Json, Router};
+        // Always replies with unparsed markup and no function_call item: the void shape.
+        // Branches on the REQUEST, because the two loops ask differently: the native
+        // path declares `tools` and expects the model to emit its own call; the Needle
+        // path declares none and expects a plain-English `TOOL:` line. A fake that
+        // ignored the difference could not show the retry reaching Needle at all.
+        let app = Router::new().route(
+            "/v1/responses",
+            post(|body: Json<serde_json::Value>| async move {
+                let native = body.0.get("tools").is_some_and(|t| !t.is_null());
+                Json(serde_json::json!({
+                    "output_text": if native {
+                        // The void shape: markup nothing can parse, no function_call item.
+                        "<tool_call>{\"name\": \"read_file\"}</tool_call>"
+                    } else {
+                        "TOOL: read the file src/lib.rs"
+                    },
+                    "output": [],
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = Client::new(format!("http://{addr}"), None);
+        let repo = std::path::PathBuf::from(".");
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&repo)),
+            repo,
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let dialects = Dialects::default();
+        // Route native, as `*qwen*` does, with no tool caller: the loop must still detect
+        // the void and warn, and with nothing to fall back to it returns the text.
+        let (etx, _erx) = mpsc::channel(64);
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let out = run_task(
+            &client,
+            "Qwen3.5-9B--oq4.25++",
+            Priority::Default,
+            &dialects,
+            None,
+            toolbox,
+            &ApprovalGate::default(),
+            "prefix",
+            Role::Coder,
+            "read src/lib.rs and report what it defines",
+            &etx,
+            7,
+            &mut written,
+            false,
+            &seen,
+            None,
+        )
+        .await
+        .expect("the task completes rather than erroring");
+        assert!(
+            out.contains("<tool_call>"),
+            "with no caller to fall back to, the model's own text stands: {out}"
+        );
+        assert!(written.is_empty(), "a void task writes nothing");
+
+        // Same void reply, but a caller is available: the task must be RETRIED through
+        // Needle rather than answered toolless. The stub caller records that it was
+        // asked, which is the whole claim — that the fallback reaches Needle at all.
+        #[derive(Default)]
+        struct RecordingCaller(std::sync::atomic::AtomicUsize);
+        impl crate::toolcall::ToolCaller for RecordingCaller {
+            fn generate(&self, _query: &str, _tools: &str) -> anyhow::Result<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // No call: ends the Needle loop too, so the test stays deterministic.
+                Ok("[]".to_string())
+            }
+            fn model_id(&self) -> &str {
+                "needle"
+            }
+        }
+        let caller = Arc::new(RecordingCaller::default());
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(std::path::Path::new("."))),
+            std::path::PathBuf::from("."),
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let mut written = Vec::new();
+        let _ = run_task(
+            &client,
+            "Qwen3.5-9B--oq4.25++",
+            Priority::Default,
+            &dialects,
+            Some(caller.clone()),
+            toolbox,
+            &ApprovalGate::default(),
+            "prefix",
+            Role::Coder,
+            "read src/lib.rs and report what it defines",
+            &etx,
+            8,
+            &mut written,
+            false,
+            &seen,
+            None,
+        )
+        .await
+        .expect("the retry completes");
+        assert!(
+            caller.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the void reply must fall back to Needle, not be returned as an answer"
+        );
     }
 
     // The harness-enforced repeat suppression: an exact repeat comes back as the prior
