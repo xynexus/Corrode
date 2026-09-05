@@ -2013,3 +2013,28 @@ to, so the text stands and only the warning fires.
 A tool-free answer to a question that needed no tools also trips this and costs one retry.
 That is the intended trade: a spurious warning costs a log line, a missed one costs a model
 its tools until somebody rereads a transcript.
+
+
+## Required arguments are checked before execution
+
+A native emitter was observed sending `write_file` with `path` and no `contents`. It
+reached execution and came back as a per-tool error string written by hand — every tool
+carried its own, so a tool could simply forget one.
+
+`tools::missing_required` drives the check from `EXEC_TOOLS`' own `required` flags, so a
+tool gains it the moment it is declared. `gate_and_execute` refuses an incomplete call
+BEFORE the approval gate: asking a human to approve a `write_file` that carries no
+contents spends the attention the gate exists to protect, on a call that was always going
+to be rejected, and `describe` renders it as a plausible-looking write. `execute` keeps
+the same check, since it is public and a direct caller must not skip it.
+
+Two judgements worth keeping explicit:
+
+- **A present-but-empty string is not missing.** `write_file` with `contents: ""` is a
+  truncation. Rejecting it to catch malformed calls would break a legitimate one.
+- **A refusal is not cached in `SeenCalls`.** The call did nothing, so remembering it
+  would serve a sibling the "already tried this" note for work that never happened —
+  when that sibling may well send the complete call.
+
+The error names what is missing and what did arrive (`missing: contents. Received: path`),
+because the model's next move is to reissue the call and it needs both halves to do it.

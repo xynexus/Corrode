@@ -344,6 +344,15 @@ impl ToolBox {
     /// errors go back to the model as text so it can recover, never as a hard failure).
     /// Callers must already have cleared [`is_mutating`] calls through the approval gate.
     pub async fn execute(&self, call: &ToolCall) -> String {
+        // Schema check before dispatch. Naming what is missing AND what did arrive gives
+        // the model something to correct; the per-tool arms below stay as the
+        // destructuring, but no longer carry the burden of being the only guard.
+        // Belt and braces: `gate_and_execute` refuses these before the approval gate, but
+        // `execute` is public and a caller reaching it directly must not skip the check.
+        let missing = missing_required(call);
+        if !missing.is_empty() {
+            return missing_required_error(call, &missing);
+        }
         match call.name.as_str() {
             "read_file" => match arg_str(call, "path") {
                 Some(path) => self.read_file(path).await,
@@ -746,6 +755,48 @@ impl ToolBox {
 
 /// The string value of a call argument, trimmed. `None` only if the key is missing or
 /// not a string — an empty string is a valid path (the repo root for `list_dir`).
+/// The observation for a call that is missing required arguments. Names what is missing
+/// AND what did arrive, so the model can correct the call rather than guess at it.
+pub(crate) fn missing_required_error(call: &ToolCall, missing: &[&'static str]) -> String {
+    let mut got: Vec<&str> = call
+        .arguments
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    got.sort_unstable();
+    format!(
+        "error: {} is missing required argument(s): {}. Received: {}. \
+         Send every required argument in one call.",
+        call.name,
+        missing.join(", "),
+        if got.is_empty() { "nothing".to_string() } else { got.join(", ") },
+    )
+}
+
+/// Required arguments a call is missing, per the canonical tool schema.
+///
+/// Driven by `EXEC_TOOLS`' own `required` flags rather than a per-tool arm, so a tool
+/// gains this the moment it is declared and no dispatch arm can forget it. Observed
+/// live: a native emitter produced `write_file` with `path` and no `contents`, which
+/// reached execution and came back as a hand-written per-tool error.
+///
+/// An argument counts as missing when the key is absent or is not a string — the schema
+/// says string, and a number arrives at `arg_str` as `None` either way, so a call that
+/// sends `{"path": 3}` gets told what is wrong instead of "needs a path argument".
+/// A present-but-EMPTY string is NOT missing: `write_file` with `contents: ""` is a
+/// truncation, and rejecting it here would break a legitimate call to protect against
+/// a malformed one.
+pub(crate) fn missing_required(call: &ToolCall) -> Vec<&'static str> {
+    let Some(tool) = EXEC_TOOLS.iter().find(|t| t.name == call.name) else {
+        return Vec::new(); // unknown tool: the dispatch arm reports it
+    };
+    tool.params
+        .iter()
+        .filter(|p| p.required && call.arguments.get(p.name).and_then(|v| v.as_str()).is_none())
+        .map(|p| p.name)
+        .collect()
+}
+
 pub(crate) fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
     call.arguments.get(key)?.as_str().map(str::trim)
 }
@@ -842,6 +893,47 @@ pub fn parse_tool_intent(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    // A native emitter was observed sending `write_file` with `path` and no `contents`;
+    // it reached execution and came back as a per-tool error written by hand. The check
+    // is schema-driven so every tool gets it, and it names what arrived so the model can
+    // correct rather than guess.
+    #[tokio::test]
+    async fn a_call_missing_a_required_argument_is_refused_before_execution() {
+        let dir = std::env::temp_dir().join(format!("corrode-req-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keep.txt"), "original").unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(crate::vfs::PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(HashMap::new()),
+        );
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            name: name.to_string(),
+            arguments: args,
+        };
+
+        let out = toolbox
+            .execute(&call("write_file", serde_json::json!({"path": "keep.txt"})))
+            .await;
+        assert!(out.starts_with("error:"), "{out}");
+        assert!(out.contains("contents"), "must name the missing argument: {out}");
+        assert!(out.contains("path"), "must name what did arrive: {out}");
+        // Refused BEFORE execution: the file is untouched.
+        assert_eq!(std::fs::read_to_string(dir.join("keep.txt")).unwrap(), "original");
+
+        // A non-string value is missing too — the schema says string, and `arg_str`
+        // cannot tell the difference, so the model would otherwise get "needs a path".
+        let out = toolbox.execute(&call("read_file", serde_json::json!({"path": 3}))).await;
+        assert!(out.contains("path"), "{out}");
+
+        // An empty string is PRESENT: truncating a file is a legitimate call.
+        let out = toolbox
+            .execute(&call("write_file", serde_json::json!({"path": "keep.txt", "contents": ""})))
+            .await;
+        assert!(!out.starts_with("error:"), "empty contents is a truncation, not an error: {out}");
+        assert_eq!(std::fs::read_to_string(dir.join("keep.txt")).unwrap(), "");
+    }
     use super::*;
     use crate::vfs::PassthroughVfs;
     use serde_json::json;

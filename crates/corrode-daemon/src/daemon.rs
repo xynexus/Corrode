@@ -1415,8 +1415,18 @@ async fn gate_and_execute(
     // never across an await (the approval gate can block for minutes). Two tasks
     // racing the same fresh call may both execute — benign, same as pre-sharing.
     let prior = seen.lock().unwrap().repeat(call);
+    // A call missing a required argument cannot do anything, so refuse it before the
+    // approval gate rather than after: asking a human to approve `write_file` with no
+    // `contents` spends their attention on a call that was always going to be rejected,
+    // and `describe` renders it as a plausible-looking write.
+    let missing = crate::tools::missing_required(call);
     let observation = if let Some(prior) = prior {
         prior
+    } else if !missing.is_empty() {
+        let refused = crate::tools::missing_required_error(call, &missing);
+        // Not recorded in `seen`: this call did nothing, and caching it would serve the
+        // "already tried" note to a sibling that might well send the complete call.
+        refused
     } else if read_only && crate::tools::is_mutating(call) {
         let note = format!(
             "read-only pass: {} was not executed. Describe the change in your final \
@@ -2504,6 +2514,57 @@ mod tests {
         assert!(
             caller.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "the void reply must fall back to Needle, not be returned as an answer"
+        );
+    }
+
+    // The gate refuses an incomplete mutating call itself, so no human is ever asked to
+    // approve a `write_file` that carries no `contents` — `describe` would render it as
+    // a plausible write. Approving it would change nothing, which is worse than refusing:
+    // it spends the one attention budget the gate exists to protect.
+    #[tokio::test]
+    async fn an_incomplete_mutating_call_never_reaches_the_approval_gate() {
+        let dir = std::env::temp_dir().join(format!("corrode-gate-req-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let (etx, mut erx) = mpsc::channel(16);
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let call = crate::toolcall::ToolCall {
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({"path": "x.txt"}),
+        };
+        let out = gate_and_execute(
+            &call,
+            &toolbox,
+            &ApprovalGate::default(),
+            &etx,
+            1,
+            &mut written,
+            &seen,
+            false,
+        )
+        .await;
+        assert!(out.contains("missing required argument"), "{out}");
+        assert!(written.is_empty());
+        // The refusal still streams back as a ToolResult — that is how the model learns
+        // what was wrong. What must NOT appear is an ApprovalRequest.
+        while let Ok(ev) = erx.try_recv() {
+            assert!(
+                !matches!(ev, AgentEvent::ApprovalRequest { .. }),
+                "an incomplete call must not ask a human to approve it: {ev:?}"
+            );
+        }
+        // Not cached, so a sibling sending the COMPLETE call still executes rather than
+        // being served the refusal as an "already tried this" note. Asserted on `seen`
+        // directly: driving the complete call through the gate would block on an
+        // approval nobody is there to give, which is the gate working, not a result.
+        assert!(
+            seen.lock().unwrap().repeat(&call).is_none(),
+            "a refused call must not be remembered as attempted"
         );
     }
 
