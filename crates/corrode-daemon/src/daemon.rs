@@ -2286,6 +2286,40 @@ mod tests {
         assert_eq!(emits[0].role, Role::Review);
     }
 
+    // A write_file call carries TWO arguments, and for most of this crate's life the
+    // guide could not produce one: a merged token closed the second key and skipped its
+    // colon, so construction failed with `expected ':'` and the model — told only that
+    // its call was malformed — rewrote the same English and failed identically. Four
+    // turns of a demo-repo run went that way without a file being written. Single-argument
+    // read_file is in here as the control, since it worked throughout and so hid the bug.
+    #[cfg(feature = "needle")]
+    #[tokio::test]
+    #[ignore = "requires Needle assets (CORRODE_NEEDLE_ASSETS or the vendored default)"]
+    async fn needle_builds_a_two_argument_write_file_call() {
+        use crate::toolcall::needle::NeedleToolCaller;
+        let caller = NeedleToolCaller::load_from_env().expect("load Needle").expect("assets");
+        let dialects = Dialects::default();
+        let dialect = dialects.resolve(caller.model_id());
+        let schema = dialect.render(crate::tools::role_tools(Role::Coder), None);
+        for (intent, tool, args) in [
+            ("write the file notes.txt with content hello", "write_file", &["path", "contents"][..]),
+            ("read the file src/lib.rs", "read_file", &["path"][..]),
+        ] {
+            let raw = caller.generate(intent, &schema).expect("generate");
+            let calls = dialect
+                .parse(&raw)
+                .unwrap_or_else(|e| panic!("{intent}: {e}\n  raw: {raw}"));
+            let call = calls.first().unwrap_or_else(|| panic!("{intent}: no call from {raw}"));
+            assert_eq!(call.name, tool, "wrong tool for {intent:?}");
+            for key in args {
+                assert!(
+                    crate::tools::arg_str(call, key).is_some_and(|v| !v.is_empty()),
+                    "{intent:?}: `{key}` missing or empty in {raw}"
+                );
+            }
+        }
+    }
+
     // The harness-enforced repeat suppression: an exact repeat comes back as the prior
     // observation plus the already-tried note, args collide regardless of key order, a
     // successful mutating call clears the memory (a re-read after a write must run for
