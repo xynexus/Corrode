@@ -1964,3 +1964,37 @@ would look at twice. Measuring found it; reasoning had already missed it once.
 
 **Not expected to break:** byte-exactness, in any language. If a mismatch appears, the
 span cover is wrong and that is a real defect rather than a missing backend.
+
+## Routing: who builds the tool call
+
+Measured 2026-09-05, one model per fresh daemon (a batch sweep exhausted VRAM and every
+model then reported "no call" — that measured the OOM, not the model):
+
+| model | hipfire `function_call` | `contents` |
+|---|---|---|
+| Qwen3.5 0.8b / 9B, Qwen3.6 35B-A3B, Qwen3.8 27B | yes | real newline |
+| MiniCPM5 1B | no — emits `<function …>` XML | dialect parses |
+| ZAYA1 8b | no — emits `<zyphra_tool_call>` XML | dialect parses |
+
+Every served Qwen artifact emits calls hipfire parses server-side, so `*qwen*` carries the
+new `native` flag and takes `run_native_tool_loop`. That matters beyond tidiness: the
+Needle path's `TOOL:` channel is ONE LINE, so a model cannot express a newline in it at
+all. It is not an escaping bug — `C:\Users\x` round-trips correctly, and unescaping
+`\n` in `write_file` would corrupt the 27 files in this repo whose source legitimately
+contains it. The channel simply cannot carry the value.
+
+Needle's extraction is the rest of the gap, and escaping would not touch any of it:
+`he said "hello" loudly` -> `contents: "hello"`; `out.push('\n');` -> path and contents
+SWAPPED; `echo "a b" | grep a` -> `run_skill_script`, the wrong tool.
+
+Same turn, same prompt, before and after routing:
+
+- Needle: 15 tool results, six of them `run_skill_script` failures as the model guessed at
+  `cargo test`, `run_skill_script`, and a full `cd … && …` line as the script name.
+- Native: 5 tool results, `run_skill_script run-tests/test.sh -> exit 0`, and a correct
+  O(sqrt n) rewrite of `is_prime` with the repo's tests still passing. Fewer calls because
+  none are wasted.
+
+The residual risk is a future artifact `*qwen*` claims unmeasured: with no call emitted,
+the native loop takes the turn as a final answer and silently loses its tools. Probe a new
+build before trusting it, or give the native path a Needle fallback so it degrades.

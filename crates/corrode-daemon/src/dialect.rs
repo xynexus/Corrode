@@ -73,6 +73,11 @@ pub enum ParseFormat {
 pub struct ToolDialect {
     schema: SchemaFormat,
     parse: ParseFormat,
+    /// The model emits its own calls and the SERVER parses them into `function_call`
+    /// output items, so no `ParseFormat` describes them — hipfire has already done the
+    /// reading. Distinct from the XML formats, which say "the model emits calls and WE
+    /// parse this shape".
+    native: bool,
     /// canonical -> exposed (what the model sees).
     names: HashMap<String, String>,
     /// exposed -> canonical (reverse of `names`, for parsing).
@@ -92,9 +97,16 @@ impl ToolDialect {
         Self {
             schema,
             parse,
+            native: false,
             names,
             rev_names,
         }
+    }
+
+    /// Mark this model a native emitter whose calls the server parses (builder).
+    pub fn native(mut self) -> Self {
+        self.native = true;
+        self
     }
 
     fn exposed(&self, canonical: &str) -> String {
@@ -157,7 +169,7 @@ impl ToolDialect {
     /// and the reply is parsed directly — no Needle in the loop. False for dialects
     /// whose calls are constructed for the model (the Needle-flat / json-array default).
     pub fn emits_own_calls(&self) -> bool {
-        matches!(self.parse, ParseFormat::MiniCpmXml | ParseFormat::ZyphraXml)
+        self.native || matches!(self.parse, ParseFormat::MiniCpmXml | ParseFormat::ZyphraXml)
     }
 
     /// Tools rendered for the `tools` field of a chat/responses request.
@@ -221,20 +233,31 @@ impl Default for Dialects {
                     "*zaya*".to_string(),
                     ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::ZyphraXml, HashMap::new()),
                 ),
-                // Qwen3.5-9B emits its own `<tool_call>` blocks and they were being
-                // thrown away — see `ParseFormat::QwenToolCall`. Scoped to the ARTIFACT,
-                // not to `*qwen*`, because measuring the family showed the shape is a
-                // property of the build rather than the model line: of four served Qwen
-                // artifacts, 3.5-9B emits `<invoke>` XML, 3.6-35B emits
-                // `tool_name:/tool_args:` YAML, and 3.5-0.8b emits prose with no call at
-                // all. A family glob routed the other three natively and cost them their
-                // tools — the 0.8b hallucinated a file's contents rather than reading it,
-                // which is the exact failure native routing was meant to fix.
+                // Every served Qwen artifact emits calls that hipfire parses into
+                // `function_call` output items — measured 2026-09-05 across all four:
+                // 3.5-0.8b, 3.5-9B, 3.6-35B-A3B and 3.8-27B each returned a structured
+                // write_file with both arguments and a REAL newline in `contents`.
                 //
-                // Needle is the right default for the rest precisely because it is
-                // shape-agnostic: it builds the call from a plain-English line, so a new
-                // artifact's private format costs nothing. Add a rule here per artifact
-                // once its shape is verified, never per family.
+                // This rule used to be per-artifact, with a standing note never to widen
+                // it to the family: measuring the shapes had shown `<invoke>` XML from
+                // one build, `tool_name:` YAML from another, prose from a third, so a
+                // family glob routed three of them natively and cost them their tools.
+                // That reasoning is now obsolete rather than merely overruled — the
+                // shapes differed because the qwen35 chat template was not rendering, so
+                // no tools block reached the model and each improvised a syntax. With the
+                // template fixed and hipfire parsing calls server-side, shape is the
+                // server's problem and the family is uniform.
+                //
+                // The residual risk is a FUTURE artifact this glob claims unmeasured: if
+                // it emits no call, `run_native_tool_loop` sees an empty list and takes
+                // the turn as a final answer, so it silently loses its tools. Probe a new
+                // build (see the table in docs/harness-architecture.md) before trusting
+                // it, or give the native path a Needle fallback so it degrades instead.
+                (
+                    "*qwen*".to_string(),
+                    ToolDialect::new(SchemaFormat::OpenAiNested, ParseFormat::JsonArray, HashMap::new())
+                        .native(),
+                ),
             ],
             default: ToolDialect::default(),
         }
@@ -307,6 +330,10 @@ struct ProfileConfig {
     parse: String,
     #[serde(default)]
     names: HashMap<String, String>,
+    /// The server parses this model's calls (hipfire `function_call` items). Off by
+    /// default: claiming it for a model that emits nothing costs that model its tools.
+    #[serde(default)]
+    native: bool,
 }
 
 impl ProfileConfig {
@@ -322,7 +349,8 @@ impl ProfileConfig {
             "zyphra-xml" => ParseFormat::ZyphraXml,
             other => anyhow::bail!("unknown parse format `{other}`"),
         };
-        Ok(ToolDialect::new(schema, parse, self.names))
+        let dialect = ToolDialect::new(schema, parse, self.names);
+        Ok(if self.native { dialect.native() } else { dialect })
     }
 }
 
@@ -395,6 +423,32 @@ mod tests {
         // The Needle-flat rendering ignores the overlay entirely.
         let flat = ToolDialect::default();
         assert_eq!(flat.render(TOOLS, Some(&overlay)), flat.render(TOOLS, None));
+    }
+
+    // Routing, per served model. The Qwen family goes native because hipfire parses its
+    // calls server-side (measured across all four artifacts); a model with neither a
+    // native flag nor an XML parse format must NOT be routed native, since the native
+    // loop would hand it an empty call list and take the turn as a final answer — the
+    // "most capable model in the roster could not read a file" regression.
+    #[test]
+    fn only_measured_native_emitters_skip_the_needle_path() {
+        let d = Dialects::default();
+        for id in [
+            "Qwen3.5--0.8b-oq4++",
+            "Qwen3.5-9B--oq4.25++",
+            "Qwen3.6--35B-A3B.oq4.25++",
+            "Qwen3.8-27B--oq4.25++",
+            "MiniCPM5--1B.oq4.25++",
+            "ZAYA1--8b.oq4++",
+        ] {
+            assert!(d.resolve(id).emits_own_calls(), "{id} must not go through Needle");
+        }
+        // Qwen needs the nested schema the chat template serializes, not Needle-flat.
+        let qwen = d.resolve("Qwen3.5-9B--oq4.25++");
+        assert!(matches!(qwen.schema, SchemaFormat::OpenAiNested));
+        // An unknown model keeps the Needle default: it has to be measured first.
+        let unknown = d.resolve("SomeNewModel--7B");
+        assert!(!unknown.emits_own_calls(), "an unmeasured model must keep its tools via Needle");
     }
 
     #[test]
