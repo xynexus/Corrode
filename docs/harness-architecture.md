@@ -2038,3 +2038,35 @@ Two judgements worth keeping explicit:
 
 The error names what is missing and what did arrive (`missing: contents. Received: path`),
 because the model's next move is to reissue the call and it needs both halves to do it.
+
+
+## Fan-out, measured — and the batching premise behind it
+
+`CORRODE_FANOUT=3` on the demo repo, 2026-09-05: **2 of 3 attempts timed out**, the
+ensemble collapsed to a lone survivor, and a lone survivor skips the judge — so the run
+paid for three explorations and executed the unjudged output of one. The fixed 120s grace
+on the Opportunistic extras was the cause, and the constant's own note had predicted it
+("race extras against attempt 1 + margin if this measurably discards useful proposals").
+Extras are now timed against attempt 1 — same prompt, same tool loop, differing only in
+band — at `FANOUT_STRAGGLER_FACTOR`x, with the old constant kept as a floor.
+
+**But the premise underneath is not currently true.** CLAUDE.md constraint 2 says a wide
+fan-out "collapses into one batched, prefix-shared run". Measured against the live daemon,
+three requests sharing a prefix and sent 0.4 ms apart (inside the 10 ms gather window):
+
+| | wall clock |
+|---|---|
+| 1 request | 14.1 s |
+| 3 concurrent | 72.3 s |
+
+Serial, plus contention — 5.1x the cost of one, not ~1x. Identical on `/v1/chat/completions`
+and `/v1/responses`, so it is not the endpoint. Every static gate passes: qwen3.5 declares
+and registers `ContinuousBatching`, no kill switch is set, `batch_envelope_ok()` holds, and
+`/health` reports `prefill_batch.enabled = true`, capability `supported`. Yet across 191
+scheduled requests `prefill_batch.selected_batch_size = 0`, `decode_batch.total_batches = 0`,
+and `daemon_scheduler.queue_depth_max = 1` — the batcher never had two requests to fuse,
+which points upstream of it rather than at eligibility.
+
+Until that is resolved, every K in a fan-out costs a full K times, speculative attempts are
+not free, and the Opportunistic band buys nothing. The straggler fix above makes the
+ensemble survive that; it does not make it cheap.

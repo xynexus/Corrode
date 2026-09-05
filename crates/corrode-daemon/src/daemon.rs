@@ -1244,12 +1244,27 @@ const MAX_TOOL_STEPS: usize = 6;
 /// shared prefix stays byte-identical (KV reuse).
 const PROPOSAL_CAP: usize = 4096;
 
-/// How long a speculative extra attempt (Opportunistic band) may keep the ensemble
-/// waiting. Attempt 1 runs at the role's band and is never timed out; without this,
-/// a starved straggler holds the whole Default-band task hostage (priority
-/// inversion). ponytail: fixed grace — race extras against attempt 1 + margin if
-/// this measurably discards useful proposals.
+/// Floor on how long a speculative extra attempt (Opportunistic band) may keep the
+/// ensemble waiting. Attempt 1 runs at the role's band and is never timed out; without
+/// a bound at all, a starved straggler holds the whole Default-band task hostage
+/// (priority inversion).
+///
+/// This used to be the WHOLE budget, fixed at 120s, and the note here said to race the
+/// extras against attempt 1 "if this measurably discards useful proposals". Measured
+/// 2026-09-05 on the demo repo: 2 of 3 attempts timed out, the ensemble collapsed to a
+/// lone survivor, and a lone survivor skips the judge — so a K=3 run paid for three
+/// explorations and got the unjudged output of one. A read-only attempt runs the same
+/// multi-step tool loop as attempt 1; it was never going to fit in a fixed 120s while
+/// attempt 1 took minutes.
 const FANOUT_EXTRA_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How much longer than attempt 1 an extra attempt may run before it is dropped.
+///
+/// Attempt 1 is the honest yardstick: same prompt, same tool loop, same repo, differing
+/// only in band. An extra that has already taken half again as long as the attempt that
+/// finished is not close behind — it is starved, which is what Opportunistic means when
+/// the GPU is busy.
+const FANOUT_STRAGGLER_FACTOR: u32 = 3;
 
 /// Byte cap per task output in the plan-review digest.
 const REVIEW_OUTPUT_CAP: usize = 2048;
@@ -1973,27 +1988,57 @@ async fn run_fanout(
     seen: &std::sync::Mutex<SeenCalls>,
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<String> {
+    // How long attempt 1 took, published the moment it finishes so the extras can be
+    // timed against it rather than against a constant guessed ahead of the run.
+    let baseline = Arc::new(tokio::sync::Notify::new());
+    let baseline_took = Arc::new(std::sync::Mutex::new(None::<std::time::Duration>));
     let attempts = (0..k).map(|i| {
         let attempt_task = planner::fanout_attempt_task(task, i + 1, k);
         let attempt_band = if i == 0 { band } else { Priority::Opportunistic };
         let toolbox = toolbox.clone();
         let tool_caller = tool_caller.clone();
+        let baseline = Arc::clone(&baseline);
+        let baseline_took = Arc::clone(&baseline_took);
         async move {
             let mut sink = Vec::new(); // read-only: no artifacts can land
             // Attempts get a PRIVATE map: their "read-only pass" notes must never
             // suppress the turn map's real, writable execution of the same call.
             let attempt_seen = std::sync::Mutex::new(SeenCalls::default());
+            let started = std::time::Instant::now();
             let fut = run_task(
                 client, model, attempt_band, dialects, tool_caller, toolbox, approvals,
                 prefix, role, &attempt_task, events, id, &mut sink, true, &attempt_seen,
                 deadline,
             );
             if i == 0 {
-                fut.await
-            } else {
-                match tokio::time::timeout(FANOUT_EXTRA_GRACE, fut).await {
-                    Ok(res) => res,
-                    Err(_) => Err(anyhow::anyhow!("fanout attempt {} timed out", i + 1)),
+                let res = fut.await;
+                *baseline_took.lock().unwrap() = Some(started.elapsed());
+                baseline.notify_waiters();
+                return res;
+            }
+            // Race the extra against attempt 1 plus a margin. Until attempt 1 lands
+            // there is no yardstick, so an extra that finishes first is simply kept.
+            tokio::pin!(fut);
+            let deadline_passed = async {
+                loop {
+                    let notified = baseline.notified();
+                    if let Some(took) = *baseline_took.lock().unwrap() {
+                        return took.saturating_mul(FANOUT_STRAGGLER_FACTOR).max(FANOUT_EXTRA_GRACE);
+                    }
+                    notified.await;
+                }
+            };
+            tokio::select! {
+                res = &mut fut => res,
+                budget = deadline_passed => {
+                    match tokio::time::timeout(budget, fut).await {
+                        Ok(res) => res,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "fanout attempt {} outran attempt 1 by more than {}x",
+                            i + 1,
+                            FANOUT_STRAGGLER_FACTOR
+                        )),
+                    }
                 }
             }
         }
