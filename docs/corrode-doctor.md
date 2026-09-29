@@ -61,6 +61,13 @@ expected baseline and detect their absence.
 - **Impact if missing:** skill ranking and doc-GraphRAG fall back to non-vector
   paths (BM25 for `DocQuery`).
 
+### Role assignments — info / warn
+- **Detect:** resolve `CORRODE_ROLES` against `/v1/models` exactly as the daemon
+  does and print each role's model.
+- **Warn:** an override naming a model hipfire does not serve. `resolve` drops it
+  silently and the role falls back to the default pick, so a typo'd id is
+  otherwise invisible.
+
 ### Repo writable & graph dir — info
 - **Detect:** `CORRODE_REPO` (default `.`) exists and is writable; the store dir
   `<repo>/.corrode/graph` (or `CORRODE_GRAPH_DIR`) is creatable. Note LMDB reserves

@@ -40,6 +40,7 @@ crates/corrode-web      # web server stub (Apache-2.0)
 crates/needle-toolcall-shim  # vendored Needle tool-call model (Apache-2.0, CPU/candle). Workspace-EXCLUDED; corrode-daemon links it behind `--features needle`. Weights committed under assets/needle.
 third_party/needle      # git submodule: upstream Needle (Cactus) — training/finetuning code, kept for finetuning Needle on Corrode's real tool set.
 fixtures/demo-repo      # git submodule (xynexus/corrode-demo): a tiny real Rust project — deterministic target for e2e/tool/skill/provenance testing (CORRODE_REPO) + Needle-finetune query source.
+fixtures/cae            # git submodule (xynexus/CAE, private, ssh): ~119K-line, 14-crate Rust workspace — the large target for concurrent-swarm testing. Its AGENTS.md is `@CLAUDE.md` (expanded by skills.rs). Never point a swarm at a live checkout of it; builds need glslc + Vulkan (lavapipe).
 webui/                  # wasm front-end seam (out of the cargo workspace; its own trunk/wasm-pack build)
 third_party/helix-db    # git submodule: HelixDB pinned at v2.3.5 (AGPL-3.0), linked in-process behind the `helix` feature
 third_party/helix-skills# vendored HelixDB agent skills (MIT); Rust-relevant ones symlinked into .claude/skills/
@@ -196,7 +197,13 @@ Every prompt in a turn — the orchestration call and each subagent
 (`Daemon::context_prefix`), so hipfire batches them prefix-shared and reuses KV when
 they land on the same model. The divergent role/task goes in the tail; nothing
 role-specific precedes the prefix. The `subagent_prompt` test guards this invariant.
-Remaining ponytail: the prefix is a shallow VFS root listing (plus AGENTS.md rules
+The prefix travels as its own **system turn** (`Client::input_items`, split at the
+registered prefix), and the native tool loop replays each step as assistant
+`function_call` + `function_call_output` turns (`Client::respond_turns`) rather than
+folding a scratchpad into one message. Both are load-bearing: Qwen3.5's DeltaNet
+state cannot be rewound to an arbitrary shared prefix, so hipfire reuses prefill only
+by forking a checkpoint taken at a chat-turn boundary — one user message, and every
+request re-prefills everything. Remaining ponytail: the prefix is a shallow VFS root listing (plus AGENTS.md rules
 and skills) — the graph-backed VFS will supply richer, relevance-ranked context
 without changing the sharing shape.
 
