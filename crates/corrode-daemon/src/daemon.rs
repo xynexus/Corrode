@@ -1669,11 +1669,18 @@ async fn run_native_tool_loop(
     }
     record_trace(&toolbox, id, task, &steps, &touched);
     // Step budget spent. Calls were made to spend it, so what follows is an answer —
-    // asked for explicitly. The tools stay DECLARED (a call it makes anyway is not
-    // run): Qwen renders them into the system turn, so dropping them changed the
-    // turn's bytes and the final call re-prefilled the whole ~13K-token conversation
-    // instead of forking the last step's checkpoint.
-    turns.push(serde_json::json!({"type": "message", "role": "user", "content": FINAL_ANSWER_NUDGE}));
+    // asked for explicitly. Both choices here keep the prompt a byte-extension of the
+    // last step's, so it forks that step's checkpoint instead of re-prefilling:
+    // - the tools stay DECLARED (a call made anyway is not run) — Qwen renders them
+    //   into the system turn, and dropping them re-prefilled ~13K tokens;
+    // - the nudge rides the last tool RESULT, not a new user message — a user turn
+    //   moves Qwen's "last query", which re-renders every earlier assistant turn
+    //   (measured: a 28.7K-token conversation prefilled cold).
+    if let Some(last) = turns.last_mut() {
+        if let Some(out) = last.get("output").and_then(|o| o.as_str()) {
+            last["output"] = serde_json::json!(format!("{out}\n\n{FINAL_ANSWER_NUDGE}"));
+        }
+    }
     let (text, _reasoning, _calls) = client
         .respond_turns(model, &prompt, &turns, band, toolbox.owner_token(), Some(&tools), Some(&effort))
         .await?;
