@@ -1254,7 +1254,7 @@ fn max_tool_steps() -> usize {
         .unwrap_or(16)
 }
 
-/// Appended when a task spends its step budget: one more generation, with no tools, so
+/// Appended when a task spends its step budget: one more generation that asks for no more calls, so
 /// the task ends on an answer rather than on whatever it said before its last call
 /// (usually nothing — a model calling a tool rarely writes prose with it).
 const FINAL_ANSWER_NUDGE: &str = "You have used all your tool calls. Do not call any more tools. \
@@ -1669,10 +1669,13 @@ async fn run_native_tool_loop(
     }
     record_trace(&toolbox, id, task, &steps, &touched);
     // Step budget spent. Calls were made to spend it, so what follows is an answer —
-    // asked for explicitly, with no tools declared, so there is one.
+    // asked for explicitly. The tools stay DECLARED (a call it makes anyway is not
+    // run): Qwen renders them into the system turn, so dropping them changed the
+    // turn's bytes and the final call re-prefilled the whole ~13K-token conversation
+    // instead of forking the last step's checkpoint.
     turns.push(serde_json::json!({"type": "message", "role": "user", "content": FINAL_ANSWER_NUDGE}));
     let (text, _reasoning, _calls) = client
-        .respond_turns(model, &prompt, &turns, band, toolbox.owner_token(), None, Some(&effort))
+        .respond_turns(model, &prompt, &turns, band, toolbox.owner_token(), Some(&tools), Some(&effort))
         .await?;
     let _ = events.send(AgentEvent::SubagentOutput { id, text: text.clone() }).await;
     Ok(NativeOutcome::Answered(if text.trim().is_empty() { last } else { text }))
