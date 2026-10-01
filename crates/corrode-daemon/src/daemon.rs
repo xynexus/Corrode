@@ -1331,6 +1331,11 @@ fn max_tool_steps() -> usize {
         .unwrap_or(16)
 }
 
+/// Sent once when a task's first reply makes no tool call (see the native loop).
+const NO_CALL_REMINDER: &str = "You replied without calling a tool. Changes to the repository only happen \
+through tool calls: to create or change a file, call write_file with its full contents -- do not paste \
+file contents as your reply. If the task truly needs no tool, repeat your final answer.";
+
 /// Tool calls left when a task is told its budget is running out.
 const STEPS_LEFT_WARNING: usize = 3;
 
@@ -1668,6 +1673,7 @@ async fn run_native_tool_loop(
     let mut steps: Vec<crate::trace::Step> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
     let max_steps = max_tool_steps();
+    let mut reminded = false;
     for step in 0..max_steps {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
         // tool call that is half-applied is worse than a turn that runs long, and
@@ -1713,6 +1719,20 @@ async fn run_native_tool_loop(
             server_calls
         };
         let Some(call) = calls.first() else {
+            // A first reply with no call gets ONE reminder before it counts as the
+            // answer: a CAE coder pasted its whole 14 KB deliverable as prose, ran
+            // into the output cap, and the toolless reply sent the task to the Needle
+            // fallback -- which wrote a 17-byte placeholder file. The reminder is a
+            // new user turn, which is fine here: there are no earlier assistant
+            // turns for it to re-render.
+            if calls_made == 0 && !reminded && !read_only {
+                reminded = true;
+                if !text.trim().is_empty() {
+                    turns.push(serde_json::json!({"type": "message", "role": "assistant", "content": text}));
+                }
+                turns.push(serde_json::json!({"type": "message", "role": "user", "content": NO_CALL_REMINDER}));
+                continue;
+            }
             steps.push(crate::trace::Step {
                 said: text.clone(),
                 intent: None,

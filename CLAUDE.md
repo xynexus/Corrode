@@ -83,8 +83,9 @@ least-irrelevant matches), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -
 (daemon ws the web proxies to), `CORRODE_TELEMETRY` (path to a JSONL
 file recording one line per subagent execution — role, model, band, prefix/tail bytes,
 duration, artifacts, ok/error; absent -> disabled), `CORRODE_MAX_TOOL_STEPS` (tool calls a task may make before it must answer, default 16;
-when spent, one more no-tools generation asks for the final answer), `CORRODE_MAX_TOKENS` (per-call output cap,
-default 4096 — a ceiling, so short outputs are unaffected), `CORRODE_STREAM`
+a note on the tool result warns at 3 left; when spent, one more generation asks for the final answer
+— tools still declared, none run), `CORRODE_MAX_TOKENS` (per-call output cap,
+default 8192 — a ceiling, so short outputs are unaffected), `CORRODE_STREAM`
 (stream single-shot subagent output over SSE, relaying `SubagentDelta` events to
 the UI as tokens generate; off unless `1`/`true`/`on` — the non-streaming path is
 unchanged when off), `CORRODE_FANOUT` (coder-task ensemble size — K read-only proposal
