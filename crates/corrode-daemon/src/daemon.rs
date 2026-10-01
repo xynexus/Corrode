@@ -353,8 +353,10 @@ impl Daemon {
                 // dataflow, not a fixed fan-out. Real concurrency is hipfire's to bound
                 // (admission control against its VRAM budget); nothing is capped here.
                 let mut graph = plan_graph::PlanGraph::new(&plan_id);
+                let mut ids = Vec::new();
                 for s in subtasks {
-                    graph.add(s.role, s.prompt, Vec::new());
+                    let deps = s.after.iter().map(|&i| ids[i]).collect();
+                    ids.push(graph.add(s.role, s.prompt, deps));
                 }
 
                 let fanout = fanout_k();
@@ -776,6 +778,7 @@ impl Daemon {
             plan = vec![planner::PlannedSubtask {
                 role: Role::Coder,
                 prompt: text.to_string(),
+                after: Vec::new(),
             }];
         }
         Ok((plan, prefix))
@@ -1239,9 +1242,23 @@ impl Daemon {
     }
 }
 
-/// Max tool calls a small model may make before it must answer — a bound on GPU spend
-/// and runaway loops.
-const MAX_TOOL_STEPS: usize = 6;
+/// Max tool calls a task may make before it must answer — a bound on GPU spend and
+/// runaway loops. `CORRODE_MAX_TOOL_STEPS` overrides. 6 was too few for a real repo:
+/// "read 15 crates' manifests and roots" needs ~30, and every task on CAE spent its
+/// budget mid-read. Steps are cheap with prefix reuse (each forks the last checkpoint).
+fn max_tool_steps() -> usize {
+    std::env::var("CORRODE_MAX_TOOL_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(16)
+}
+
+/// Appended when a task spends its step budget: one more generation, with no tools, so
+/// the task ends on an answer rather than on whatever it said before its last call
+/// (usually nothing — a model calling a tool rarely writes prose with it).
+const FINAL_ANSWER_NUDGE: &str = "You have used all your tool calls. Do not call any more tools. \
+Give your final answer now from what you have gathered, and say plainly what you did not get to.";
 
 /// Byte cap per proposal fed to the fan-out judge — bounds the judge tail while the
 /// shared prefix stays byte-identical (KV reuse).
@@ -1557,7 +1574,7 @@ async fn run_native_tool_loop(
     // no notes at all — silently, since nothing reports notes it never tried to make.
     let mut steps: Vec<crate::trace::Step> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
-    for step in 0..MAX_TOOL_STEPS {
+    for step in 0..max_tool_steps() {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
         // tool call that is half-applied is worse than a turn that runs long, and
         // there is no way to un-run one. Reported, not silent: a truncated answer
@@ -1651,8 +1668,14 @@ async fn run_native_tool_loop(
         }));
     }
     record_trace(&toolbox, id, task, &steps, &touched);
-    // Step budget spent. Calls were made to spend it, so this is an answer.
-    Ok(NativeOutcome::Answered(last))
+    // Step budget spent. Calls were made to spend it, so what follows is an answer —
+    // asked for explicitly, with no tools declared, so there is one.
+    turns.push(serde_json::json!({"type": "message", "role": "user", "content": FINAL_ANSWER_NUDGE}));
+    let (text, _reasoning, _calls) = client
+        .respond_turns(model, &prompt, &turns, band, toolbox.owner_token(), None, Some(&effort))
+        .await?;
+    let _ = events.send(AgentEvent::SubagentOutput { id, text: text.clone() }).await;
+    Ok(NativeOutcome::Answered(if text.trim().is_empty() { last } else { text }))
 }
 
 /// The Needle-mediated tool-execution loop for a small model.
@@ -1699,7 +1722,7 @@ async fn run_tool_loop(
     // content without re-reading the model's prose.
     let mut called: Option<String> = None;
     let mut last = String::new();
-    for _ in 0..MAX_TOOL_STEPS {
+    for _ in 0..max_tool_steps() {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
         // tool call that is half-applied is worse than a turn that runs long, and
         // there is no way to un-run one. Reported, not silent: a truncated answer
@@ -1768,9 +1791,13 @@ async fn run_tool_loop(
         });
         scratchpad.push_str(&format!("\nTOOL: {intent}\nRESULT: {observation}\n"));
     }
-    // Step budget spent: hand back the last turn as the answer.
+    // Step budget spent: ask once more, for the answer (see FINAL_ANSWER_NUDGE).
     record_trace(&toolbox, id, task, &steps, &touched);
-    Ok(last)
+    scratchpad.push_str(&format!("\n{FINAL_ANSWER_NUDGE}\n"));
+    let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
+    let text = client.respond(model, &prompt, band, toolbox.owner_token()).await?;
+    let _ = events.send(AgentEvent::SubagentOutput { id, text: text.clone() }).await;
+    Ok(if text.trim().is_empty() { last } else { text })
 }
 
 /// Extract a task's notes and persist them.

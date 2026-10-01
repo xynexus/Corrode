@@ -82,7 +82,8 @@ least-irrelevant matches), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -
 `CORRODE_WEB_ADDR` (web bind, default `0.0.0.0:8787`), `CORRODE_DAEMON_URL`
 (daemon ws the web proxies to), `CORRODE_TELEMETRY` (path to a JSONL
 file recording one line per subagent execution — role, model, band, prefix/tail bytes,
-duration, artifacts, ok/error; absent -> disabled), `CORRODE_MAX_TOKENS` (per-call output cap,
+duration, artifacts, ok/error; absent -> disabled), `CORRODE_MAX_TOOL_STEPS` (tool calls a task may make before it must answer, default 16;
+when spent, one more no-tools generation asks for the final answer), `CORRODE_MAX_TOKENS` (per-call output cap,
 default 4096 — a ceiling, so short outputs are unaffected), `CORRODE_STREAM`
 (stream single-shot subagent output over SSE, relaying `SubagentDelta` events to
 the UI as tokens generate; off unless `1`/`true`/`on` — the non-streaming path is
@@ -149,7 +150,8 @@ unreachable, all roles fall back to `CORRODE_MODEL`.
 
 `planner.rs` is the two-phase decomposition, driven by `Daemon::plan`: phase 1 asks
 the orchestration model for a JSON plan; phase 2 (`parse_plan`) turns it into
-role-tagged `PlannedSubtask`s. Empty/unparseable plan degrades to one coder task on
+role-tagged `PlannedSubtask`s; a subtask's optional `after` (indices of earlier subtasks) becomes
+plan-graph deps, and a dependent launches with its deps' outputs appended to its prompt. Empty/unparseable plan degrades to one coder task on
 the raw prompt. `plan` returns those subtasks plus the shared prefix; the daemon
 seeds a `plan_graph::PlanGraph` with them and drives it via `run_reactive`.
 

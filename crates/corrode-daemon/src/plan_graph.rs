@@ -31,6 +31,9 @@ const LABEL_CAP: usize = 200;
 /// ponytail: fixed cap — make it budget-aware with per-request cost when tracked.
 const MAX_PLAN_TASKS: usize = 24;
 
+/// Bytes of each dependency's output handed to a dependent task.
+const DEP_OUTPUT_CAP: usize = 6144;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Pending,
@@ -187,6 +190,30 @@ impl PlanGraph {
         if let Some(n) = self.nodes.iter_mut().find(|n| n.task.id == id) {
             n.output = Some(output.to_string());
         }
+    }
+
+    /// `task` with the outputs of the tasks it waits on appended to its prompt — a
+    /// dependency is only useful if its result reaches the dependent. Each is capped at
+    /// [`DEP_OUTPUT_CAP`] bytes so a chain of long answers can't grow a tail unboundedly.
+    fn with_dep_outputs(&self, mut task: PlanTask) -> PlanTask {
+        let outs: Vec<String> = task
+            .deps
+            .iter()
+            .filter_map(|d| {
+                let n = self.nodes.iter().find(|n| n.task.id == *d)?;
+                let out = n.output.as_deref().filter(|o| !o.trim().is_empty())?;
+                let end = crate::tools::floor_char_boundary(out, DEP_OUTPUT_CAP);
+                Some(format!("task {} [{}] result:\n{}", d, n.task.role.as_str(), &out[..end]))
+            })
+            .collect();
+        if !outs.is_empty() {
+            task.prompt = format!(
+                "{}\n\nResults of the tasks this one waited on:\n\n{}",
+                task.prompt,
+                outs.join("\n\n")
+            );
+        }
+        task
     }
 
     /// A compact digest of the settled plan for the review pass: every `Done` task's
@@ -356,6 +383,7 @@ where
     loop {
         if !expired() {
             for task in graph.ready() {
+                let task = graph.with_dep_outputs(task);
                 let id = task.id;
                 graph.set_status(id, Status::Running);
                 let fut = execute(task); // borrows `execute`; only the future is moved
@@ -529,6 +557,32 @@ mod tests {
         assert_eq!(role_from_tool_calls(&[]), None);
     }
 
+    // A dependency is only useful if its result reaches the dependent: the writer must
+    // be handed what the researchers found, and only once they finished.
+    #[tokio::test]
+    async fn dependent_task_receives_its_dependencies_outputs() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut g = PlanGraph::default();
+        let a = g.add(Role::Research, "read crate a", vec![]);
+        let b = g.add(Role::Research, "read crate b", vec![]);
+        g.add(Role::Coder, "write the map", vec![a, b]);
+        let rec = seen.clone();
+        run_reactive(&mut g, move |task: PlanTask| {
+            let rec = rec.clone();
+            async move {
+                rec.lock().unwrap().push(task.prompt.clone());
+                let out = format!("found {}", task.prompt.trim_start_matches("read "));
+                Outcome { output: Ok(out), emitted: vec![], artifacts: vec![] }
+            }
+        })
+        .await;
+        let seen = seen.lock().unwrap();
+        let writer = seen.iter().find(|p| p.starts_with("write the map")).unwrap();
+        assert!(writer.contains("found crate a") && writer.contains("found crate b"), "{writer}");
+        let research = seen.iter().find(|p| p.starts_with("read crate a")).unwrap();
+        assert!(!research.contains("Results of"), "a task with no deps gets no results block");
+    }
+
     // A coder task emits a test contract mid-run; a review task depends on the coder.
     // Assert dependency order (coder before review) AND that the emitted test runs
     // after the coder that spawned it.
@@ -585,7 +639,9 @@ mod tests {
             let rec = rec.clone();
             async move {
                 rec.lock().unwrap().push(task.prompt.clone());
-                let emitted = if task.prompt.contains("review the plan") {
+                // starts_with: a dependent's prompt carries its deps' outputs, which
+                // quote their prompts, so `contains` would match the fix itself.
+                let emitted = if task.prompt.starts_with("review the plan") {
                     vec![Emit {
                         role: Role::Coder,
                         prompt: "fix the overflow in add()".into(),
