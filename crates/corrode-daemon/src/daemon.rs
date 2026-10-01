@@ -11,8 +11,8 @@ use crate::approval::ApprovalGate;
 use crate::dialect::Dialects;
 use crate::hipfire::Client;
 use crate::plan_graph;
-use crate::project::Project;
 use crate::planner;
+use crate::project::Project;
 use crate::roles::{Role, RoleModels};
 use crate::session::{RepoResources, Session, SessionKey};
 use crate::skills::SkillContext;
@@ -137,7 +137,9 @@ impl Daemon {
             (None, true) => {
                 // Asking for it and silently not getting it is the failure mode worth
                 // avoiding: without a store there is nothing to compose from.
-                eprintln!("vfs: CORRODE_VFS_GRAPH set but no graph store is open; using the filesystem");
+                eprintln!(
+                    "vfs: CORRODE_VFS_GRAPH set but no graph store is open; using the filesystem"
+                );
                 vfs
             }
             _ => vfs,
@@ -214,20 +216,38 @@ impl Daemon {
             skill_scripts: Arc::new(skills.script_dirs()),
             skills: Arc::new(skills),
         };
-        Ok(self.repos.lock().unwrap().entry(repo.clone()).or_insert(res).clone())
+        Ok(self
+            .repos
+            .lock()
+            .unwrap()
+            .entry(repo.clone())
+            .or_insert(res)
+            .clone())
     }
 
     /// Get-or-create the `(user, repo)` session for a connection. `path` empty =>
     /// the default repo. Sessions are shared across a user's tabs on the same repo.
     async fn bind_session(&self, user: Option<String>, path: &str) -> anyhow::Result<Arc<Session>> {
-        let repo = if path.is_empty() { self.default_repo.clone() } else { canonical(path) };
-        let key = SessionKey { user: user.unwrap_or_default(), repo: repo.clone() };
+        let repo = if path.is_empty() {
+            self.default_repo.clone()
+        } else {
+            canonical(path)
+        };
+        let key = SessionKey {
+            user: user.unwrap_or_default(),
+            repo: repo.clone(),
+        };
         if let Some(s) = self.sessions.lock().unwrap().get(&key) {
             return Ok(Arc::clone(s));
         }
         let res = self.repo_resources(&repo).await?;
         let owner_token = self.owner_token_for(&key.user);
-        let session = Arc::new(Session::new(key.clone(), res, self.sandbox.clone(), owner_token));
+        let session = Arc::new(Session::new(
+            key.clone(),
+            res,
+            self.sandbox.clone(),
+            owner_token,
+        ));
         Ok(Arc::clone(
             self.sessions.lock().unwrap().entry(key).or_insert(session),
         ))
@@ -267,13 +287,20 @@ impl Daemon {
                     }
                     match self.bind_session(user.clone(), &path).await {
                         Ok(s) => {
-                            let (p, u) = (s.repo_root.to_string_lossy().into_owned(), s.key.user.clone());
+                            let (p, u) = (
+                                s.repo_root.to_string_lossy().into_owned(),
+                                s.key.user.clone(),
+                            );
                             session = Some(s);
-                            let _ = events.send(AgentEvent::RepoSelected { path: p, user: u }).await;
+                            let _ = events
+                                .send(AgentEvent::RepoSelected { path: p, user: u })
+                                .await;
                         }
                         Err(e) => {
                             let _ = events
-                                .send(AgentEvent::Error { message: format!("select repo: {e}") })
+                                .send(AgentEvent::Error {
+                                    message: format!("select repo: {e}"),
+                                })
                                 .await;
                         }
                     }
@@ -321,7 +348,12 @@ impl Daemon {
         }
     }
 
-    async fn handle(&self, session: &Arc<Session>, cmd: AgentCommand, events: &mpsc::Sender<AgentEvent>) {
+    async fn handle(
+        &self,
+        session: &Arc<Session>,
+        cmd: AgentCommand,
+        events: &mpsc::Sender<AgentEvent>,
+    ) {
         match cmd {
             AgentCommand::Prompt { text, priority } => {
                 // The plan id exists before planning so TurnComplete is unconditional:
@@ -515,7 +547,8 @@ impl Daemon {
                         }
                     }
                 };
-                let mut budget = plan_graph::run_reactive_until(&mut graph, &execute, deadline).await;
+                let mut budget =
+                    plan_graph::run_reactive_until(&mut graph, &execute, deadline).await;
 
                 // One plan-level review pass over the settled work: the review role
                 // reads the digest (and, through its tools, the written files) and
@@ -631,7 +664,9 @@ impl Daemon {
                         }
                         AgentEvent::DirListing { path, entries }
                     }
-                    Err(e) => AgentEvent::Error { message: e.to_string() },
+                    Err(e) => AgentEvent::Error {
+                        message: e.to_string(),
+                    },
                 };
                 let _ = events.send(ev).await;
             }
@@ -650,9 +685,15 @@ impl Daemon {
                         } else {
                             full
                         };
-                        AgentEvent::FileContent { path, content, truncated }
+                        AgentEvent::FileContent {
+                            path,
+                            content,
+                            truncated,
+                        }
                     }
-                    Err(e) => AgentEvent::Error { message: format!("read {path}: {e}") },
+                    Err(e) => AgentEvent::Error {
+                        message: format!("read {path}: {e}"),
+                    },
                 };
                 let _ = events.send(ev).await;
             }
@@ -674,7 +715,10 @@ impl Daemon {
                             },
                         }
                     }
-                    None => AgentEvent::Neighbors { node_id, nodes: Vec::new() },
+                    None => AgentEvent::Neighbors {
+                        node_id,
+                        nodes: Vec::new(),
+                    },
                 };
                 let _ = events.send(ev).await;
             }
@@ -690,15 +734,22 @@ impl Daemon {
                                     .map(|(id, title)| corrode_core::DocEntry { id, title })
                                     .collect(),
                             },
-                            Ok(Err(e)) => AgentEvent::Error { message: format!("list docs: {e}") },
-                            Err(e) => AgentEvent::Error { message: format!("list docs: {e}") },
+                            Ok(Err(e)) => AgentEvent::Error {
+                                message: format!("list docs: {e}"),
+                            },
+                            Err(e) => AgentEvent::Error {
+                                message: format!("list docs: {e}"),
+                            },
                         }
                     }
                     None => AgentEvent::DocList { docs: Vec::new() },
                 };
                 let _ = events.send(ev).await;
             }
-            AgentCommand::TerminalInput { session: term, data } => {
+            AgentCommand::TerminalInput {
+                session: term,
+                data,
+            } => {
                 // Write keystrokes to the (per-tenant) pty; its output streams back as
                 // TerminalOutput from the session's reader thread. `term` is the
                 // client-chosen id, unique per browser tab.
@@ -847,7 +898,8 @@ impl Daemon {
             // change — the churn the sparse key exists to prevent. `stored` is empty for
             // a file the graph has not seen, which is exactly a first ingest.
             let stored = store.file_nodes(path).unwrap_or_default();
-            let Ok((fw, update)) = crate::projection::ingest::file_against(lang.as_ref(), path, &src, &stored)
+            let Ok((fw, update)) =
+                crate::projection::ingest::file_against(lang.as_ref(), path, &src, &stored)
             else {
                 continue; // unparseable mid-edit: leave the previous nodes in place
             };
@@ -856,7 +908,11 @@ impl Daemon {
                     "code ingest {path}: {} changed, {} cosmetic{}",
                     update.changed.len(),
                     update.cosmetic,
-                    if update.rebalanced { ", rebalanced" } else { "" }
+                    if update.rebalanced {
+                        ", rebalanced"
+                    } else {
+                        ""
+                    }
                 );
             }
             if let Err(e) = store.replace_file(&fw) {
@@ -931,14 +987,21 @@ impl Daemon {
         // LMDB read txn + HNSW search are sync — off the tokio worker.
         let store = Arc::clone(g);
         let q = question.to_string();
-        let searched = tokio::task::spawn_blocking(move || {
-            store.doc_search(&q, query_vec.as_deref(), 8)
-        })
-        .await;
+        let searched =
+            tokio::task::spawn_blocking(move || store.doc_search(&q, query_vec.as_deref(), 8))
+                .await;
         let hits = match searched {
             Ok(Ok(hits)) => hits,
-            Ok(Err(e)) => return AgentEvent::Error { message: format!("doc search: {e}") },
-            Err(e) => return AgentEvent::Error { message: format!("doc search task: {e}") },
+            Ok(Err(e)) => {
+                return AgentEvent::Error {
+                    message: format!("doc search: {e}"),
+                }
+            }
+            Err(e) => {
+                return AgentEvent::Error {
+                    message: format!("doc search task: {e}"),
+                }
+            }
         };
         let grounded_on: Vec<String> = hits.iter().map(|(id, _)| id.clone()).collect();
         let raw = || {
@@ -961,7 +1024,12 @@ impl Daemon {
                 match self
                     .swarm
                     .client()
-                    .respond(model, &prompt, Priority::Default, session.owner_token.as_deref())
+                    .respond(
+                        model,
+                        &prompt,
+                        Priority::Default,
+                        session.owner_token.as_deref(),
+                    )
                     .await
                 {
                     Ok(answer) if !answer.trim().is_empty() => answer,
@@ -986,7 +1054,11 @@ impl Daemon {
     async fn ingest_doc(&self, session: &Session, path: String) -> AgentEvent {
         let canonical = match self.confine_doc_path(session, &path) {
             Ok(p) => p,
-            Err(e) => return AgentEvent::Error { message: format!("doc ingest: {e}") },
+            Err(e) => {
+                return AgentEvent::Error {
+                    message: format!("doc ingest: {e}"),
+                }
+            }
         };
         let converted = tokio::task::spawn_blocking(move || {
             crate::ingest::ingest(&canonical).map(|d| (canonical, d))
@@ -994,8 +1066,16 @@ impl Daemon {
         .await;
         let (path, doc) = match converted {
             Ok(Ok(ok)) => ok,
-            Ok(Err(e)) => return AgentEvent::Error { message: format!("doc ingest: {e}") },
-            Err(e) => return AgentEvent::Error { message: format!("doc ingest task: {e}") },
+            Ok(Err(e)) => {
+                return AgentEvent::Error {
+                    message: format!("doc ingest: {e}"),
+                }
+            }
+            Err(e) => {
+                return AgentEvent::Error {
+                    message: format!("doc ingest task: {e}"),
+                }
+            }
         };
         let persisted = self.persist_doc(session, &doc).await;
         AgentEvent::DocIngested {
@@ -1015,8 +1095,8 @@ impl Daemon {
             .ok()
             .map(|v| v.split(':').map(PathBuf::from).collect())
             .unwrap_or_else(|| vec![session.repo_root.clone()]);
-        let canonical = std::fs::canonicalize(path)
-            .map_err(|e| anyhow::anyhow!("resolve {path}: {e}"))?;
+        let canonical =
+            std::fs::canonicalize(path).map_err(|e| anyhow::anyhow!("resolve {path}: {e}"))?;
         let allowed = roots.iter().any(|r| {
             std::fs::canonicalize(r)
                 .map(|cr| canonical.starts_with(cr))
@@ -1232,10 +1312,7 @@ impl Daemon {
                 }
             }
             if children.len() > TREE_BREADTH {
-                out.push_str(&format!(
-                    "    ... {} more\n",
-                    children.len() - TREE_BREADTH
-                ));
+                out.push_str(&format!("    ... {} more\n", children.len() - TREE_BREADTH));
             }
         }
         out
@@ -1252,6 +1329,16 @@ fn max_tool_steps() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .map(|n| n.max(1))
         .unwrap_or(16)
+}
+
+/// Tool calls left when a task is told its budget is running out.
+const STEPS_LEFT_WARNING: usize = 3;
+
+fn steps_left_note(left: usize) -> String {
+    format!(
+        "[You have {left} tool calls left. If your task is to write or change a file, \
+         do it now with what you have gathered; then give your final answer.]"
+    )
 }
 
 /// Appended when a task spends its step budget: one more generation that asks for no more calls, so
@@ -1362,11 +1449,14 @@ impl SeenCalls {
         fn canon(v: &serde_json::Value) -> serde_json::Value {
             match v {
                 serde_json::Value::Object(m) => {
-                    let mut entries: Vec<_> = m.iter().map(|(k, v)| (k.clone(), canon(v))).collect();
+                    let mut entries: Vec<_> =
+                        m.iter().map(|(k, v)| (k.clone(), canon(v))).collect();
                     entries.sort_by(|a, b| a.0.cmp(&b.0));
                     serde_json::Value::Object(entries.into_iter().collect())
                 }
-                serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(canon).collect()),
+                serde_json::Value::Array(a) => {
+                    serde_json::Value::Array(a.iter().map(canon).collect())
+                }
                 scalar => scalar.clone(),
             }
         }
@@ -1397,8 +1487,11 @@ impl SeenCalls {
         }
         let first = observation.lines().next().unwrap_or("");
         let end = crate::tools::floor_char_boundary(first, LOG_LINE_CAP);
-        self.log
-            .push(format!("{} -> {}", crate::tools::describe(call), &first[..end]));
+        self.log.push(format!(
+            "{} -> {}",
+            crate::tools::describe(call),
+            &first[..end]
+        ));
         self.seen.insert(Self::key(call), observation.to_string());
     }
 
@@ -1574,7 +1667,8 @@ async fn run_native_tool_loop(
     // no notes at all — silently, since nothing reports notes it never tried to make.
     let mut steps: Vec<crate::trace::Step> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
-    for step in 0..max_tool_steps() {
+    let max_steps = max_tool_steps();
+    for step in 0..max_steps {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
         // tool call that is half-applied is worse than a turn that runs long, and
         // there is no way to un-run one. Reported, not silent: a truncated answer
@@ -1640,20 +1734,32 @@ async fn run_native_tool_loop(
                 touched.push(p.to_string());
             }
         }
-        let observation =
-            gate_and_execute(call, &toolbox, approvals, events, id, written, seen, read_only)
-                .await;
+        let observation = gate_and_execute(
+            call, &toolbox, approvals, events, id, written, seen, read_only,
+        )
+        .await;
         steps.push(crate::trace::Step {
             said: text.clone(),
             intent: Some(crate::tools::describe(call)),
             tool: Some(call.name.clone()),
             observation: Some(observation.clone()),
         });
+        // Warn while there is still room to act on it: a CAE writer spent its whole
+        // budget re-reading files and ended on "Let me write the document" with no
+        // call left to write it. Rides the newest tool result (not a new turn), so
+        // the prompt still extends the last step's checkpoint.
+        let left = max_steps - step - 1;
+        let observation = if left == STEPS_LEFT_WARNING {
+            format!("{observation}\n\n{}", steps_left_note(left))
+        } else {
+            observation
+        };
         // Only the call that ran is replayed, so every call in the history has its
         // result — a model shown a call with no output would wait on it or redo it.
         let call_id = format!("call_{id}_{step}");
         if !text.trim().is_empty() {
-            turns.push(serde_json::json!({"type": "message", "role": "assistant", "content": text}));
+            turns
+                .push(serde_json::json!({"type": "message", "role": "assistant", "content": text}));
         }
         turns.push(serde_json::json!({
             "type": "function_call",
@@ -1682,10 +1788,27 @@ async fn run_native_tool_loop(
         }
     }
     let (text, _reasoning, _calls) = client
-        .respond_turns(model, &prompt, &turns, band, toolbox.owner_token(), Some(&tools), Some(&effort))
+        .respond_turns(
+            model,
+            &prompt,
+            &turns,
+            band,
+            toolbox.owner_token(),
+            Some(&tools),
+            Some(&effort),
+        )
         .await?;
-    let _ = events.send(AgentEvent::SubagentOutput { id, text: text.clone() }).await;
-    Ok(NativeOutcome::Answered(if text.trim().is_empty() { last } else { text }))
+    let _ = events
+        .send(AgentEvent::SubagentOutput {
+            id,
+            text: text.clone(),
+        })
+        .await;
+    Ok(NativeOutcome::Answered(if text.trim().is_empty() {
+        last
+    } else {
+        text
+    }))
 }
 
 /// The Needle-mediated tool-execution loop for a small model.
@@ -1746,7 +1869,9 @@ async fn run_tool_loop(
             return Ok(format!("{last}\n[stopped: turn budget reached]"));
         }
         let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
-        let text = client.respond(model, &prompt, band, toolbox.owner_token()).await?;
+        let text = client
+            .respond(model, &prompt, band, toolbox.owner_token())
+            .await?;
         let _ = events
             .send(AgentEvent::SubagentOutput {
                 id,
@@ -1783,10 +1908,8 @@ async fn run_tool_loop(
                             touched.push(p.to_string());
                         }
                     }
-                    gate_and_execute(
-                        c, &toolbox, approvals, events, id, written, seen, read_only,
-                    )
-                    .await
+                    gate_and_execute(c, &toolbox, approvals, events, id, written, seen, read_only)
+                        .await
                 }
                 None => "error: no tool call produced".to_string(),
             },
@@ -1805,8 +1928,15 @@ async fn run_tool_loop(
     record_trace(&toolbox, id, task, &steps, &touched);
     scratchpad.push_str(&format!("\n{FINAL_ANSWER_NUDGE}\n"));
     let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
-    let text = client.respond(model, &prompt, band, toolbox.owner_token()).await?;
-    let _ = events.send(AgentEvent::SubagentOutput { id, text: text.clone() }).await;
+    let text = client
+        .respond(model, &prompt, band, toolbox.owner_token())
+        .await?;
+    let _ = events
+        .send(AgentEvent::SubagentOutput {
+            id,
+            text: text.clone(),
+        })
+        .await;
     Ok(if text.trim().is_empty() { last } else { text })
 }
 
@@ -1837,7 +1967,10 @@ fn record_trace(
     if notes.is_empty() {
         return;
     }
-    let observed = notes.iter().filter(|n| n.kind == NoteKind::Observed).count();
+    let observed = notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Observed)
+        .count();
     eprintln!(
         "trace: {} note(s) from {} step(s) — {observed} observed, {} asserted, {} path(s)",
         notes.len(),
@@ -1888,7 +2021,10 @@ fn record_trace(
             }
         }
     }
-    eprintln!("trace: persisted {wrote}/{} note(s), {edges} edge(s)", notes.len());
+    eprintln!(
+        "trace: persisted {wrote}/{} note(s), {edges} edge(s)",
+        notes.len()
+    );
 
     // Supersede prior notes on the same files. The claim is ordering — this note was
     // written with more of the trace behind it — not correctness.
@@ -1946,8 +2082,21 @@ async fn run_task(
     let role_dialect = dialects.resolve(model);
     if role_dialect.emits_own_calls() {
         let outcome = run_native_tool_loop(
-            client, model, band, role_dialect, toolbox.clone(), approvals, prefix, role, task,
-            events, id, written, read_only, seen, deadline,
+            client,
+            model,
+            band,
+            role_dialect,
+            toolbox.clone(),
+            approvals,
+            prefix,
+            role,
+            task,
+            events,
+            id,
+            written,
+            read_only,
+            seen,
+            deadline,
         )
         .await?;
         let text = match outcome {
@@ -1982,15 +2131,15 @@ async fn run_task(
         };
         eprintln!("warning: retrying task {id} through the Needle tool loop");
         return run_tool_loop(
-            client, model, band, caller, toolbox, approvals, dialects, prefix, role, task,
-            events, id, written, read_only, seen, deadline,
+            client, model, band, caller, toolbox, approvals, dialects, prefix, role, task, events,
+            id, written, read_only, seen, deadline,
         )
         .await;
     }
     if let Some(caller) = tool_caller {
         run_tool_loop(
-            client, model, band, caller, toolbox, approvals, dialects, prefix, role, task,
-            events, id, written, read_only, seen, deadline,
+            client, model, band, caller, toolbox, approvals, dialects, prefix, role, task, events,
+            id, written, read_only, seen, deadline,
         )
         .await
     } else {
@@ -2009,7 +2158,9 @@ async fn run_task(
                 .await?;
             Ok(text)
         } else {
-            client.respond(model, &full, band, toolbox.owner_token()).await
+            client
+                .respond(model, &full, band, toolbox.owner_token())
+                .await
         };
         if let Ok(text) = &out {
             let _ = events
@@ -2057,20 +2208,37 @@ async fn run_fanout(
     let baseline_took = Arc::new(std::sync::Mutex::new(None::<std::time::Duration>));
     let attempts = (0..k).map(|i| {
         let attempt_task = planner::fanout_attempt_task(task, i + 1, k);
-        let attempt_band = if i == 0 { band } else { Priority::Opportunistic };
+        let attempt_band = if i == 0 {
+            band
+        } else {
+            Priority::Opportunistic
+        };
         let toolbox = toolbox.clone();
         let tool_caller = tool_caller.clone();
         let baseline = Arc::clone(&baseline);
         let baseline_took = Arc::clone(&baseline_took);
         async move {
             let mut sink = Vec::new(); // read-only: no artifacts can land
-            // Attempts get a PRIVATE map: their "read-only pass" notes must never
-            // suppress the turn map's real, writable execution of the same call.
+                                       // Attempts get a PRIVATE map: their "read-only pass" notes must never
+                                       // suppress the turn map's real, writable execution of the same call.
             let attempt_seen = std::sync::Mutex::new(SeenCalls::default());
             let started = std::time::Instant::now();
             let fut = run_task(
-                client, model, attempt_band, dialects, tool_caller, toolbox, approvals,
-                prefix, role, &attempt_task, events, id, &mut sink, true, &attempt_seen,
+                client,
+                model,
+                attempt_band,
+                dialects,
+                tool_caller,
+                toolbox,
+                approvals,
+                prefix,
+                role,
+                &attempt_task,
+                events,
+                id,
+                &mut sink,
+                true,
+                &attempt_seen,
                 deadline,
             );
             if i == 0 {
@@ -2086,7 +2254,9 @@ async fn run_fanout(
                 loop {
                     let notified = baseline.notified();
                     if let Some(took) = *baseline_took.lock().unwrap() {
-                        return took.saturating_mul(FANOUT_STRAGGLER_FACTOR).max(FANOUT_EXTRA_GRACE);
+                        return took
+                            .saturating_mul(FANOUT_STRAGGLER_FACTOR)
+                            .max(FANOUT_EXTRA_GRACE);
                     }
                     notified.await;
                 }
@@ -2156,8 +2326,22 @@ async fn run_fanout(
         );
     }
     run_task(
-        client, model, band, dialects, tool_caller, toolbox, approvals, prefix, role,
-        &steered, events, id, written, false, seen, deadline,
+        client,
+        model,
+        band,
+        dialects,
+        tool_caller,
+        toolbox,
+        approvals,
+        prefix,
+        role,
+        &steered,
+        events,
+        id,
+        written,
+        false,
+        seen,
+        deadline,
     )
     .await
 }
@@ -2191,8 +2375,7 @@ async fn emit_followups(
             let dialect = dialects.resolve(caller.model_id());
             let schema = dialect.render(plan_graph::ROLE_TOOLS, None);
             let query = instruction.clone();
-            let raw =
-                tokio::task::spawn_blocking(move || caller.generate(&query, &schema)).await;
+            let raw = tokio::task::spawn_blocking(move || caller.generate(&query, &schema)).await;
             match raw.map(|r| r.and_then(|raw| dialect.parse(&raw))) {
                 Ok(Ok(calls)) => plan_graph::role_from_tool_calls(&calls).unwrap_or(Role::Coder),
                 Ok(Err(e)) => {
@@ -2320,13 +2503,19 @@ mod tests {
     async fn sessions_are_keyed_by_user_and_repo_and_reused() {
         let d = test_daemon();
         assert!(!d.auth_on(), "no CORRODE_USERS -> auth off");
-        assert!(d.authenticate("anyone", "whatever"), "auth off accepts any token");
+        assert!(
+            d.authenticate("anyone", "whatever"),
+            "auth off accepts any token"
+        );
 
         let a1 = d.bind_session(Some("alice".into()), "").await.unwrap();
         let a2 = d.bind_session(Some("alice".into()), "").await.unwrap();
         let bob = d.bind_session(Some("bob".into()), "").await.unwrap();
         assert!(Arc::ptr_eq(&a1, &a2), "same (user,repo) reuses one session");
-        assert!(!Arc::ptr_eq(&a1, &bob), "different users get different sessions");
+        assert!(
+            !Arc::ptr_eq(&a1, &bob),
+            "different users get different sessions"
+        );
         assert_eq!(a1.key.user, "alice");
         // The gate is per-session, so alice's and bob's are distinct instances.
         assert!(!Arc::ptr_eq(&a1.approvals, &bob.approvals));
@@ -2343,7 +2532,11 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(root.join("README.md"), "Widget is a lock-free queue library.").unwrap();
+        std::fs::write(
+            root.join("README.md"),
+            "Widget is a lock-free queue library.",
+        )
+        .unwrap();
         std::fs::write(root.join("src/atom.h"), "// atom").unwrap();
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
 
@@ -2457,10 +2650,7 @@ mod tests {
         let reply = "Rewrote is_prime in src/lib.rs to trial-divide up to sqrt(n).\n\
             NEXT: review the new is_prime implementation in src/lib.rs for correctness";
         let emits = emit_followups(Some(caller), &Dialects::default(), reply).await;
-        let summary: Vec<_> = emits
-            .iter()
-            .map(|e| (e.role, e.prompt.as_str()))
-            .collect();
+        let summary: Vec<_> = emits.iter().map(|e| (e.role, e.prompt.as_str())).collect();
         eprintln!("emitted: {summary:?}");
         assert_eq!(emits.len(), 1, "one NEXT: line -> one task");
         // Task text is verbatim from the NEXT: line (not Needle's truncated arg).
@@ -2483,19 +2673,27 @@ mod tests {
     #[ignore = "requires Needle assets (CORRODE_NEEDLE_ASSETS or the vendored default)"]
     async fn needle_builds_a_two_argument_write_file_call() {
         use crate::toolcall::needle::NeedleToolCaller;
-        let caller = NeedleToolCaller::load_from_env().expect("load Needle").expect("assets");
+        let caller = NeedleToolCaller::load_from_env()
+            .expect("load Needle")
+            .expect("assets");
         let dialects = Dialects::default();
         let dialect = dialects.resolve(caller.model_id());
         let schema = dialect.render(crate::tools::role_tools(Role::Coder), None);
         for (intent, tool, args) in [
-            ("write the file notes.txt with content hello", "write_file", &["path", "contents"][..]),
+            (
+                "write the file notes.txt with content hello",
+                "write_file",
+                &["path", "contents"][..],
+            ),
             ("read the file src/lib.rs", "read_file", &["path"][..]),
         ] {
             let raw = caller.generate(intent, &schema).expect("generate");
             let calls = dialect
                 .parse(&raw)
                 .unwrap_or_else(|e| panic!("{intent}: {e}\n  raw: {raw}"));
-            let call = calls.first().unwrap_or_else(|| panic!("{intent}: no call from {raw}"));
+            let call = calls
+                .first()
+                .unwrap_or_else(|| panic!("{intent}: no call from {raw}"));
             assert_eq!(call.name, tool, "wrong tool for {intent:?}");
             for key in args {
                 assert!(
@@ -2696,8 +2894,14 @@ mod tests {
         assert!(suppressed.ends_with("contents of src/lib.rs:\nfn f() {}"));
 
         // Key order is not identity: semantically identical args collide.
-        let a = call("write_file", serde_json::json!({"path": "a.rs", "contents": "x"}));
-        let b = call("write_file", serde_json::json!({"contents": "x", "path": "a.rs"}));
+        let a = call(
+            "write_file",
+            serde_json::json!({"path": "a.rs", "contents": "x"}),
+        );
+        let b = call(
+            "write_file",
+            serde_json::json!({"contents": "x", "path": "a.rs"}),
+        );
         seen.record(&a, "denied: write_file a.rs was not approved");
         assert!(seen.repeat(&b).is_some(), "reordered args must collide");
 
@@ -2705,11 +2909,17 @@ mod tests {
         let bad = call("run_command", serde_json::json!({"command": "carg test"}));
         seen.record(&bad, "exit 127:\ncarg: command not found");
         assert!(seen.repeat(&bad).is_some());
-        assert!(seen.repeat(&read).is_some(), "reads survive a failed command");
+        assert!(
+            seen.repeat(&read).is_some(),
+            "reads survive a failed command"
+        );
 
         // A successful mutating call clears everything: the re-read runs for real.
         seen.record(&a, "wrote 1 bytes to a.rs");
-        assert!(seen.repeat(&read).is_none(), "read after write must not be suppressed");
+        assert!(
+            seen.repeat(&read).is_none(),
+            "read after write must not be suppressed"
+        );
         assert!(seen.repeat(&bad).is_none());
         assert!(seen.repeat(&a).is_some(), "the write itself stays recorded");
     }
@@ -2740,7 +2950,16 @@ mod tests {
         // request, this would block on a oneshot nobody resolves — fail, don't hang.
         let obs = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            gate_and_execute(&write, &toolbox, &approvals, &tx, 0, &mut written, &seen, true),
+            gate_and_execute(
+                &write,
+                &toolbox,
+                &approvals,
+                &tx,
+                0,
+                &mut written,
+                &seen,
+                true,
+            ),
         )
         .await
         .expect("read-only gate must not block on approval");
@@ -2748,9 +2967,14 @@ mod tests {
         assert!(written.is_empty(), "no artifact from a blocked write");
         // The only event is the ToolResult trace — never an ApprovalRequest.
         match rx.try_recv().expect("a ToolResult event") {
-            AgentEvent::ToolResult { call, observation, .. } => {
+            AgentEvent::ToolResult {
+                call, observation, ..
+            } => {
                 assert!(call.starts_with("write_file"), "got: {call}");
-                assert!(observation.starts_with("read-only pass:"), "got: {observation}");
+                assert!(
+                    observation.starts_with("read-only pass:"),
+                    "got: {observation}"
+                );
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
@@ -2761,9 +2985,17 @@ mod tests {
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "lib.rs"}),
         };
-        let obs =
-            gate_and_execute(&read, &toolbox, &approvals, &tx, 0, &mut written, &seen, true)
-                .await;
+        let obs = gate_and_execute(
+            &read,
+            &toolbox,
+            &approvals,
+            &tx,
+            0,
+            &mut written,
+            &seen,
+            true,
+        )
+        .await;
         assert!(obs.contains("fn f() {}"), "got: {obs}");
         assert!(
             matches!(rx.try_recv(), Ok(AgentEvent::ToolResult { .. })),
@@ -2820,29 +3052,72 @@ mod tests {
         };
 
         // "Task A" reads; "task B" (same shared map) asks again and gets the cache.
-        let a = gate_and_execute(&read, &toolbox, &approvals, &tx, 0, &mut written, &seen, false)
-            .await;
+        let a = gate_and_execute(
+            &read,
+            &toolbox,
+            &approvals,
+            &tx,
+            0,
+            &mut written,
+            &seen,
+            false,
+        )
+        .await;
         assert!(a.contains("fn f() {}"));
-        let b = gate_and_execute(&read, &toolbox, &approvals, &tx, 1, &mut written, &seen, false)
-            .await;
-        assert!(b.starts_with("note: this exact call was already made this turn"), "got: {b}");
-        assert!(b.contains("fn f() {}"), "the sibling still gets the knowledge");
+        let b = gate_and_execute(
+            &read,
+            &toolbox,
+            &approvals,
+            &tx,
+            1,
+            &mut written,
+            &seen,
+            false,
+        )
+        .await;
+        assert!(
+            b.starts_with("note: this exact call was already made this turn"),
+            "got: {b}"
+        );
+        assert!(
+            b.contains("fn f() {}"),
+            "the sibling still gets the knowledge"
+        );
 
         // The digest advertises the activity, once, for a launching task's tail.
-        let digest = seen.lock().unwrap().digest(TURN_DIGEST_LINES).expect("activity");
+        let digest = seen
+            .lock()
+            .unwrap()
+            .digest(TURN_DIGEST_LINES)
+            .expect("activity");
         assert!(digest.contains("read_file lib.rs ->"), "got: {digest}");
-        assert_eq!(digest.matches("read_file lib.rs").count(), 1, "cache hits are not re-logged");
+        assert_eq!(
+            digest.matches("read_file lib.rs").count(),
+            1,
+            "cache hits are not re-logged"
+        );
 
         // A successful mutating call invalidates cache AND digest.
         let write = crate::toolcall::ToolCall {
             name: "write_file".into(),
             arguments: serde_json::json!({"path": "lib.rs", "contents": "fn g() {}"}),
         };
-        seen.lock().unwrap().record(&write, "wrote 9 bytes to lib.rs");
-        assert!(seen.lock().unwrap().repeat(&read).is_none(), "read re-executes after a write");
+        seen.lock()
+            .unwrap()
+            .record(&write, "wrote 9 bytes to lib.rs");
+        assert!(
+            seen.lock().unwrap().repeat(&read).is_none(),
+            "read re-executes after a write"
+        );
         let digest = seen.lock().unwrap().digest(TURN_DIGEST_LINES).unwrap();
-        assert!(!digest.contains("read_file"), "stale reads are not advertised: {digest}");
-        assert!(digest.contains("write_file lib.rs ->"), "the write itself is: {digest}");
+        assert!(
+            !digest.contains("read_file"),
+            "stale reads are not advertised: {digest}"
+        );
+        assert!(
+            digest.contains("write_file lib.rs ->"),
+            "the write itself is: {digest}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2883,7 +3158,10 @@ mod tests {
             .expect("Needle assets present");
         let dialect = ToolDialect::default();
         let raw = caller
-            .generate("read the file src/lib.rs", &dialect.render(EXEC_TOOLS, None))
+            .generate(
+                "read the file src/lib.rs",
+                &dialect.render(EXEC_TOOLS, None),
+            )
             .expect("generation");
         let calls = dialect.parse(&raw).expect("parse");
         eprintln!("calls: {calls:?}");
@@ -2892,7 +3170,10 @@ mod tests {
 
         // mathkit's source, straight out of the fixture repo.
         let observation = toolbox.execute(call).await;
-        assert!(observation.contains("pub fn is_prime"), "got: {observation}");
+        assert!(
+            observation.contains("pub fn is_prime"),
+            "got: {observation}"
+        );
     }
 
     // Stage 3 end-to-end against the fixture repo: discovery finds its bundled
@@ -2910,7 +3191,9 @@ mod tests {
             return;
         };
         let client = Client::new("http://127.0.0.1:1", None);
-        let skills = SkillContext::build(&repo, &client, None, &GlobalSkills::default()).await.script_dirs();
+        let skills = SkillContext::build(&repo, &client, None, &GlobalSkills::default())
+            .await
+            .script_dirs();
         assert!(skills.contains_key("run-tests"), "got: {skills:?}");
         let toolbox = ToolBox::new(
             Arc::new(PassthroughVfs::new(&repo)),
@@ -2937,7 +3220,10 @@ mod tests {
         assert!(crate::tools::is_mutating(call));
         let observation = toolbox.execute(call).await;
         assert!(observation.starts_with("exit 0:"), "got: {observation}");
-        assert!(observation.contains("test result: ok"), "got: {observation}");
+        assert!(
+            observation.contains("test result: ok"),
+            "got: {observation}"
+        );
     }
 
     // The whole loop, for real: a Prompt goes into the daemon, hipfire plans it, the
@@ -2983,7 +3269,8 @@ mod tests {
             Arc::new(crate::graph::embedded::HelixStore::open(dir.to_str().unwrap()).unwrap());
 
         let embed = crate::roles::default_embedding_model(&models).map(str::to_string);
-        let skills = SkillContext::build(&repo, &client, embed.clone(), &GlobalSkills::default()).await;
+        let skills =
+            SkillContext::build(&repo, &client, embed.clone(), &GlobalSkills::default()).await;
         let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
             .expect("load Needle")
             .expect("Needle assets present");
@@ -3012,7 +3299,9 @@ mod tests {
         .unwrap();
         while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(180), erx.recv()).await {
             if let AgentEvent::ApprovalRequest { id, .. } = ev {
-                let _ = ctx.send(AgentCommand::ApprovalResponse { id, approved: true }).await;
+                let _ = ctx
+                    .send(AgentCommand::ApprovalResponse { id, approved: true })
+                    .await;
             } else if let AgentEvent::TurnComplete { plan_id } = ev {
                 turn_plan = Some(plan_id);
                 break;
@@ -3037,7 +3326,10 @@ mod tests {
             .filter(|n| n.kind == "task" || n.kind == "contract")
             .map(|n| n.id)
             .collect();
-        assert!(!tasks.is_empty(), "no task node is reachable from plan {plan_id}");
+        assert!(
+            !tasks.is_empty(),
+            "no task node is reachable from plan {plan_id}"
+        );
         for t in &tasks {
             for n in store.neighbors(t).unwrap_or_default() {
                 if n.kind == "observed" || n.kind == "asserted" {
@@ -3046,13 +3338,28 @@ mod tests {
             }
         }
         let notes: Vec<(String, String)> = notes.into_values().collect();
-        eprintln!("\nnotes reachable from plan {plan_id} via {} task(s): {}", tasks.len(), notes.len());
+        eprintln!(
+            "\nnotes reachable from plan {plan_id} via {} task(s): {}",
+            tasks.len(),
+            notes.len()
+        );
         // A note that is written but unreachable is the failure this asserts against:
         // `record_trace` counting a successful write says nothing about whether the edge
         // naming it points at a node that exists.
-        assert!(!notes.is_empty(), "notes were written but none is reachable from the plan");
+        assert!(
+            !notes.is_empty(),
+            "notes were written but none is reachable from the plan"
+        );
         for (k, t) in notes.iter().take(6) {
-            eprintln!("  [{k}] {}", t.lines().next().unwrap_or("").chars().take(120).collect::<String>());
+            eprintln!(
+                "  [{k}] {}",
+                t.lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3083,7 +3390,8 @@ mod tests {
         // `is_small_model` gate went, and re-adding it would be unused in the base
         // build (this call site is feature-gated).
         let embed = crate::roles::default_embedding_model(&models).map(str::to_string);
-        let skills = SkillContext::build(&repo, &client, embed.clone(), &GlobalSkills::default()).await;
+        let skills =
+            SkillContext::build(&repo, &client, embed.clone(), &GlobalSkills::default()).await;
         let caller = crate::toolcall::needle::NeedleToolCaller::load_from_env()
             .expect("load Needle")
             .expect("Needle assets present");
@@ -3128,7 +3436,11 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                AgentEvent::ToolResult { id, call, observation } => {
+                AgentEvent::ToolResult {
+                    id,
+                    call,
+                    observation,
+                } => {
                     eprintln!("--- tool [{id}] {call} -> {observation}");
                     tool_results.push((call, observation));
                 }
@@ -3198,7 +3510,10 @@ mod tests {
         // hipfire flag left the qwen35 template unrendered, so no tools block reached the
         // model and `executed_mutating` was always 0. The assertion passed by vacuity.
         let auto_approve = matches!(
-            std::env::var("CORRODE_AUTO_APPROVE").unwrap_or_default().to_ascii_lowercase().as_str(),
+            std::env::var("CORRODE_AUTO_APPROVE")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
             "1" | "true" | "on"
         );
         assert!(
@@ -3239,14 +3554,15 @@ mod tests {
 
         // Corrode's canonical tools, rendered for a chat model. The `type`/`function`
         // envelope is what the chat templates serialize with `tool | tojson`.
-        let rendered: serde_json::Value =
-            serde_json::from_str(&ToolDialect::new(
+        let rendered: serde_json::Value = serde_json::from_str(
+            &ToolDialect::new(
                 SchemaFormat::OpenAiNested,
                 ParseFormat::MiniCpmXml,
                 std::collections::HashMap::new(),
             )
-            .render(EXEC_TOOLS, None))
-            .expect("rendered tools are JSON");
+            .render(EXEC_TOOLS, None),
+        )
+        .expect("rendered tools are JSON");
         let tools = serde_json::Value::Array(
             rendered
                 .as_array()
@@ -3287,7 +3603,10 @@ mod tests {
             Arc::new(std::collections::HashMap::new()),
         );
         let observation = toolbox.execute(call).await;
-        assert!(observation.contains("pub fn is_prime"), "got: {observation}");
+        assert!(
+            observation.contains("pub fn is_prime"),
+            "got: {observation}"
+        );
     }
 
     // The hipfire-free dispatch path: DocQuery without a graph store reports itself

@@ -31,8 +31,10 @@ const LABEL_CAP: usize = 200;
 /// ponytail: fixed cap — make it budget-aware with per-request cost when tracked.
 const MAX_PLAN_TASKS: usize = 24;
 
-/// Bytes of each dependency's output handed to a dependent task.
-const DEP_OUTPUT_CAP: usize = 6144;
+/// Bytes of dependency output handed to a dependent task, split evenly across its
+/// deps. 6 KB per dep cut two CAE research summaries (~10-15 KB each) in half, and
+/// the writer re-read every crate it was missing instead of writing.
+const DEP_OUTPUT_BUDGET: usize = 24 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -193,22 +195,30 @@ impl PlanGraph {
     }
 
     /// `task` with the outputs of the tasks it waits on appended to its prompt — a
-    /// dependency is only useful if its result reaches the dependent. Each is capped at
-    /// [`DEP_OUTPUT_CAP`] bytes so a chain of long answers can't grow a tail unboundedly.
+    /// dependency is only useful if its result reaches the dependent. They share
+    /// [`DEP_OUTPUT_BUDGET`] bytes, so a chain of long answers can't grow a tail
+    /// unboundedly.
     fn with_dep_outputs(&self, mut task: PlanTask) -> PlanTask {
+        let per_dep = DEP_OUTPUT_BUDGET / task.deps.len().max(1);
         let outs: Vec<String> = task
             .deps
             .iter()
             .filter_map(|d| {
                 let n = self.nodes.iter().find(|n| n.task.id == *d)?;
                 let out = n.output.as_deref().filter(|o| !o.trim().is_empty())?;
-                let end = crate::tools::floor_char_boundary(out, DEP_OUTPUT_CAP);
-                Some(format!("task {} [{}] result:\n{}", d, n.task.role.as_str(), &out[..end]))
+                let end = crate::tools::floor_char_boundary(out, per_dep);
+                Some(format!(
+                    "task {} [{}] result:\n{}",
+                    d,
+                    n.task.role.as_str(),
+                    &out[..end]
+                ))
             })
             .collect();
         if !outs.is_empty() {
             task.prompt = format!(
-                "{}\n\nResults of the tasks this one waited on:\n\n{}",
+                "{}\n\nResults of the tasks this one waited on (already gathered from the repo — \
+                 work from them; read a file only to fill a gap they leave):\n\n{}",
                 task.prompt,
                 outs.join("\n\n")
             );
@@ -289,7 +299,11 @@ impl PlanGraph {
             });
             edges.push(ProvEdge::new(&task_ref, "part_of", &plan));
             if let Some(emitter) = n.emitted_by {
-                edges.push(ProvEdge::new(&task_ref, "emitted_from", &self.node_ref(emitter)));
+                edges.push(ProvEdge::new(
+                    &task_ref,
+                    "emitted_from",
+                    &self.node_ref(emitter),
+                ));
             }
             for path in &n.artifacts {
                 let code_ref = format!("{plan}:code:{path}");
@@ -305,7 +319,10 @@ impl PlanGraph {
     }
 
     fn status(&self, id: TaskId) -> Option<&Status> {
-        self.nodes.iter().find(|n| n.task.id == id).map(|n| &n.status)
+        self.nodes
+            .iter()
+            .find(|n| n.task.id == id)
+            .map(|n| &n.status)
     }
 
     fn set_status(&mut self, id: TaskId, status: Status) {
@@ -411,7 +428,10 @@ where
                 continue;
             }
             if graph.nodes.len() >= MAX_PLAN_TASKS {
-                eprintln!("plan {}: task budget ({MAX_PLAN_TASKS}) reached, dropping emission", graph.plan_id);
+                eprintln!(
+                    "plan {}: task budget ({MAX_PLAN_TASKS}) reached, dropping emission",
+                    graph.plan_id
+                );
                 break;
             }
             let deps = if emit.after_emitter { vec![id] } else { vec![] };
@@ -521,7 +541,8 @@ mod tests {
 
     #[test]
     fn parse_next_instruction_reads_the_next_line() {
-        let out = "I implemented add() in math.rs.\nNEXT: write unit tests for add() covering overflow\n";
+        let out =
+            "I implemented add() in math.rs.\nNEXT: write unit tests for add() covering overflow\n";
         assert_eq!(
             parse_next_instruction(out).as_deref(),
             Some("write unit tests for add() covering overflow")
@@ -541,12 +562,18 @@ mod tests {
             role_from_tool_calls(&[call("research_task")]),
             Some(Role::Research)
         );
-        assert_eq!(role_from_tool_calls(&[call("coding_task")]), Some(Role::Coder));
+        assert_eq!(
+            role_from_tool_calls(&[call("coding_task")]),
+            Some(Role::Coder)
+        );
         assert_eq!(
             role_from_tool_calls(&[call("architecture_task")]),
             Some(Role::Architect)
         );
-        assert_eq!(role_from_tool_calls(&[call("review_task")]), Some(Role::Review));
+        assert_eq!(
+            role_from_tool_calls(&[call("review_task")]),
+            Some(Role::Review)
+        );
         // one call per turn: only the first is consulted
         assert_eq!(
             role_from_tool_calls(&[call("review_task"), call("coding_task")]),
@@ -572,15 +599,28 @@ mod tests {
             async move {
                 rec.lock().unwrap().push(task.prompt.clone());
                 let out = format!("found {}", task.prompt.trim_start_matches("read "));
-                Outcome { output: Ok(out), emitted: vec![], artifacts: vec![] }
+                Outcome {
+                    output: Ok(out),
+                    emitted: vec![],
+                    artifacts: vec![],
+                }
             }
         })
         .await;
         let seen = seen.lock().unwrap();
-        let writer = seen.iter().find(|p| p.starts_with("write the map")).unwrap();
-        assert!(writer.contains("found crate a") && writer.contains("found crate b"), "{writer}");
+        let writer = seen
+            .iter()
+            .find(|p| p.starts_with("write the map"))
+            .unwrap();
+        assert!(
+            writer.contains("found crate a") && writer.contains("found crate b"),
+            "{writer}"
+        );
         let research = seen.iter().find(|p| p.starts_with("read crate a")).unwrap();
-        assert!(!research.contains("Results of"), "a task with no deps gets no results block");
+        assert!(
+            !research.contains("Results of"),
+            "a task with no deps gets no results block"
+        );
     }
 
     // A coder task emits a test contract mid-run; a review task depends on the coder.
@@ -618,9 +658,15 @@ mod tests {
 
         let ord = order.lock().unwrap().clone();
         let pos = |needle: &str| ord.iter().position(|p| p.contains(needle));
-        assert!(pos("write add") < pos("review add"), "dep order: coder before review");
+        assert!(
+            pos("write add") < pos("review add"),
+            "dep order: coder before review"
+        );
         assert!(pos("test add").is_some(), "emitted test task ran");
-        assert!(pos("write add") < pos("test add"), "emitted test runs after its emitter");
+        assert!(
+            pos("write add") < pos("test add"),
+            "emitted test runs after its emitter"
+        );
         assert!(g.stuck().is_empty(), "everything scheduled");
     }
 
@@ -674,7 +720,10 @@ mod tests {
 
         let ord = order.lock().unwrap().clone();
         let pos = |needle: &str| ord.iter().position(|p| p.contains(needle));
-        assert!(pos("review the plan") < pos("fix the overflow"), "fix runs after review");
+        assert!(
+            pos("review the plan") < pos("fix the overflow"),
+            "fix runs after review"
+        );
         // coder + review + fix, exactly once each — the review drive must never
         // re-execute settled tasks (that would mean duplicate real writes).
         assert_eq!(ord.len(), 3, "settled tasks re-ran: {ord:?}");
@@ -682,8 +731,10 @@ mod tests {
 
         // The emitted fix is a contract of the review task in provenance.
         let prov = g.provenance();
-        assert!(prov.edges.iter().any(|e| e.rel == "emitted_from"
-            && e.to == format!("plan-9:task:{review}")));
+        assert!(prov
+            .edges
+            .iter()
+            .any(|e| e.rel == "emitted_from" && e.to == format!("plan-9:task:{review}")));
 
         // Nothing done -> nothing to review.
         assert!(PlanGraph::default().review_digest(4096).is_none());
@@ -713,7 +764,11 @@ mod tests {
             }
         })
         .await;
-        assert_eq!(*ran.lock().unwrap(), MAX_PLAN_TASKS, "settles exactly at the budget");
+        assert_eq!(
+            *ran.lock().unwrap(),
+            MAX_PLAN_TASKS,
+            "settles exactly at the budget"
+        );
         assert!(g.stuck().is_empty());
     }
 
@@ -740,7 +795,10 @@ mod tests {
         let digest = g.review_digest(10).expect("one done task");
         let out_line = digest.lines().find(|l| l.starts_with("output:")).unwrap();
         assert_eq!(out_line, "output: €€€", "capped on a char boundary");
-        assert!(digest.contains("task 1 [coder] FAILED: doomed"), "digest: {digest}");
+        assert!(
+            digest.contains("task 1 [coder] FAILED: doomed"),
+            "digest: {digest}"
+        );
     }
 
     // The provenance graph a plan produces: a coder task emits a contract and writes a
@@ -775,9 +833,8 @@ mod tests {
         .await;
 
         let prov = g.provenance();
-        let has_node = |id: &str, kind: NodeKind| {
-            prov.nodes.iter().any(|n| n.id == id && n.kind == kind)
-        };
+        let has_node =
+            |id: &str, kind: NodeKind| prov.nodes.iter().any(|n| n.id == id && n.kind == kind);
         let has_edge = |from: &str, rel: &str, to: &str| {
             prov.edges
                 .iter()
@@ -792,7 +849,11 @@ mod tests {
         assert!(has_edge("plan-7:task:0", "part_of", "plan-7"));
         assert!(has_edge("plan-7:task:1", "part_of", "plan-7"));
         assert!(has_edge("plan-7:task:1", "emitted_from", "plan-7:task:0"));
-        assert!(has_edge("plan-7:code:src/math.rs", "produced_by", "plan-7:task:0"));
+        assert!(has_edge(
+            "plan-7:code:src/math.rs",
+            "produced_by",
+            "plan-7:task:0"
+        ));
     }
     /// A deadline stops the graph GROWING without killing work already in flight: an
     /// agent that emits a follow-up every turn otherwise has no natural end.
@@ -803,7 +864,12 @@ mod tests {
 
         // Already past: the one ready task never launches.
         let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        let summary = run_reactive_until(&mut g, |_t: PlanTask| async move { unreachable!() }, Some(past)).await;
+        let summary = run_reactive_until(
+            &mut g,
+            |_t: PlanTask| async move { unreachable!() },
+            Some(past),
+        )
+        .await;
         assert!(summary.expired);
         assert_eq!(summary.unlaunched, 1, "the pending task was shed, not run");
 
@@ -853,7 +919,11 @@ mod tests {
                 } else {
                     vec![]
                 };
-                Outcome { output: Ok("ok".into()), emitted, artifacts: Vec::new() }
+                Outcome {
+                    output: Ok("ok".into()),
+                    emitted,
+                    artifacts: Vec::new(),
+                }
             },
             None,
         )
@@ -861,6 +931,4 @@ mod tests {
         assert_eq!(summary, RunSummary::default());
         assert_eq!(g.nodes.len(), 2, "the follow-up was folded in");
     }
-
-
 }
