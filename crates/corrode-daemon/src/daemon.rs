@@ -1337,6 +1337,27 @@ const NO_CALL_REMINDER: &str = "You replied without calling a tool. Changes to t
 through tool calls: to create or change a file, call write_file with its full contents -- do not paste \
 file contents as your reply. If the task truly needs no tool, repeat your final answer.";
 
+/// `CORRODE_CONTEXT_TOKENS`: the serving model's context (default 32768, the
+/// swarm models' hipfire max_seq). The tool loop stops gathering once the
+/// conversation leaves less than [`ANSWER_RESERVE_TOKENS`] of it.
+fn context_tokens() -> usize {
+    std::env::var("CORRODE_CONTEXT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32768)
+}
+
+/// Tokens kept free for the final answer.
+const ANSWER_RESERVE_TOKENS: usize = 4096;
+
+/// Whether `prompt` plus the replayed `turns` is too close to the context to take
+/// another tool step. Estimated, not tokenized: 3 bytes per token is conservative
+/// for code and markdown (Qwen's tokenizer averages ~3.5-4 on this repo).
+fn over_context_budget(prompt: &str, turns: &[serde_json::Value]) -> bool {
+    let bytes = prompt.len() + turns.iter().map(|t| t.to_string().len()).sum::<usize>();
+    bytes / 3 + ANSWER_RESERVE_TOKENS > context_tokens()
+}
+
 /// Tool calls one step may run. A step is one generation; the model may emit several
 /// independent calls in it (read several files at once).
 const MAX_CALLS_PER_STEP: usize = 8;
@@ -1699,6 +1720,13 @@ async fn run_native_tool_loop(
     let max_steps = max_tool_steps_for(role);
     let mut reminded = false;
     for step in 0..max_steps {
+        // Stop gathering while the answer still fits the model's context: several
+        // reads per step can outgrow it -- a CAE research conversation passed the
+        // 27B's 32K tokens, hipfire refused the prefill, and the request was shed
+        // with a 500. Past the budget the loop goes straight to the final answer.
+        if step > 0 && over_context_budget(&prompt, &turns) {
+            break;
+        }
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
         // tool call that is half-applied is worse than a turn that runs long, and
         // there is no way to un-run one. Reported, not silent: a truncated answer
@@ -1868,7 +1896,7 @@ async fn run_native_tool_loop(
     // front of the call ("Let me start by reading..."). Give it the one step it
     // asked for, then ask again. (hipfire has no tool_choice "none"; dropping the
     // tools would change the system turn and re-prefill the whole conversation.)
-    if !calls.is_empty() {
+    if !calls.is_empty() && !over_context_budget(&prompt, &turns) {
         let batch = &calls[..calls.len().min(MAX_CALLS_PER_STEP)];
         let mut observations = Vec::with_capacity(batch.len());
         for call in batch {
@@ -2519,6 +2547,17 @@ async fn emit_followups(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_budget_trips_before_the_model_context_is_full() {
+        // Default 32768-token context, 4096 reserved: ~85 KB of prompt + turns.
+        let prompt = "x".repeat(30_000);
+        let read = serde_json::json!({"type": "function_call_output", "call_id": "c", "output": "y".repeat(4096)});
+        let few: Vec<_> = std::iter::repeat(read.clone()).take(5).collect();
+        let many: Vec<_> = std::iter::repeat(read).take(40).collect();
+        assert!(!super::over_context_budget(&prompt, &few), "5 reads fit");
+        assert!(super::over_context_budget(&prompt, &many), "40 reads (~160 KB) do not");
+    }
+
     use super::*;
     use crate::hipfire::Client;
     use crate::project::GlobalSkills;
