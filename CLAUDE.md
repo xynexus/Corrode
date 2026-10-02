@@ -297,8 +297,10 @@ tasks): a sibling's identical call is served from cache, a mutating call is
 approval-gated once per turn, a successful mutation invalidates everything, and each
 launching task's tail carries a digest of the swarm's activity so far (the shared
 prefix stays byte-identical). Fan-out attempts keep private maps.
-Tools are **per-role subsets** (`tools::role_tools`), harness-enforced: the declared
-set is all the grammar/schema can produce, so an out-of-role call is unreachable.
+Tools are **per-role subsets** (`tools::role_tools`), harness-enforced: `gate_and_execute`
+refuses any call outside the task's role set before approval or execution. (The declared
+set alone is a hard limit only where hipfire builds a grammar for the model -- MiniCPM;
+the Qwen models can emit undeclared tools.)
 Research/architect observe (read-only — never block on approval); review adds
 `run_skill_script` but has no raw shell; only the coder gets the full set.
 Tools: `read_file`, `list_dir` (read-only) run straight through; `write_file`,
