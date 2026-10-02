@@ -366,12 +366,12 @@ impl ToolBox {
                 Some(query) => self.search_files(query, arg_str(call, "path")).await,
                 None => "error: search_files needs a `query` argument".to_string(),
             },
-            "write_file" => match (arg_str(call, "path"), arg_str(call, "contents")) {
-                (Some(path), Some(contents)) => self.write_file(path, contents).await,
+            "write_file" => match (arg_str(call, "path"), arg_text(call, "contents")) {
+                (Some(path), Some(contents)) => self.write_file(path, &contents).await,
                 _ => "error: write_file needs `path` and `contents` arguments".to_string(),
             },
-            "run_command" => match arg_str(call, "command") {
-                Some(command) => self.run_command(command).await,
+            "run_command" => match arg_text(call, "command") {
+                Some(command) => self.run_command(command.trim()).await,
                 None => "error: run_command needs a `command` argument".to_string(),
             },
             "run_skill_script" => match arg_str(call, "target") {
@@ -792,13 +792,27 @@ pub(crate) fn missing_required(call: &ToolCall) -> Vec<&'static str> {
     };
     tool.params
         .iter()
-        .filter(|p| p.required && call.arguments.get(p.name).and_then(|v| v.as_str()).is_none())
+        .filter(|p| p.required && call.arguments.get(p.name).is_none_or(|v| v.is_null()))
         .map(|p| p.name)
         .collect()
 }
 
 pub(crate) fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
     call.arguments.get(key)?.as_str().map(str::trim)
+}
+
+/// A free-text argument (`contents`, `command`) exactly as sent: never trimmed, and a
+/// non-string value taken back as its JSON text. Trimming stripped every written
+/// file's trailing newline and first-line indentation (`cargo fmt --check` then
+/// failed on everything the swarm wrote), and a server that JSON-coerces tool
+/// arguments hands over a file whose contents parse as JSON -- a `package.json`, a
+/// bare number -- as an object or number, which read as "missing contents".
+pub(crate) fn arg_text<'a>(call: &'a ToolCall, key: &str) -> Option<std::borrow::Cow<'a, str>> {
+    match call.arguments.get(key)? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(std::borrow::Cow::Borrowed(s)),
+        other => Some(std::borrow::Cow::Owned(other.to_string())),
+    }
 }
 
 /// Format a finished process's exit code + stdout/stderr into a bounded observation.
@@ -933,6 +947,45 @@ mod tests {
             .await;
         assert!(!out.starts_with("error:"), "empty contents is a truncation, not an error: {out}");
         assert_eq!(std::fs::read_to_string(dir.join("keep.txt")).unwrap(), "");
+    }
+
+    // Contents arrive exactly as sent. Trimming stripped the trailing newline and the
+    // first line's indentation from every file the swarm wrote, and contents a server
+    // had JSON-coerced (a file that parses as JSON) were refused as missing.
+    #[tokio::test]
+    async fn write_file_contents_are_written_exactly_and_json_values_are_taken_as_text() {
+        let dir = std::env::temp_dir().join(format!("corrode-exact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(crate::vfs::PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(HashMap::new()),
+        );
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            name: name.to_string(),
+            arguments: args,
+        };
+        let src = "    fn f() {}\n";
+        let out = toolbox
+            .execute(&call("write_file", serde_json::json!({"path": "a.rs", "contents": src})))
+            .await;
+        assert!(out.starts_with("wrote"), "{out}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), src);
+
+        let call_json = call(
+            "write_file",
+            serde_json::json!({"path": "p.json", "contents": {"name": "x", "version": 1}}),
+        );
+        assert!(missing_required(&call_json).is_empty(), "coerced contents are present");
+        let out = toolbox.execute(&call_json).await;
+        assert!(out.starts_with("wrote"), "{out}");
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("p.json")).unwrap()).unwrap();
+        assert_eq!(back, serde_json::json!({"name": "x", "version": 1}));
+
+        let out = toolbox.execute(&call("run_command", serde_json::json!({"command": true}))).await;
+        assert!(out.starts_with("exit 0"), "`true` coerced to a bool still runs: {out}");
+        std::fs::remove_dir_all(&dir).ok();
     }
     use super::*;
     use crate::vfs::PassthroughVfs;
