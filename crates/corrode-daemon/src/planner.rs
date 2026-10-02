@@ -32,8 +32,10 @@ pub fn orchestration_prompt(context_prefix: &str, user_prompt: &str) -> String {
 You are the orchestrator of a coding-agent swarm. Decompose the user's request \
 into a small set of subtasks, each assigned to one role from: research, architect, \
 coder, review. Reply with ONLY a JSON array, no prose, each element \
-{{\"role\": <role>, \"task\": <self-contained instruction>}}. Use at most {MAX_SUBTASKS} \
-subtasks.\n\nUser request:\n{user_prompt}"
+{{\"role\": <role>, \"task\": <self-contained instruction>, \"after\": [<indices>]}}. \
+\"after\" lists the 0-based indices of EARLIER subtasks whose results this one needs \
+(it runs once they finish and is given their output); omit it for work that can start \
+at once. Use at most {MAX_SUBTASKS} subtasks.\n\nUser request:\n{user_prompt}"
     )
 }
 
@@ -157,6 +159,8 @@ important fix as your NEXT: line; if the work holds, say so and emit no follow-u
 struct RawSubtask {
     role: String,
     task: String,
+    #[serde(default)]
+    after: Vec<usize>,
 }
 
 /// One decomposed unit of work: a role and its instruction.
@@ -164,6 +168,9 @@ struct RawSubtask {
 pub struct PlannedSubtask {
     pub role: Role,
     pub prompt: String,
+    /// Indices (into the plan) of earlier subtasks this one waits on. Only earlier
+    /// ones survive parsing, so a plan can never form a cycle.
+    pub after: Vec<usize>,
 }
 
 /// The balanced JSON array beginning at byte offset `start` (which must be a `[`),
@@ -216,14 +223,26 @@ pub fn parse_plan(text: &str) -> Vec<PlannedSubtask> {
         })
         .unwrap_or_default();
 
-    raw.into_iter()
-        .take(MAX_SUBTASKS)
-        .filter(|r| !r.task.trim().is_empty())
-        .map(|r| PlannedSubtask {
+    // Indices in `after` refer to the model's array; dropping empty tasks shifts
+    // positions, so remap through the kept set.
+    let mut kept: Vec<Option<usize>> = Vec::new();
+    let mut plan = Vec::new();
+    for r in raw.into_iter().take(MAX_SUBTASKS) {
+        if r.task.trim().is_empty() {
+            kept.push(None);
+            continue;
+        }
+        let mut after: Vec<usize> = r.after.iter().filter_map(|&i| kept.get(i).copied().flatten()).collect();
+        after.sort_unstable();
+        after.dedup();
+        kept.push(Some(plan.len()));
+        plan.push(PlannedSubtask {
             role: Role::from_str(&r.role).unwrap_or(Role::Coder),
             prompt: r.task,
-        })
-        .collect()
+            after,
+        });
+    }
+    plan
 }
 
 /// Default priority band for a subagent role.
@@ -299,6 +318,20 @@ mod tests {
         // bands come from the role: build work Default, research fills idle GPU.
         assert_eq!(band_for(Role::Coder), Priority::Default);
         assert_eq!(band_for(Role::Research), Priority::Opportunistic);
+    }
+
+    #[test]
+    fn parse_plan_keeps_earlier_deps_only_and_remaps_past_dropped_tasks() {
+        // Task 1 is empty and dropped, so the model's index 2 becomes plan index 1.
+        // Forward (3 -> 5) and self (2 -> 2) references can't form a cycle: dropped.
+        let out = r#"[{"role":"research","task":"read A"},{"role":"coder","task":" "},
+            {"role":"coder","task":"write doc","after":[0,2,3]},
+            {"role":"review","task":"check doc","after":[2,0,0]}]"#;
+        let plan = parse_plan(out);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].after, Vec::<usize>::new());
+        assert_eq!(plan[1].after, vec![0]);
+        assert_eq!(plan[2].after, vec![0, 1]);
     }
 
     #[test]

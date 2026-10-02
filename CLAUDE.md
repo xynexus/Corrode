@@ -82,8 +82,11 @@ least-irrelevant matches), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -
 `CORRODE_WEB_ADDR` (web bind, default `0.0.0.0:8787`), `CORRODE_DAEMON_URL`
 (daemon ws the web proxies to), `CORRODE_TELEMETRY` (path to a JSONL
 file recording one line per subagent execution — role, model, band, prefix/tail bytes,
-duration, artifacts, ok/error; absent -> disabled), `CORRODE_MAX_TOKENS` (per-call output cap,
-default 4096 — a ceiling, so short outputs are unaffected), `CORRODE_STREAM`
+duration, artifacts, ok/error; absent -> disabled), `CORRODE_MAX_FOLLOWUPS` (emitted follow-up tasks folded in per drive, default 3;
+the plan-review round is its own drive; past it emissions are dropped and logged), `CORRODE_MAX_TOOL_STEPS` (tool calls a task may make before it must answer, default 16;
+a note on the tool result warns at 3 left; when spent, one more generation asks for the final answer
+— tools still declared, none run), `CORRODE_MAX_TOKENS` (per-call output cap,
+default 8192 — a ceiling, so short outputs are unaffected), `CORRODE_STREAM`
 (stream single-shot subagent output over SSE, relaying `SubagentDelta` events to
 the UI as tokens generate; off unless `1`/`true`/`on` — the non-streaming path is
 unchanged when off), `CORRODE_FANOUT` (coder-task ensemble size — K read-only proposal
@@ -149,7 +152,8 @@ unreachable, all roles fall back to `CORRODE_MODEL`.
 
 `planner.rs` is the two-phase decomposition, driven by `Daemon::plan`: phase 1 asks
 the orchestration model for a JSON plan; phase 2 (`parse_plan`) turns it into
-role-tagged `PlannedSubtask`s. Empty/unparseable plan degrades to one coder task on
+role-tagged `PlannedSubtask`s; a subtask's optional `after` (indices of earlier subtasks) becomes
+plan-graph deps, and a dependent launches with its deps' outputs appended to its prompt. Empty/unparseable plan degrades to one coder task on
 the raw prompt. `plan` returns those subtasks plus the shared prefix; the daemon
 seeds a `plan_graph::PlanGraph` with them and drives it via `run_reactive`.
 

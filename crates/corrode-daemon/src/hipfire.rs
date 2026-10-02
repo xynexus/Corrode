@@ -92,9 +92,9 @@ fn parse_sse_event(block: &str) -> Option<SseDelta> {
         "response.output_text.delta" => {
             Some(SseDelta::Text(json.get("delta")?.as_str()?.to_string()))
         }
-        "response.reasoning.delta" => {
-            Some(SseDelta::Reasoning(json.get("delta")?.as_str()?.to_string()))
-        }
+        "response.reasoning.delta" => Some(SseDelta::Reasoning(
+            json.get("delta")?.as_str()?.to_string(),
+        )),
         "response.output_text.done" => {
             Some(SseDelta::TextDone(json.get("text")?.as_str()?.to_string()))
         }
@@ -249,13 +249,14 @@ impl Client {
         // A ceiling, not a target: models stop at EOS, so a higher cap costs nothing
         // for short outputs (a TOOL: line) and only spares long ones (a multi-task
         // plan, a synthesized doc answer) from truncation — 1024 tokens (~750 words)
-        // was clipping real plans/answers mid-output.
+        // was clipping real plans/answers mid-output, and 4096 clipped a coder's
+        // write_file of a 14 KB document (~4K tokens plus JSON escaping).
         // ponytail: still one cap for every call. Split per-role (a planner wants more
         // than a research skim) once we tune it.
         let max_output_tokens = std::env::var("CORRODE_MAX_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(4096);
+            .unwrap_or(8192);
         let stream = matches!(
             std::env::var("CORRODE_STREAM").ok().as_deref(),
             Some("1") | Some("true") | Some("on")
@@ -292,11 +293,19 @@ impl Client {
     /// one user message, a prefix byte-identical across the whole swarm was
     /// prefilled again by every request. As its own turn it is prefilled once.
     fn input_items(&self, input: &str) -> serde_json::Value {
-        let prefixes = self.shared_prefixes.lock().map(|p| p.clone()).unwrap_or_default();
+        let prefixes = self
+            .shared_prefixes
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_default();
         let split = prefixes
             .iter()
             .filter(|p| !p.is_empty())
-            .filter_map(|p| input.strip_prefix(p.as_str()).map(|rest| (p.as_str(), rest)))
+            .filter_map(|p| {
+                input
+                    .strip_prefix(p.as_str())
+                    .map(|rest| (p.as_str(), rest))
+            })
             .max_by_key(|(p, _)| p.len());
         match split {
             Some((prefix, rest)) => serde_json::json!([
@@ -527,7 +536,11 @@ impl Client {
             buf.extend_from_slice(&chunk?);
             while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
                 let block: Vec<u8> = buf.drain(..pos + 2).collect();
-                apply(parse_sse_event(&String::from_utf8_lossy(&block)), &mut text, &mut reasoning);
+                apply(
+                    parse_sse_event(&String::from_utf8_lossy(&block)),
+                    &mut text,
+                    &mut reasoning,
+                );
             }
         }
         // A final event without a trailing blank line.
@@ -580,7 +593,11 @@ impl Client {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
-        let req = RerankRequest { model, query, documents };
+        let req = RerankRequest {
+            model,
+            query,
+            documents,
+        };
         let mut rb = self
             .http
             .post(format!("{}/v1/rerank", self.base_url))
@@ -729,7 +746,10 @@ mod tests {
     fn a_prompt_leading_with_the_shared_prefix_is_sent_as_a_system_turn() {
         let client = Client::new("http://unused", None);
         // Unregistered: the prompt goes as the plain string it always was.
-        assert_eq!(client.input_items("PREFIX\n\n[role: coder]\ndo it"), "PREFIX\n\n[role: coder]\ndo it");
+        assert_eq!(
+            client.input_items("PREFIX\n\n[role: coder]\ndo it"),
+            "PREFIX\n\n[role: coder]\ndo it"
+        );
 
         client.register_shared_prefix("PRE");
         client.register_shared_prefix("PREFIX");
@@ -758,7 +778,10 @@ mod tests {
     #[test]
     fn answer_falls_back_to_reasoning_only_when_output_is_blank() {
         // Normal case: a real answer is returned as-is.
-        assert_eq!(answer_or_reasoning("the answer".into(), "some thinking"), "the answer");
+        assert_eq!(
+            answer_or_reasoning("the answer".into(), "some thinking"),
+            "the answer"
+        );
         // Think-native model: empty output_text -> recover the answer from reasoning.
         assert_eq!(answer_or_reasoning("   ".into(), "4"), "4");
         // Nothing anywhere stays empty (no spurious fallback).
