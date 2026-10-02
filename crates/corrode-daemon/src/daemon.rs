@@ -1337,12 +1337,16 @@ const NO_CALL_REMINDER: &str = "You replied without calling a tool. Changes to t
 through tool calls: to create or change a file, call write_file with its full contents -- do not paste \
 file contents as your reply. If the task truly needs no tool, repeat your final answer.";
 
+/// Tool calls one step may run. A step is one generation; the model may emit several
+/// independent calls in it (read several files at once).
+const MAX_CALLS_PER_STEP: usize = 8;
+
 /// Tool calls left when a task is told its budget is running out.
 const STEPS_LEFT_WARNING: usize = 3;
 
 fn steps_left_note(left: usize) -> String {
     format!(
-        "[You have {left} tool calls left. If your task is to write or change a file, \
+        "[You have {left} tool steps left. If your task is to write or change a file, \
          do it now with what you have gathered; then give your final answer.]"
     )
 }
@@ -1719,7 +1723,7 @@ async fn run_native_tool_loop(
         } else {
             server_calls
         };
-        let Some(call) = calls.first() else {
+        if calls.is_empty() {
             // A first reply with no call gets ONE reminder before it counts as the
             // answer: a CAE coder pasted its whole 14 KB deliverable as prose, ran
             // into the output cap, and the toolless reply sent the task to the Needle
@@ -1748,51 +1752,66 @@ async fn run_native_tool_loop(
             } else {
                 NativeOutcome::Answered(text)
             });
-        };
-        calls_made += 1;
-        if let Some(p) = crate::tools::arg_str(call, "path") {
-            if !touched.iter().any(|t| t == p) {
-                touched.push(p.to_string());
-            }
         }
-        let observation = gate_and_execute(
-            call, &toolbox, approvals, events, id, written, seen, read_only,
-        )
-        .await;
-        steps.push(crate::trace::Step {
-            said: text.clone(),
-            intent: Some(crate::tools::describe(call)),
-            tool: Some(call.name.clone()),
-            observation: Some(observation.clone()),
-        });
+        // Run EVERY call of the step (up to MAX_CALLS_PER_STEP), not just the first.
+        // A step is a full generation -- prefill plus decode, tens of seconds -- while a
+        // tool call is milliseconds; research reading 15 crates one file per step
+        // spent 16 generations on what parallel calls do in a few. Sequential is
+        // enough: the generation, not the call, is the cost.
+        let batch = &calls[..calls.len().min(MAX_CALLS_PER_STEP)];
+        let mut observations = Vec::with_capacity(batch.len());
+        for call in batch {
+            calls_made += 1;
+            if let Some(p) = crate::tools::arg_str(call, "path") {
+                if !touched.iter().any(|t| t == p) {
+                    touched.push(p.to_string());
+                }
+            }
+            let observation = gate_and_execute(
+                call, &toolbox, approvals, events, id, written, seen, read_only,
+            )
+            .await;
+            steps.push(crate::trace::Step {
+                said: text.clone(),
+                intent: Some(crate::tools::describe(call)),
+                tool: Some(call.name.clone()),
+                observation: Some(observation.clone()),
+            });
+            observations.push(observation);
+        }
         // Warn while there is still room to act on it: a CAE writer spent its whole
         // budget re-reading files and ended on "Let me write the document" with no
         // call left to write it. Rides the newest tool result (not a new turn), so
         // the prompt still extends the last step's checkpoint.
         let left = max_steps - step - 1;
-        let observation = if left == STEPS_LEFT_WARNING {
-            format!("{observation}\n\n{}", steps_left_note(left))
-        } else {
-            observation
-        };
-        // Only the call that ran is replayed, so every call in the history has its
+        if left == STEPS_LEFT_WARNING {
+            if let Some(last) = observations.last_mut() {
+                *last = format!("{last}\n\n{}", steps_left_note(left));
+            }
+        }
+        // Only the calls that ran are replayed, so every call in the history has its
         // result — a model shown a call with no output would wait on it or redo it.
-        let call_id = format!("call_{id}_{step}");
+        // Calls first, then outputs: hipfire folds consecutive calls into the one
+        // assistant turn the model emitted them in, outputs into consecutive tool turns.
         if !text.trim().is_empty() {
             turns
                 .push(serde_json::json!({"type": "message", "role": "assistant", "content": text}));
         }
-        turns.push(serde_json::json!({
-            "type": "function_call",
-            "call_id": call_id,
-            "name": call.name,
-            "arguments": call.arguments.to_string(),
-        }));
-        turns.push(serde_json::json!({
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": observation,
-        }));
+        for (k, call) in batch.iter().enumerate() {
+            turns.push(serde_json::json!({
+                "type": "function_call",
+                "call_id": format!("call_{id}_{step}_{k}"),
+                "name": call.name,
+                "arguments": call.arguments.to_string(),
+            }));
+        }
+        for (k, observation) in observations.into_iter().enumerate() {
+            turns.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": format!("call_{id}_{step}_{k}"),
+                "output": observation,
+            }));
+        }
     }
     record_trace(&toolbox, id, task, &steps, &touched);
     // Step budget spent. Calls were made to spend it, so what follows is an answer —
