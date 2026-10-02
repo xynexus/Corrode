@@ -1490,6 +1490,9 @@ fn plan_review_enabled() -> bool {
 struct SeenCalls {
     seen: std::collections::HashMap<String, String>,
     log: Vec<String>,
+    /// Bumped by every invalidation, so a read that was running when a sibling's
+    /// mutation landed is not cached: its result may predate the change.
+    gen: u64,
 }
 
 impl SeenCalls {
@@ -1524,17 +1527,21 @@ impl SeenCalls {
         })
     }
 
-    /// Record a call's observation. A mutating call that actually ran (`wrote …` /
-    /// `exit 0:`) invalidates everything first — including the advertised log, which
-    /// would otherwise sell stale knowledge; failed or denied ones stay recorded so
-    /// their repeats are suppressed too.
+    /// Forget everything: a mutating call ran, so any cached read -- and the advertised
+    /// log, which would otherwise sell stale knowledge -- may describe a tree that no
+    /// longer exists. Keyed on the call having RUN, not on what it printed: matching
+    /// `exit 0:` missed the digest's `exit 0 — test run` and every command that changed
+    /// files and then failed, and a coder told "unchanged, do not repeat" rewrote a
+    /// file from stale text.
+    fn invalidate(&mut self) {
+        self.seen.clear();
+        self.log.clear();
+        self.gen += 1;
+    }
+
+    /// Record a call's observation, so its exact repeat is suppressed (denied and
+    /// failed calls included).
     fn record(&mut self, call: &crate::toolcall::ToolCall, observation: &str) {
-        if crate::tools::is_mutating(call)
-            && (observation.starts_with("wrote") || observation.starts_with("exit 0:"))
-        {
-            self.seen.clear();
-            self.log.clear();
-        }
         let first = observation.lines().next().unwrap_or("");
         let end = crate::tools::floor_char_boundary(first, LOG_LINE_CAP);
         self.log.push(format!(
@@ -1622,13 +1629,23 @@ async fn gate_and_execute(
         seen.lock().unwrap().record(call, &denied);
         denied
     } else {
+        let gen = seen.lock().unwrap().gen;
         let observation = toolbox.execute(call).await;
         if call.name == "write_file" && observation.starts_with("wrote") {
             if let Some(path) = call.arguments.get("path").and_then(|p| p.as_str()) {
                 written.push(path.to_string());
             }
         }
-        seen.lock().unwrap().record(call, &observation);
+        let mut s = seen.lock().unwrap();
+        if crate::tools::is_mutating(call) {
+            s.invalidate();
+            s.record(call, &observation);
+        } else if s.gen == gen {
+            s.record(call, &observation);
+        }
+        // else: a sibling's mutation ran while this read did; its result may predate
+        // the change, so it is not cached.
+        drop(s);
         observation
     };
     let mut shown = observation.clone();
@@ -3063,23 +3080,57 @@ mod tests {
         seen.record(&a, "denied: write_file a.rs was not approved");
         assert!(seen.repeat(&b).is_some(), "reordered args must collide");
 
-        // A failing mutating call does NOT invalidate — its repeat stays suppressed.
+        // Invalidation clears every cached result; the call that caused it is
+        // recorded after, so its own repeat stays suppressed (gate_and_execute).
         let bad = call("run_command", serde_json::json!({"command": "carg test"}));
+        seen.invalidate();
         seen.record(&bad, "exit 127:\ncarg: command not found");
-        assert!(seen.repeat(&bad).is_some());
-        assert!(
-            seen.repeat(&read).is_some(),
-            "reads survive a failed command"
-        );
+        assert!(seen.repeat(&bad).is_some(), "a failing command's retry stays dead");
+        assert!(seen.repeat(&read).is_none(), "the re-read runs for real");
+    }
 
-        // A successful mutating call clears everything: the re-read runs for real.
-        seen.record(&a, "wrote 1 bytes to a.rs");
-        assert!(
-            seen.repeat(&read).is_none(),
-            "read after write must not be suppressed"
+    // Any mutating call that RAN invalidates the cache, whatever it printed. A passing
+    // test run digests to `exit 0 — test run`, which the old `exit 0:` match missed:
+    // the file this command rewrote was then served from the cache, stale.
+    #[tokio::test]
+    async fn a_command_that_ran_invalidates_cached_reads_whatever_it_printed() {
+        let dir = std::env::temp_dir().join(format!("corrode-seen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(std::collections::HashMap::new()),
         );
-        assert!(seen.repeat(&bad).is_none());
-        assert!(seen.repeat(&a).is_some(), "the write itself stays recorded");
+        let approvals = Arc::new(ApprovalGate::default());
+        let (etx, mut erx) = mpsc::channel(16);
+        let g = approvals.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = erx.recv().await {
+                if let AgentEvent::ApprovalRequest { id, .. } = ev {
+                    g.resolve(id, true);
+                }
+            }
+        });
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let call = |name: &str, args: serde_json::Value| crate::toolcall::ToolCall {
+            name: name.to_string(),
+            arguments: args,
+        };
+        let read = call("read_file", serde_json::json!({"path": "a.txt"}));
+        let first = gate_and_execute(&read, &toolbox, &approvals, &etx, 1, &mut written, &seen, false).await;
+        assert!(first.contains("one"), "{first}");
+        let cmd = call(
+            "run_command",
+            serde_json::json!({"command": "printf two > a.txt; echo 'test result: ok. 1 passed; 0 failed'"}),
+        );
+        let ran = gate_and_execute(&cmd, &toolbox, &approvals, &etx, 1, &mut written, &seen, false).await;
+        assert!(!ran.starts_with("exit 0:"), "the digest format this guards against: {ran}");
+        let again = gate_and_execute(&read, &toolbox, &approvals, &etx, 1, &mut written, &seen, false).await;
+        assert!(again.contains("two"), "stale read served from the cache: {again}");
+        assert!(!again.starts_with("note:"), "{again}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // A read-only pass (a fan-out proposal attempt) neither executes a mutating call
@@ -3260,9 +3311,11 @@ mod tests {
             name: "write_file".into(),
             arguments: serde_json::json!({"path": "lib.rs", "contents": "fn g() {}"}),
         };
-        seen.lock()
-            .unwrap()
-            .record(&write, "wrote 9 bytes to lib.rs");
+        {
+            let mut s = seen.lock().unwrap();
+            s.invalidate();
+            s.record(&write, "wrote 9 bytes to lib.rs");
+        }
         assert!(
             seen.lock().unwrap().repeat(&read).is_none(),
             "read re-executes after a write"
