@@ -261,9 +261,24 @@ impl Client {
             std::env::var("CORRODE_STREAM").ok().as_deref(),
             Some("1") | Some("true") | Some("on")
         );
+        // Every call is bounded. Nothing else was: no timeout here or in hipfire,
+        // so one wedged generation hung its turn forever. The bound covers the
+        // whole generation (a non-streamed reply arrives only when it is done), so
+        // it is sized for a full max_output_tokens at a busy server's per-session
+        // rate, not for a typical call. `CORRODE_REQUEST_TIMEOUT_S`, default 3600.
+        let timeout = std::env::var("CORRODE_REQUEST_TIMEOUT_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&s: &u64| s > 0)
+            .unwrap_or(3600);
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(timeout))
+            .build()
+            .expect("reqwest client");
         Self {
             shared_prefixes: std::sync::Mutex::new(Vec::new()),
-            http: reqwest::Client::new(),
+            http,
             base_url: base_url.into(),
             api_key,
             max_output_tokens,
@@ -455,7 +470,15 @@ impl Client {
                     last = Some(anyhow::anyhow!("hipfire sched-shed {}", resp.status()));
                 }
                 Ok(resp) => return Ok(resp.error_for_status()?.json().await?),
-                Err(e) if e.is_timeout() || e.is_connect() => last = Some(e.into()),
+                // Unreachable (restarting, not up yet): back off and retry. A call
+                // that ran the whole request timeout is not shedding, it is stuck or
+                // far too slow -- retrying would multiply the wait, so fail it.
+                Err(e) if e.is_connect() => last = Some(e.into()),
+                Err(e) if e.is_timeout() => {
+                    return Err(anyhow::anyhow!(
+                        "hipfire request timed out (CORRODE_REQUEST_TIMEOUT_S): {e}"
+                    ))
+                }
                 Err(e) => return Err(e.into()), // non-transient -> don't retry
             }
             if attempt + 1 < MAX_ATTEMPTS {
