@@ -105,7 +105,8 @@ confined; each auto-approval is logged and the call still streams back as a
 `ToolResult`), `CORRODE_USERS` (path to a JSON `user -> {token, hipfire_token?}` table; present =
 auth on, connections must `Authenticate` before repo-scoped commands, and each
 user's `hipfire_token` — if set — attributes their swarm to a distinct hipfire
-principal for per-user fairness; absent = auth off, connections anonymous). The
+principal for per-user fairness; absent = auth off, connections anonymous; set but
+unreadable, unparseable or empty = auth stays on and nobody can authenticate). The
 hipfire background daemon must be up (`hipfire start`, not just
 `serve` — `serve` is only the HTTP frontend) for the daemon to resolve roles and
 generate.
