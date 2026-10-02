@@ -40,7 +40,7 @@ crates/corrode-web      # web server stub (Apache-2.0)
 crates/needle-toolcall-shim  # vendored Needle tool-call model (Apache-2.0, CPU/candle). Workspace-EXCLUDED; corrode-daemon links it behind `--features needle`. Weights committed under assets/needle.
 third_party/needle      # git submodule: upstream Needle (Cactus) — training/finetuning code, kept for finetuning Needle on Corrode's real tool set.
 fixtures/demo-repo      # git submodule (xynexus/corrode-demo): a tiny real Rust project — deterministic target for e2e/tool/skill/provenance testing (CORRODE_REPO) + Needle-finetune query source.
-fixtures/cae            # git submodule (xynexus/CAE, private, ssh): ~119K-line, 14-crate Rust workspace — the large target for concurrent-swarm testing. Its AGENTS.md is `@CLAUDE.md` (expanded by skills.rs). Never point a swarm at a live checkout of it; builds need glslc + Vulkan (lavapipe).
+fixtures/cae            # git submodule (xynexus/CAE, private, ssh): ~119K-line, 14-crate Rust workspace — the large target for concurrent-swarm testing. Its AGENTS.md is `@CLAUDE.md` (expanded by skills.rs). Never point a swarm at a live checkout of it; builds need glslc + Vulkan (lavapipe). Marked `update = none` so recursive submodule updates (and CI, which can't reach it) skip it; fetch it with `git submodule update --init --checkout fixtures/cae`.
 webui/                  # wasm front-end seam (out of the cargo workspace; its own trunk/wasm-pack build)
 third_party/helix-db    # git submodule: HelixDB pinned at v2.3.5 (AGPL-3.0), linked in-process behind the `helix` feature
 third_party/helix-skills# vendored HelixDB agent skills (MIT); Rust-relevant ones symlinked into .claude/skills/

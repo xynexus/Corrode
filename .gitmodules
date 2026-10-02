@@ -22,3 +22,4 @@
 [submodule "fixtures/cae"]
 	path = fixtures/cae
 	url = git@github.com:xynexus/CAE.git
+	update = none
