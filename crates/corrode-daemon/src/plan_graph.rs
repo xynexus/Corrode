@@ -143,6 +143,22 @@ pub struct PlanGraph {
     plan_id: String,
     nodes: Vec<Node>,
     next_id: TaskId,
+    /// Emitted follow-ups folded in per drive (`run_reactive_until` call); past it
+    /// emissions are dropped. `None` = unlimited (tests). See [`max_followups`].
+    pub followup_cap: Option<usize>,
+}
+
+/// `CORRODE_MAX_FOLLOWUPS`: follow-up tasks a turn's drive folds in (default 3).
+///
+/// Every subagent may end with a `NEXT:` line, and research does, nearly always:
+/// a CAE crate-map turn grew 9 follow-ups of up to 16 tool steps each, which kept
+/// the turn running 30-60 minutes past its deliverable. The plan-review round is a
+/// separate drive, so its fixes get their own allowance.
+pub fn max_followups() -> usize {
+    std::env::var("CORRODE_MAX_FOLLOWUPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
 }
 
 impl PlanGraph {
@@ -396,6 +412,7 @@ where
 {
     let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     let mut summary = RunSummary::default();
+    let mut followups = 0usize;
     let mut inflight = FuturesUnordered::new();
     loop {
         if !expired() {
@@ -434,6 +451,16 @@ where
                 );
                 break;
             }
+            if graph.followup_cap.is_some_and(|cap| followups >= cap) {
+                eprintln!(
+                    "plan {}: follow-up cap reached, dropping emission ({:?})",
+                    graph.plan_id,
+                    emit.prompt.chars().take(80).collect::<String>()
+                );
+                summary.capped += 1;
+                continue;
+            }
+            followups += 1;
             let deps = if emit.after_emitter { vec![id] } else { vec![] };
             let emitted_id = graph.add(emit.role, emit.prompt, deps);
             graph.set_emitted_by(emitted_id, id); // the emitted task is a contract of `id`
@@ -459,6 +486,8 @@ pub struct RunSummary {
     pub expired: bool,
     pub shed: usize,
     pub unlaunched: usize,
+    /// Emissions dropped by `followup_cap`.
+    pub capped: usize,
 }
 
 /// Extract the single follow-up instruction an agent proposed, from a `NEXT:` line
@@ -621,6 +650,39 @@ mod tests {
             !research.contains("Results of"),
             "a task with no deps gets no results block"
         );
+    }
+
+    // Every task emits a follow-up; the cap stops the chain after N of them, per drive.
+    #[tokio::test]
+    async fn followup_cap_bounds_emissions_per_drive() {
+        let mut g = PlanGraph::default();
+        g.followup_cap = Some(2);
+        g.add(Role::Research, "seed", vec![]);
+        let summary = run_reactive(&mut g, |task: PlanTask| async move {
+            Outcome {
+                output: Ok("ok".into()),
+                emitted: vec![Emit {
+                    role: Role::Research,
+                    prompt: format!("after {}", task.id),
+                    after_emitter: true,
+                }],
+                artifacts: vec![],
+            }
+        })
+        .await;
+        assert_eq!(g.nodes.len(), 3, "seed + 2 follow-ups");
+        assert_eq!(summary.capped, 1, "the third emission is dropped");
+        // A second drive (the plan-review round) gets its own allowance.
+        g.add(Role::Review, "review", vec![]);
+        run_reactive(&mut g, |_task: PlanTask| async move {
+            Outcome {
+                output: Ok("ok".into()),
+                emitted: vec![Emit { role: Role::Coder, prompt: "fix".into(), after_emitter: true }],
+                artifacts: vec![],
+            }
+        })
+        .await;
+        assert_eq!(g.nodes.len(), 6, "review + 2 fixes, then capped again");
     }
 
     // A coder task emits a test contract mid-run; a review task depends on the coder.

@@ -385,6 +385,7 @@ impl Daemon {
                 // dataflow, not a fixed fan-out. Real concurrency is hipfire's to bound
                 // (admission control against its VRAM budget); nothing is capped here.
                 let mut graph = plan_graph::PlanGraph::new(&plan_id);
+                graph.followup_cap = Some(plan_graph::max_followups());
                 let mut ids = Vec::new();
                 for s in subtasks {
                     let deps = s.after.iter().map(|&i| ids[i]).collect();

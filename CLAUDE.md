@@ -82,7 +82,8 @@ least-irrelevant matches), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -
 `CORRODE_WEB_ADDR` (web bind, default `0.0.0.0:8787`), `CORRODE_DAEMON_URL`
 (daemon ws the web proxies to), `CORRODE_TELEMETRY` (path to a JSONL
 file recording one line per subagent execution — role, model, band, prefix/tail bytes,
-duration, artifacts, ok/error; absent -> disabled), `CORRODE_MAX_TOOL_STEPS` (tool calls a task may make before it must answer, default 16;
+duration, artifacts, ok/error; absent -> disabled), `CORRODE_MAX_FOLLOWUPS` (emitted follow-up tasks folded in per drive, default 3;
+the plan-review round is its own drive; past it emissions are dropped and logged), `CORRODE_MAX_TOOL_STEPS` (tool calls a task may make before it must answer, default 16;
 a note on the tool result warns at 3 left; when spent, one more generation asks for the final answer
 — tools still declared, none run), `CORRODE_MAX_TOKENS` (per-call output cap,
 default 8192 — a ceiling, so short outputs are unaffected), `CORRODE_STREAM`
