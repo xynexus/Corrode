@@ -59,10 +59,11 @@ Write plain English, not JSON. Omit the line if no follow-up is needed.",
 /// Deliberately does NOT teach a call syntax: the tools are declared on the request and
 /// the model's chat template renders the format it was trained on. Describing a second
 /// syntax here would compete with that one. The shared prefix still leads, so hipfire
-/// reuses the KV prefill across the swarm; only the scratchpad tail grows.
-pub fn native_tool_prompt(context_prefix: &str, role: Role, task: &str, scratchpad: &str) -> String {
+/// reuses the KV prefill across the swarm. Tool steps are not folded in here: they
+/// follow as conversation turns (`Client::respond_turns`), so this stays fixed.
+pub fn native_tool_prompt(context_prefix: &str, role: Role, task: &str) -> String {
     format!(
-        "{context_prefix}\n\n[role: {}]\n{task}\n{scratchpad}\n\
+        "{context_prefix}\n\n[role: {}]\n{task}\n\n\
 You have tools available. Call one when you need it — you will get the result and can \
 continue. Never guess a file's contents: read it first. When you have enough to answer, \
 reply with your final answer and no tool call. Optionally end with:\n\

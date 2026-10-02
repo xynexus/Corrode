@@ -1158,6 +1158,9 @@ impl Daemon {
         }
         s.push_str("\nRepository tree:\n");
         s.push_str(&self.repo_tree(session).await);
+        // Every prompt of the turn starts with this; the client sends it as its own
+        // system turn so hipfire can checkpoint and reuse its prefill.
+        self.swarm.client().register_shared_prefix(&s);
         s
     }
 
@@ -1541,7 +1544,10 @@ async fn run_native_tool_loop(
     let values = toolbox.param_values().await;
     let tools = dialect.request_tools(crate::tools::role_tools(role), Some(&values));
     let effort = std::env::var("CORRODE_REASONING_EFFORT").unwrap_or_else(|_| "none".to_string());
-    let mut scratchpad = String::new();
+    // The first user turn stays fixed; each step appends its call and result as
+    // turns after it (see `Client::respond_turns`).
+    let prompt = planner::native_tool_prompt(prefix, role, task);
+    let mut turns: Vec<serde_json::Value> = Vec::new();
     let mut last = String::new();
     // Whether this model ever produced a parsed call. The loop's own exit condition
     // cannot distinguish "finished" from "never able to start".
@@ -1551,7 +1557,7 @@ async fn run_native_tool_loop(
     // no notes at all — silently, since nothing reports notes it never tried to make.
     let mut steps: Vec<crate::trace::Step> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
-    for _ in 0..MAX_TOOL_STEPS {
+    for step in 0..MAX_TOOL_STEPS {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
         // tool call that is half-applied is worse than a turn that runs long, and
         // there is no way to un-run one. Reported, not silent: a truncated answer
@@ -1566,9 +1572,16 @@ async fn run_native_tool_loop(
                 "{last}\n[stopped: turn budget reached]"
             )));
         }
-        let prompt = planner::native_tool_prompt(prefix, role, task, &scratchpad);
         let (text, _reasoning, server_calls) = client
-            .respond_full(model, &prompt, band, toolbox.owner_token(), Some(&tools), Some(&effort))
+            .respond_turns(
+                model,
+                &prompt,
+                &turns,
+                band,
+                toolbox.owner_token(),
+                Some(&tools),
+                Some(&effort),
+            )
             .await?;
         let _ = events
             .send(AgentEvent::SubagentOutput {
@@ -1619,10 +1632,23 @@ async fn run_native_tool_loop(
             tool: Some(call.name.clone()),
             observation: Some(observation.clone()),
         });
-        scratchpad.push_str(&format!(
-            "\nCALLED: {}\nRESULT: {observation}\n",
-            crate::tools::describe(call)
-        ));
+        // Only the call that ran is replayed, so every call in the history has its
+        // result — a model shown a call with no output would wait on it or redo it.
+        let call_id = format!("call_{id}_{step}");
+        if !text.trim().is_empty() {
+            turns.push(serde_json::json!({"type": "message", "role": "assistant", "content": text}));
+        }
+        turns.push(serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": call.name,
+            "arguments": call.arguments.to_string(),
+        }));
+        turns.push(serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": observation,
+        }));
     }
     record_trace(&toolbox, id, task, &steps, &touched);
     // Step budget spent. Calls were made to spend it, so this is an answer.

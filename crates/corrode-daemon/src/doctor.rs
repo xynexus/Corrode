@@ -41,6 +41,7 @@ pub async fn run() -> bool {
                     "no embedding model served — DocQuery/skills fall back to BM25/manifest",
                 ),
             }
+            role_assignments(&models);
         }
         Ok(_) if has_fallback => warn("hipfire served 0 models; using CORRODE_MODEL fallback"),
         Ok(_) => {
@@ -156,6 +157,33 @@ pub async fn run() -> bool {
 /// The real usability test for the sandbox: actually run an unprivileged bwrap.
 /// Its failure modes (missing binary, AppArmor/userns restriction) are hard to
 /// enumerate from config alone, so we just try it.
+/// Print the model each role will run on. `RoleModels::resolve` drops an override
+/// naming a model hipfire does not serve, so a typo in `CORRODE_ROLES` would put
+/// that role on the default pick without a word — warn about each one here.
+fn role_assignments(served: &[String]) {
+    let overrides = match roles::RoleModels::overrides_from_env() {
+        Ok(o) => o,
+        Err(e) => {
+            warn(&format!("CORRODE_ROLES unreadable ({e}); every role uses the default pick"));
+            roles::RoleModels::default()
+        }
+    };
+    for (role, model) in &overrides.0 {
+        if !served.iter().any(|s| s == model) {
+            warn(&format!(
+                "CORRODE_ROLES {}: '{model}' is not served; using the default pick",
+                role.as_str()
+            ));
+        }
+    }
+    if let Ok(resolved) = roles::RoleModels::resolve(served, &overrides) {
+        for role in roles::Role::ALL {
+            let model = resolved.model_for(role).unwrap_or("?");
+            info(&format!("role {:<13} -> {model}", role.as_str()));
+        }
+    }
+}
+
 fn bwrap_usable() -> anyhow::Result<()> {
     let out = Command::new("bwrap")
         .args([

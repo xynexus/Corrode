@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11435";
 
 pub struct Client {
+    /// Context prefixes the swarm's prompts start with, most recent last; see
+    /// [`Client::input_items`].
+    shared_prefixes: std::sync::Mutex<Vec<String>>,
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
@@ -102,7 +105,9 @@ fn parse_sse_event(block: &str) -> Option<SseDelta> {
 #[derive(Serialize)]
 struct ResponsesRequest<'a> {
     model: &'a str,
-    input: &'a str,
+    /// A string, or role-tagged items when the prompt leads with a shared prefix
+    /// (see [`Client::input_items`]).
+    input: serde_json::Value,
     /// Hard cap on generated tokens. Without it a slow model generates until EOS
     /// and one subagent can hog the GPU for minutes, starving the rest of the swarm.
     max_output_tokens: u32,
@@ -256,11 +261,49 @@ impl Client {
             Some("1") | Some("true") | Some("on")
         );
         Self {
+            shared_prefixes: std::sync::Mutex::new(Vec::new()),
             http: reqwest::Client::new(),
             base_url: base_url.into(),
             api_key,
             max_output_tokens,
             stream,
+        }
+    }
+
+    /// Record a context prefix the swarm's prompts will start with. A few are kept,
+    /// since several repos or tenants can be mid-turn at once.
+    pub fn register_shared_prefix(&self, prefix: &str) {
+        const KEEP: usize = 8;
+        let Ok(mut prefixes) = self.shared_prefixes.lock() else {
+            return;
+        };
+        prefixes.retain(|p| p != prefix);
+        prefixes.push(prefix.to_string());
+        let over = prefixes.len().saturating_sub(KEEP);
+        prefixes.drain(..over);
+    }
+
+    /// The `/v1/responses` `input` for a prompt. One that starts with a registered
+    /// context prefix goes as a system turn (the prefix) plus a user turn (the rest);
+    /// anything else as the plain string it is.
+    ///
+    /// hipfire can only checkpoint a prompt at a chat-turn boundary, and Qwen3.5's
+    /// recurrent state cannot be rewound to an arbitrary shared prefix — so sent as
+    /// one user message, a prefix byte-identical across the whole swarm was
+    /// prefilled again by every request. As its own turn it is prefilled once.
+    fn input_items(&self, input: &str) -> serde_json::Value {
+        let prefixes = self.shared_prefixes.lock().map(|p| p.clone()).unwrap_or_default();
+        let split = prefixes
+            .iter()
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| input.strip_prefix(p.as_str()).map(|rest| (p.as_str(), rest)))
+            .max_by_key(|(p, _)| p.len());
+        match split {
+            Some((prefix, rest)) => serde_json::json!([
+                {"role": "system", "content": prefix},
+                {"role": "user", "content": rest.trim_start()},
+            ]),
+            None => serde_json::json!(input),
         }
     }
 
@@ -322,6 +365,38 @@ impl Client {
         tools: Option<&serde_json::Value>,
         effort: Option<&str>,
     ) -> anyhow::Result<(String, String, Vec<crate::toolcall::ToolCall>)> {
+        self.respond_turns(model, input, &[], priority, owner_token, tools, effort)
+            .await
+    }
+
+    /// [`Self::respond_full`] continuing a conversation: `turns` are Responses input
+    /// items after `prompt` — an assistant `message`, its `function_call`, and that
+    /// call's `function_call_output`, per tool step.
+    ///
+    /// Replayed as turns, each step's input is the previous step's plus what is new,
+    /// so hipfire forks the checkpoint the last step left at its end and prefills only
+    /// the new turns. Folded into one growing user message instead, the whole
+    /// transcript was prefilled again at every step.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn respond_turns(
+        &self,
+        model: &str,
+        prompt: &str,
+        turns: &[serde_json::Value],
+        priority: Priority,
+        owner_token: Option<&str>,
+        tools: Option<&serde_json::Value>,
+        effort: Option<&str>,
+    ) -> anyhow::Result<(String, String, Vec<crate::toolcall::ToolCall>)> {
+        let mut input = self.input_items(prompt);
+        if !turns.is_empty() {
+            if let serde_json::Value::String(text) = &input {
+                input = serde_json::json!([{"role": "user", "content": text}]);
+            }
+            if let Some(items) = input.as_array_mut() {
+                items.extend(turns.iter().cloned());
+            }
+        }
         let req = ResponsesRequest {
             model,
             input,
@@ -402,7 +477,7 @@ impl Client {
 
         let req = ResponsesRequest {
             model,
-            input,
+            input: self.input_items(input),
             max_output_tokens: self.max_output_tokens,
             metadata: serde_json::json!({ "hipfire_priority": priority.as_u8() }),
             tools: None,
@@ -648,6 +723,25 @@ mod tests {
         );
         assert_eq!(parse_sse_event("data: [DONE]"), None);
         assert_eq!(parse_sse_event(": keep-alive comment"), None);
+    }
+
+    #[test]
+    fn a_prompt_leading_with_the_shared_prefix_is_sent_as_a_system_turn() {
+        let client = Client::new("http://unused", None);
+        // Unregistered: the prompt goes as the plain string it always was.
+        assert_eq!(client.input_items("PREFIX\n\n[role: coder]\ndo it"), "PREFIX\n\n[role: coder]\ndo it");
+
+        client.register_shared_prefix("PRE");
+        client.register_shared_prefix("PREFIX");
+        let items = client.input_items("PREFIX\n\n[role: coder]\ndo it");
+        // The longest registered prefix wins, so the split lands where the turn's
+        // prefix actually ends.
+        assert_eq!(items[0]["role"], "system");
+        assert_eq!(items[0]["content"], "PREFIX");
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[1]["content"], "[role: coder]\ndo it");
+
+        assert_eq!(client.input_items("unrelated"), "unrelated");
     }
 
     #[test]

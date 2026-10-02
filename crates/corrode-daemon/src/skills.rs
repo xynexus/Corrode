@@ -119,10 +119,16 @@ impl SkillRegistry {
     /// Project rules from `AGENTS.md` (empty if none). Folded into `context_prefix`
     /// like a README-for-agents.
     pub fn agents_rules(&self) -> String {
-        self.agents_md
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default()
+        let Some(path) = self.agents_md.as_ref() else {
+            return String::new();
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return String::new();
+        };
+        match path.parent() {
+            Some(dir) => expand_includes(&text, dir),
+            None => text,
+        }
     }
 
     /// Stage 2 (activation): the full `SKILL.md` body for `name`. Injected into the
@@ -456,8 +462,50 @@ fn unquote(s: &str) -> String {
     }
 }
 
+/// Expand `@path` import lines in `AGENTS.md` — Claude Code's syntax, which the
+/// agents.md format itself lacks. A repo that keeps its guidance in `CLAUDE.md` can
+/// then point `AGENTS.md` at it (`@CLAUDE.md`) instead of maintaining two copies.
+///
+/// One level only, so an include cycle cannot loop. The target must resolve inside
+/// the repo: this text goes into every prompt, and a repo's `AGENTS.md` should not be
+/// able to pull in host files (`@~/.ssh/...`). An unresolvable line stays as written.
+fn expand_includes(text: &str, repo_root: &Path) -> String {
+    let root = repo_root.canonicalize().ok();
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let included = line
+            .trim()
+            .strip_prefix('@')
+            .filter(|rel| !rel.is_empty() && !rel.contains(char::is_whitespace))
+            .and_then(|rel| repo_root.join(rel).canonicalize().ok())
+            .filter(|p| root.as_ref().is_some_and(|r| p.starts_with(r)) && p.is_file())
+            .and_then(|p| std::fs::read_to_string(p).ok());
+        match included {
+            Some(body) => out.push_str(body.trim_end()),
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agents_md_includes_expand_inside_the_repo_only() {
+        let dir = std::env::temp_dir().join(format!("corrode-agents-include-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "Build with glslc.\n").unwrap();
+        let text = "# Rules\n@CLAUDE.md\n@missing.md\n@../../../etc/hostname\nkeep @ inline\n";
+        let out = super::expand_includes(text, &dir);
+        assert!(out.contains("Build with glslc."), "include not expanded: {out}");
+        assert!(!out.contains("@CLAUDE.md"), "include line kept: {out}");
+        // A missing file and a path outside the repo stay as written.
+        assert!(out.contains("@missing.md"));
+        assert!(out.contains("@../../../etc/hostname"));
+        assert!(out.contains("keep @ inline"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
     use super::*;
 
     /// The reported bug: a project with no skills of its own was handed every skill

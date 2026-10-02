@@ -19,3 +19,7 @@
 [submodule "third_party/docling.rs"]
 	path = third_party/docling.rs
 	url = https://github.com/docling-project/docling.rs.git
+[submodule "fixtures/cae"]
+	path = fixtures/cae
+	url = git@github.com:xynexus/CAE.git
+	update = none
