@@ -1846,7 +1846,7 @@ async fn run_native_tool_loop(
             last["output"] = serde_json::json!(format!("{out}\n\n{FINAL_ANSWER_NUDGE}"));
         }
     }
-    let (text, _reasoning, _calls) = client
+    let (mut text, _reasoning, calls) = client
         .respond_turns(
             model,
             &prompt,
@@ -1863,6 +1863,66 @@ async fn run_native_tool_loop(
             text: text.clone(),
         })
         .await;
+    // A reply that still calls tools is not an answer: a CAE research task asked
+    // for "one more" read on its final call, and its report became the preamble in
+    // front of the call ("Let me start by reading..."). Give it the one step it
+    // asked for, then ask again. (hipfire has no tool_choice "none"; dropping the
+    // tools would change the system turn and re-prefill the whole conversation.)
+    if !calls.is_empty() {
+        let batch = &calls[..calls.len().min(MAX_CALLS_PER_STEP)];
+        let mut observations = Vec::with_capacity(batch.len());
+        for call in batch {
+            observations.push(
+                gate_and_execute(call, &toolbox, approvals, events, id, written, seen, read_only)
+                    .await,
+            );
+        }
+        if !text.trim().is_empty() {
+            turns
+                .push(serde_json::json!({"type": "message", "role": "assistant", "content": text}));
+        }
+        for (k, call) in batch.iter().enumerate() {
+            turns.push(serde_json::json!({
+                "type": "function_call",
+                "call_id": format!("call_{id}_final_{k}"),
+                "name": call.name,
+                "arguments": call.arguments.to_string(),
+            }));
+        }
+        let n = observations.len();
+        for (k, observation) in observations.into_iter().enumerate() {
+            let output = if k + 1 == n {
+                format!("{observation}\n\n{FINAL_ANSWER_NUDGE}")
+            } else {
+                observation
+            };
+            turns.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": format!("call_{id}_final_{k}"),
+                "output": output,
+            }));
+        }
+        let (again, _reasoning, _calls) = client
+            .respond_turns(
+                model,
+                &prompt,
+                &turns,
+                band,
+                toolbox.owner_token(),
+                Some(&tools),
+                Some(&effort),
+            )
+            .await?;
+        let _ = events
+            .send(AgentEvent::SubagentOutput {
+                id,
+                text: again.clone(),
+            })
+            .await;
+        if !again.trim().is_empty() {
+            text = again;
+        }
+    }
     Ok(NativeOutcome::Answered(if text.trim().is_empty() {
         last
     } else {
