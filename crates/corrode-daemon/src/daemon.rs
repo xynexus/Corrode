@@ -1337,14 +1337,58 @@ const NO_CALL_REMINDER: &str = "You replied without calling a tool. Changes to t
 through tool calls: to create or change a file, call write_file with its full contents -- do not paste \
 file contents as your reply. If the task truly needs no tool, repeat your final answer.";
 
+/// `CORRODE_CONTEXT_TOKENS`: the serving model's context (default 32768, the
+/// swarm models' hipfire max_seq). The tool loop stops gathering once the
+/// conversation leaves less than [`ANSWER_RESERVE_TOKENS`] of it.
+fn context_tokens() -> usize {
+    std::env::var("CORRODE_CONTEXT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32768)
+}
+
+/// Tokens kept free for the final answer.
+const ANSWER_RESERVE_TOKENS: usize = 4096;
+
+/// Whether `prompt` plus the replayed `turns` is too close to the context to take
+/// another tool step. Estimated, not tokenized: 3 bytes per token is conservative
+/// for code and markdown (Qwen's tokenizer averages ~3.5-4 on this repo).
+fn over_context_budget(prompt: &str, turns: &[serde_json::Value]) -> bool {
+    let bytes = prompt.len() + turns.iter().map(|t| t.to_string().len()).sum::<usize>();
+    bytes / 3 + ANSWER_RESERVE_TOKENS > context_tokens()
+}
+
+/// Tool calls one step may run. A step is one generation; the model may emit several
+/// independent calls in it (read several files at once).
+const MAX_CALLS_PER_STEP: usize = 8;
+
 /// Tool calls left when a task is told its budget is running out.
 const STEPS_LEFT_WARNING: usize = 3;
 
 fn steps_left_note(left: usize) -> String {
     format!(
-        "[You have {left} tool calls left. If your task is to write or change a file, \
+        "[You have {left} tool steps left. If your task is to write or change a file, \
          do it now with what you have gathered; then give your final answer.]"
     )
+}
+
+/// A research task's step budget: `CORRODE_RESEARCH_TOOL_STEPS` (default 8), never
+/// above [`max_tool_steps`]. Research only reads, and with several calls per step (a
+/// CAE research step averaged ~5 reads) 8 steps cover what 16 single-call steps did;
+/// given 16 it simply read twice as much -- 107K prompt tokens of file contents for
+/// three tasks, the prefill that dominated the turn. Other roles keep the full budget
+/// (a coder's edits are sequential).
+fn max_tool_steps_for(role: Role) -> usize {
+    let all = max_tool_steps();
+    if role != Role::Research {
+        return all;
+    }
+    std::env::var("CORRODE_RESEARCH_TOOL_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(8)
+        .min(all)
 }
 
 /// Appended when a task spends its step budget: one more generation that asks for no more calls, so
@@ -1673,9 +1717,16 @@ async fn run_native_tool_loop(
     // no notes at all — silently, since nothing reports notes it never tried to make.
     let mut steps: Vec<crate::trace::Step> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
-    let max_steps = max_tool_steps();
+    let max_steps = max_tool_steps_for(role);
     let mut reminded = false;
     for step in 0..max_steps {
+        // Stop gathering while the answer still fits the model's context: several
+        // reads per step can outgrow it -- a CAE research conversation passed the
+        // 27B's 32K tokens, hipfire refused the prefill, and the request was shed
+        // with a 500. Past the budget the loop goes straight to the final answer.
+        if step > 0 && over_context_budget(&prompt, &turns) {
+            break;
+        }
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
         // tool call that is half-applied is worse than a turn that runs long, and
         // there is no way to un-run one. Reported, not silent: a truncated answer
@@ -1719,7 +1770,7 @@ async fn run_native_tool_loop(
         } else {
             server_calls
         };
-        let Some(call) = calls.first() else {
+        if calls.is_empty() {
             // A first reply with no call gets ONE reminder before it counts as the
             // answer: a CAE coder pasted its whole 14 KB deliverable as prose, ran
             // into the output cap, and the toolless reply sent the task to the Needle
@@ -1748,51 +1799,66 @@ async fn run_native_tool_loop(
             } else {
                 NativeOutcome::Answered(text)
             });
-        };
-        calls_made += 1;
-        if let Some(p) = crate::tools::arg_str(call, "path") {
-            if !touched.iter().any(|t| t == p) {
-                touched.push(p.to_string());
-            }
         }
-        let observation = gate_and_execute(
-            call, &toolbox, approvals, events, id, written, seen, read_only,
-        )
-        .await;
-        steps.push(crate::trace::Step {
-            said: text.clone(),
-            intent: Some(crate::tools::describe(call)),
-            tool: Some(call.name.clone()),
-            observation: Some(observation.clone()),
-        });
+        // Run EVERY call of the step (up to MAX_CALLS_PER_STEP), not just the first.
+        // A step is a full generation -- prefill plus decode, tens of seconds -- while a
+        // tool call is milliseconds; research reading 15 crates one file per step
+        // spent 16 generations on what parallel calls do in a few. Sequential is
+        // enough: the generation, not the call, is the cost.
+        let batch = &calls[..calls.len().min(MAX_CALLS_PER_STEP)];
+        let mut observations = Vec::with_capacity(batch.len());
+        for call in batch {
+            calls_made += 1;
+            if let Some(p) = crate::tools::arg_str(call, "path") {
+                if !touched.iter().any(|t| t == p) {
+                    touched.push(p.to_string());
+                }
+            }
+            let observation = gate_and_execute(
+                call, &toolbox, approvals, events, id, written, seen, read_only,
+            )
+            .await;
+            steps.push(crate::trace::Step {
+                said: text.clone(),
+                intent: Some(crate::tools::describe(call)),
+                tool: Some(call.name.clone()),
+                observation: Some(observation.clone()),
+            });
+            observations.push(observation);
+        }
         // Warn while there is still room to act on it: a CAE writer spent its whole
         // budget re-reading files and ended on "Let me write the document" with no
         // call left to write it. Rides the newest tool result (not a new turn), so
         // the prompt still extends the last step's checkpoint.
         let left = max_steps - step - 1;
-        let observation = if left == STEPS_LEFT_WARNING {
-            format!("{observation}\n\n{}", steps_left_note(left))
-        } else {
-            observation
-        };
-        // Only the call that ran is replayed, so every call in the history has its
+        if left == STEPS_LEFT_WARNING {
+            if let Some(last) = observations.last_mut() {
+                *last = format!("{last}\n\n{}", steps_left_note(left));
+            }
+        }
+        // Only the calls that ran are replayed, so every call in the history has its
         // result — a model shown a call with no output would wait on it or redo it.
-        let call_id = format!("call_{id}_{step}");
+        // Calls first, then outputs: hipfire folds consecutive calls into the one
+        // assistant turn the model emitted them in, outputs into consecutive tool turns.
         if !text.trim().is_empty() {
             turns
                 .push(serde_json::json!({"type": "message", "role": "assistant", "content": text}));
         }
-        turns.push(serde_json::json!({
-            "type": "function_call",
-            "call_id": call_id,
-            "name": call.name,
-            "arguments": call.arguments.to_string(),
-        }));
-        turns.push(serde_json::json!({
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": observation,
-        }));
+        for (k, call) in batch.iter().enumerate() {
+            turns.push(serde_json::json!({
+                "type": "function_call",
+                "call_id": format!("call_{id}_{step}_{k}"),
+                "name": call.name,
+                "arguments": call.arguments.to_string(),
+            }));
+        }
+        for (k, observation) in observations.into_iter().enumerate() {
+            turns.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": format!("call_{id}_{step}_{k}"),
+                "output": observation,
+            }));
+        }
     }
     record_trace(&toolbox, id, task, &steps, &touched);
     // Step budget spent. Calls were made to spend it, so what follows is an answer —
@@ -1808,7 +1874,7 @@ async fn run_native_tool_loop(
             last["output"] = serde_json::json!(format!("{out}\n\n{FINAL_ANSWER_NUDGE}"));
         }
     }
-    let (text, _reasoning, _calls) = client
+    let (mut text, _reasoning, calls) = client
         .respond_turns(
             model,
             &prompt,
@@ -1825,6 +1891,66 @@ async fn run_native_tool_loop(
             text: text.clone(),
         })
         .await;
+    // A reply that still calls tools is not an answer: a CAE research task asked
+    // for "one more" read on its final call, and its report became the preamble in
+    // front of the call ("Let me start by reading..."). Give it the one step it
+    // asked for, then ask again. (hipfire has no tool_choice "none"; dropping the
+    // tools would change the system turn and re-prefill the whole conversation.)
+    if !calls.is_empty() && !over_context_budget(&prompt, &turns) {
+        let batch = &calls[..calls.len().min(MAX_CALLS_PER_STEP)];
+        let mut observations = Vec::with_capacity(batch.len());
+        for call in batch {
+            observations.push(
+                gate_and_execute(call, &toolbox, approvals, events, id, written, seen, read_only)
+                    .await,
+            );
+        }
+        if !text.trim().is_empty() {
+            turns
+                .push(serde_json::json!({"type": "message", "role": "assistant", "content": text}));
+        }
+        for (k, call) in batch.iter().enumerate() {
+            turns.push(serde_json::json!({
+                "type": "function_call",
+                "call_id": format!("call_{id}_final_{k}"),
+                "name": call.name,
+                "arguments": call.arguments.to_string(),
+            }));
+        }
+        let n = observations.len();
+        for (k, observation) in observations.into_iter().enumerate() {
+            let output = if k + 1 == n {
+                format!("{observation}\n\n{FINAL_ANSWER_NUDGE}")
+            } else {
+                observation
+            };
+            turns.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": format!("call_{id}_final_{k}"),
+                "output": output,
+            }));
+        }
+        let (again, _reasoning, _calls) = client
+            .respond_turns(
+                model,
+                &prompt,
+                &turns,
+                band,
+                toolbox.owner_token(),
+                Some(&tools),
+                Some(&effort),
+            )
+            .await?;
+        let _ = events
+            .send(AgentEvent::SubagentOutput {
+                id,
+                text: again.clone(),
+            })
+            .await;
+        if !again.trim().is_empty() {
+            text = again;
+        }
+    }
     Ok(NativeOutcome::Answered(if text.trim().is_empty() {
         last
     } else {
@@ -1876,7 +2002,7 @@ async fn run_tool_loop(
     // content without re-reading the model's prose.
     let mut called: Option<String> = None;
     let mut last = String::new();
-    for _ in 0..max_tool_steps() {
+    for _ in 0..max_tool_steps_for(role) {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
         // tool call that is half-applied is worse than a turn that runs long, and
         // there is no way to un-run one. Reported, not silent: a truncated answer
@@ -2421,6 +2547,17 @@ async fn emit_followups(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_budget_trips_before_the_model_context_is_full() {
+        // Default 32768-token context, 4096 reserved: ~85 KB of prompt + turns.
+        let prompt = "x".repeat(30_000);
+        let read = serde_json::json!({"type": "function_call_output", "call_id": "c", "output": "y".repeat(4096)});
+        let few: Vec<_> = std::iter::repeat(read.clone()).take(5).collect();
+        let many: Vec<_> = std::iter::repeat(read).take(40).collect();
+        assert!(!super::over_context_budget(&prompt, &few), "5 reads fit");
+        assert!(super::over_context_budget(&prompt, &many), "40 reads (~160 KB) do not");
+    }
+
     use super::*;
     use crate::hipfire::Client;
     use crate::project::GlobalSkills;

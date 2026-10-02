@@ -67,7 +67,8 @@ pub fn native_tool_prompt(context_prefix: &str, role: Role, task: &str) -> Strin
     format!(
         "{context_prefix}\n\n[role: {}]\n{task}\n\n\
 You have tools available. Call one when you need it — you will get the result and can \
-continue. Never guess a file's contents: read it first. When you have enough to answer, \
+continue. Independent calls can go in one step: to read several files, call read_file for \
+each of them at once rather than one per reply. Never guess a file's contents: read it first. When you have enough to answer, \
 reply with your final answer and no tool call. Optionally end with:\n\
 NEXT: <one plain-English follow-up task>",
         role.as_str()
