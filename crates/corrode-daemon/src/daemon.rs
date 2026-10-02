@@ -1351,6 +1351,25 @@ fn steps_left_note(left: usize) -> String {
     )
 }
 
+/// A research task's step budget: `CORRODE_RESEARCH_TOOL_STEPS` (default 8), never
+/// above [`max_tool_steps`]. Research only reads, and with several calls per step (a
+/// CAE research step averaged ~5 reads) 8 steps cover what 16 single-call steps did;
+/// given 16 it simply read twice as much -- 107K prompt tokens of file contents for
+/// three tasks, the prefill that dominated the turn. Other roles keep the full budget
+/// (a coder's edits are sequential).
+fn max_tool_steps_for(role: Role) -> usize {
+    let all = max_tool_steps();
+    if role != Role::Research {
+        return all;
+    }
+    std::env::var("CORRODE_RESEARCH_TOOL_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(8)
+        .min(all)
+}
+
 /// Appended when a task spends its step budget: one more generation that asks for no more calls, so
 /// the task ends on an answer rather than on whatever it said before its last call
 /// (usually nothing — a model calling a tool rarely writes prose with it).
@@ -1677,7 +1696,7 @@ async fn run_native_tool_loop(
     // no notes at all — silently, since nothing reports notes it never tried to make.
     let mut steps: Vec<crate::trace::Step> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
-    let max_steps = max_tool_steps();
+    let max_steps = max_tool_steps_for(role);
     let mut reminded = false;
     for step in 0..max_steps {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
@@ -1895,7 +1914,7 @@ async fn run_tool_loop(
     // content without re-reading the model's prose.
     let mut called: Option<String> = None;
     let mut last = String::new();
-    for _ in 0..max_tool_steps() {
+    for _ in 0..max_tool_steps_for(role) {
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
         // tool call that is half-applied is worse than a turn that runs long, and
         // there is no way to un-run one. Reported, not silent: a truncated answer
