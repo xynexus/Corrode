@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use corrode_core::FileNodeView;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Async because the real backing store is I/O: the graph-backed impl hits
 /// HelixDB/LMDB and hipfire, and a FUSE mount awaits these handlers per syscall.
@@ -72,12 +72,62 @@ impl PassthroughVfs {
     }
 }
 
+/// The real path of `full` must stay under the real `root`. `resolve` rejects `..` only
+/// lexically, while the I/O here runs in the daemon -- outside any sandbox -- and
+/// follows symlinks: a link planted in the repo (by a sandboxed `ln -s ~/.bashrc x`, or
+/// committed) made write_file and read_file reach outside it. The deepest existing part
+/// of the path is checked, so a file about to be created is covered by its parent, and
+/// a dangling link is refused (writing through it would create its outside target).
+/// ponytail: check-then-open, not openat2(RESOLVE_BENEATH): a process racing to swap a
+/// directory for a link between the check and the open can still escape.
+fn confine(root: &Path, full: &Path) -> anyhow::Result<()> {
+    if real_path(full)?.starts_with(real_path(root)?) {
+        Ok(())
+    } else {
+        anyhow::bail!("path leaves the repository: {}", full.display())
+    }
+}
+
+/// `p` with every existing part resolved (symlinks followed) and the part that does
+/// not exist yet appended as written. A dangling link is an error.
+fn real_path(p: &Path) -> anyhow::Result<PathBuf> {
+    let mut probe = p;
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        match std::fs::canonicalize(probe) {
+            Ok(real) => return Ok(rest.iter().rev().fold(real, |acc, c| acc.join(c))),
+            Err(_) if std::fs::symlink_metadata(probe).is_ok() => {
+                anyhow::bail!("refusing a dangling symlink: {}", probe.display())
+            }
+            Err(_) => {
+                rest.extend(probe.file_name());
+                probe = match probe.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => parent,
+                    _ => Path::new("."),
+                };
+            }
+        }
+    }
+}
+
+/// Directories the tool layer may read but never write: `.git` (a written
+/// `core.hooksPath` or `fsmonitor` runs code at the human's next `git status`) and
+/// `.corrode` (the graph store and skills, which the sandbox mounts read-only).
+fn write_protected(path: &str) -> bool {
+    matches!(
+        path.trim_start_matches('/').split('/').next(),
+        Some(".git" | ".corrode")
+    )
+}
+
 #[async_trait]
 impl Vfs for PassthroughVfs {
     async fn list(&self, dir: &str) -> anyhow::Result<Vec<FileNodeView>> {
         let base = self.resolve(dir)?; // pure path check, no I/O — stays on the async side
         let dir = dir.to_string();
+        let root = self.root.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<FileNodeView>> {
+            confine(&root, &base)?;
             let mut entries = Vec::new();
             for entry in std::fs::read_dir(&base)? {
                 let entry = entry?;
@@ -111,7 +161,9 @@ impl Vfs for PassthroughVfs {
     async fn stat(&self, path: &str) -> anyhow::Result<FileNodeView> {
         let full = self.resolve(path)?;
         let path = path.to_string();
+        let root = self.root.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<FileNodeView> {
+            confine(&root, &full)?;
             let meta = std::fs::metadata(&full)?;
             Ok(FileNodeView {
                 path,
@@ -126,8 +178,12 @@ impl Vfs for PassthroughVfs {
 
     async fn read(&self, path: &str) -> anyhow::Result<Vec<u8>> {
         let full = self.resolve(path)?;
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> { Ok(std::fs::read(full)?) })
-            .await?
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+            confine(&root, &full)?;
+            Ok(std::fs::read(full)?)
+        })
+        .await?
     }
 
     /// `git ls-files` restricted to regular blobs.
@@ -173,9 +229,14 @@ impl Vfs for PassthroughVfs {
     }
 
     async fn write(&self, path: &str, contents: &[u8]) -> anyhow::Result<()> {
+        if write_protected(path) {
+            anyhow::bail!("refusing to write inside .git or .corrode: {path}");
+        }
         let full = self.resolve(path)?;
         let contents = contents.to_vec();
+        let root = self.root.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            confine(&root, &full)?;
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -189,6 +250,41 @@ impl Vfs for PassthroughVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Links planted in the repo must not carry reads or writes out of it: an existing
+    // outside target, a dangling one (the write would create it), and a linked
+    // directory. Writes into .git and .corrode are refused outright.
+    #[tokio::test]
+    async fn symlinks_cannot_carry_io_out_of_the_repo() {
+        let base = std::env::temp_dir().join(format!("corrode-confine-{}", std::process::id()));
+        let (root, outside) = (base.join("repo"), base.join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "s3cret").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), root.join("leak")).unwrap();
+        std::os::unix::fs::symlink(outside.join("new"), root.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("dir")).unwrap();
+        std::fs::write(root.join("inside.txt"), "ok").unwrap();
+        std::os::unix::fs::symlink(root.join("inside.txt"), root.join("alias")).unwrap();
+        let vfs = PassthroughVfs::new(&root);
+
+        assert!(vfs.read("leak").await.is_err(), "read through a link to outside");
+        assert!(vfs.write("leak", b"x").await.is_err(), "write through a link to outside");
+        assert_eq!(std::fs::read_to_string(outside.join("secret")).unwrap(), "s3cret");
+        assert!(vfs.write("dangling", b"x").await.is_err());
+        assert!(!outside.join("new").exists(), "a dangling link must not create its target");
+        assert!(vfs.write("dir/planted", b"x").await.is_err());
+        assert!(!outside.join("planted").exists());
+        assert!(vfs.list("dir").await.is_err());
+        assert!(vfs.write(".git/config", b"x").await.is_err());
+        assert!(vfs.write(".corrode/skills/x/SKILL.md", b"x").await.is_err());
+
+        // Inside the repo everything still works, links included.
+        assert_eq!(vfs.read("alias").await.unwrap(), b"ok");
+        vfs.write("new/deep/file.txt", b"made").await.unwrap();
+        assert_eq!(vfs.read("new/deep/file.txt").await.unwrap(), b"made");
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[tokio::test]
     async fn passthrough_write_list_stat_read_roundtrip_and_rejects_escape() {
@@ -219,7 +315,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("corrode-vfs-prune-{}", std::process::id()));
         let vfs = PassthroughVfs::new(&root);
         vfs.write("src/main.rs", b"fn main() {}").await.unwrap();
-        vfs.write(".git/HEAD", b"ref: x").await.unwrap();
+        // The tool layer may not write .git, so the fixture writes it directly.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), b"ref: x").unwrap();
         vfs.write("target/debug/x", b"blob").await.unwrap();
         let names: Vec<String> = vfs.list("").await.unwrap().into_iter().map(|e| e.path).collect();
         assert!(names.contains(&"src".to_string()), "source kept: {names:?}");
