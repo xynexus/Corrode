@@ -83,29 +83,34 @@ fn allowed_repo(path: &str) -> anyhow::Result<PathBuf> {
 /// daemon, plus (optionally) a per-user hipfire bearer for fairness attribution.
 /// JSON: `{"alice": {"token": "…", "hipfire_token": "…"}}` (hipfire_token optional).
 #[derive(serde::Deserialize, Clone)]
-struct UserEntry {
+pub(crate) struct UserEntry {
     token: String,
     #[serde(default)]
     hipfire_token: Option<String>,
 }
 
-/// Load the auth table from `CORRODE_USERS` (a JSON file path). Absent or
-/// unreadable => `None` (auth off, connections anonymous).
+/// Read and parse the `CORRODE_USERS` table at `path`. Shared with `doctor`, so it
+/// checks the schema the daemon actually reads.
+pub(crate) fn parse_users(path: &str) -> anyhow::Result<HashMap<String, UserEntry>> {
+    let data = std::fs::read_to_string(path)?;
+    let users: HashMap<String, UserEntry> = serde_json::from_str(&data)?;
+    anyhow::ensure!(!users.is_empty(), "the table has no users");
+    Ok(users)
+}
+
+/// The auth table from `CORRODE_USERS`. Absent => `None` (auth off, anonymous).
+/// Set => auth is ON: a table that cannot be read or parsed, or is empty, leaves it
+/// on with nobody able to authenticate. It used to turn auth off -- a typo in the
+/// file opened the daemon to anyone who could reach it.
 fn load_users() -> Option<HashMap<String, UserEntry>> {
     let path = std::env::var("CORRODE_USERS").ok()?;
-    match std::fs::read_to_string(&path) {
-        Ok(data) => match serde_json::from_str(&data) {
-            Ok(map) => Some(map),
-            Err(e) => {
-                eprintln!("CORRODE_USERS parse failed ({e}); auth disabled");
-                None
-            }
-        },
-        Err(e) => {
-            eprintln!("CORRODE_USERS read failed at {path} ({e}); auth disabled");
-            None
-        }
-    }
+    Some(parse_users(&path).unwrap_or_else(|e| {
+        eprintln!(
+            "CORRODE_USERS at {path} is unusable ({e}); auth stays ON and no connection \
+             can authenticate until it is fixed (`corrode-daemon doctor` checks it)"
+        );
+        HashMap::new()
+    }))
 }
 /// Cap on the README digest folded into the shared prefix. Generous on purpose: this
 /// is prefix content, prefilled once per model and reused across the turn's fan-out
@@ -212,16 +217,17 @@ impl Daemon {
         }
     }
 
-    /// Whether a user table is configured (auth on). Empty table = off.
+    /// Whether auth is on: `CORRODE_USERS` is set, whether or not its table is usable.
     fn auth_on(&self) -> bool {
-        self.users.as_ref().is_some_and(|u| !u.is_empty())
+        self.users.is_some()
     }
 
-    /// Validate a user/token. Auth off => always accepts.
+    /// Validate a user/token. Auth off => always accepts; an unusable table accepts
+    /// nobody.
     fn authenticate(&self, user: &str, token: &str) -> bool {
         match &self.users {
-            Some(map) if !map.is_empty() => map.get(user).is_some_and(|e| e.token == token),
-            _ => true,
+            Some(map) => map.get(user).is_some_and(|e| e.token == token),
+            None => true,
         }
     }
 
@@ -855,17 +861,53 @@ impl Daemon {
             model: orch_model,
             owner_token: session.owner_token.clone(),
         };
-        let plan_text = self
+        let plan_prompt = plan_task.prompt.clone();
+        let first = self
             .swarm
             .run(vec![plan_task])
             .next()
             .await
             .map(|(_, r)| r)
-            .transpose()?
-            .unwrap_or_default();
+            .transpose();
+        // A planner cut off mid-thought returned its raw reasoning as the plan. Retry
+        // once with a bounded thinking budget ("medium": still thinking, which
+        // planning needs, but within the output cap) before giving up on structure.
+        let plan_text = match first {
+            Ok(t) => t.unwrap_or_default(),
+            Err(e) => match e.downcast::<crate::hipfire::Truncated>() {
+                Ok(t) => {
+                    eprintln!("planner: {t}; retrying with reasoning effort medium");
+                    let model = self.roles.model_for(Role::Orchestration).unwrap_or_default();
+                    match self
+                        .swarm
+                        .client()
+                        .respond_full(
+                            model,
+                            &plan_prompt,
+                            priority,
+                            session.owner_token.as_deref(),
+                            None,
+                            Some("medium"),
+                        )
+                        .await
+                    {
+                        Ok((text, _, _)) => text,
+                        Err(e) => {
+                            eprintln!("planner: retry failed too: {e}");
+                            String::new()
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            },
+        };
 
         let mut plan = planner::parse_plan(&plan_text);
         if plan.is_empty() {
+            eprintln!(
+                "planner: no usable plan in {} bytes; falling back to one coder task",
+                plan_text.len()
+            );
             // Degrade to one coder task on the raw prompt (still behind the shared
             // prefix) so a plan the model couldn't structure still gets attempted
             // rather than dropped.
@@ -1379,9 +1421,14 @@ const NO_CALL_REMINDER: &str = "You replied without calling a tool. Changes to t
 through tool calls: to create or change a file, call write_file with its full contents -- do not paste \
 file contents as your reply. If the task truly needs no tool, repeat your final answer.";
 
+const TRUNCATED_NOTE: &str = "Your last reply hit the output limit and was cut off, so none of it was \
+used -- not its text, not any tool call in it. Make this reply shorter: answer more concisely, or if you \
+were writing a large file, write it in smaller pieces (several smaller files, or one write_file followed \
+by appending the rest with run_command if you have it).";
+
 /// `CORRODE_CONTEXT_TOKENS`: the serving model's context (default 32768, the
 /// swarm models' hipfire max_seq). The tool loop stops gathering once the
-/// conversation leaves less than [`ANSWER_RESERVE_TOKENS`] of it.
+/// conversation leaves less than one output cap of it.
 fn context_tokens() -> usize {
     std::env::var("CORRODE_CONTEXT_TOKENS")
         .ok()
@@ -1389,15 +1436,15 @@ fn context_tokens() -> usize {
         .unwrap_or(32768)
 }
 
-/// Tokens kept free for the final answer.
-const ANSWER_RESERVE_TOKENS: usize = 4096;
 
 /// Whether `prompt` plus the replayed `turns` is too close to the context to take
 /// another tool step. Estimated, not tokenized: 3 bytes per token is conservative
 /// for code and markdown (Qwen's tokenizer averages ~3.5-4 on this repo).
 fn over_context_budget(prompt: &str, turns: &[serde_json::Value]) -> bool {
     let bytes = prompt.len() + turns.iter().map(|t| t.to_string().len()).sum::<usize>();
-    bytes / 3 + ANSWER_RESERVE_TOKENS > context_tokens()
+    // Keep a whole output cap free: hipfire clamps a reply to the KV capacity left, so
+    // a 4096-token reserve under an 8192-token cap cut long final answers short.
+    bytes / 3 + crate::hipfire::max_output_tokens() as usize > context_tokens()
 }
 
 /// Tool calls one step may run. A step is one generation; the model may emit several
@@ -1532,6 +1579,9 @@ fn plan_review_enabled() -> bool {
 struct SeenCalls {
     seen: std::collections::HashMap<String, String>,
     log: Vec<String>,
+    /// Bumped by every invalidation, so a read that was running when a sibling's
+    /// mutation landed is not cached: its result may predate the change.
+    gen: u64,
 }
 
 impl SeenCalls {
@@ -1566,17 +1616,21 @@ impl SeenCalls {
         })
     }
 
-    /// Record a call's observation. A mutating call that actually ran (`wrote …` /
-    /// `exit 0:`) invalidates everything first — including the advertised log, which
-    /// would otherwise sell stale knowledge; failed or denied ones stay recorded so
-    /// their repeats are suppressed too.
+    /// Forget everything: a mutating call ran, so any cached read -- and the advertised
+    /// log, which would otherwise sell stale knowledge -- may describe a tree that no
+    /// longer exists. Keyed on the call having RUN, not on what it printed: matching
+    /// `exit 0:` missed the digest's `exit 0 — test run` and every command that changed
+    /// files and then failed, and a coder told "unchanged, do not repeat" rewrote a
+    /// file from stale text.
+    fn invalidate(&mut self) {
+        self.seen.clear();
+        self.log.clear();
+        self.gen += 1;
+    }
+
+    /// Record a call's observation, so its exact repeat is suppressed (denied and
+    /// failed calls included).
     fn record(&mut self, call: &crate::toolcall::ToolCall, observation: &str) {
-        if crate::tools::is_mutating(call)
-            && (observation.starts_with("wrote") || observation.starts_with("exit 0:"))
-        {
-            self.seen.clear();
-            self.log.clear();
-        }
         let first = observation.lines().next().unwrap_or("");
         let end = crate::tools::floor_char_boundary(first, LOG_LINE_CAP);
         self.log.push(format!(
@@ -1630,6 +1684,7 @@ async fn gate_and_execute(
     written: &mut Vec<String>,
     seen: &std::sync::Mutex<SeenCalls>,
     read_only: bool,
+    role: Role,
 ) -> String {
     // The map is turn-shared across concurrent tasks: lock only around map ops,
     // never across an await (the approval gate can block for minutes). Two tasks
@@ -1640,7 +1695,21 @@ async fn gate_and_execute(
     // `contents` spends their attention on a call that was always going to be rejected,
     // and `describe` renders it as a plausible-looking write.
     let missing = crate::tools::missing_required(call);
-    let observation = if let Some(prior) = prior {
+    // Each role's tool set is enforced HERE, not only by what its request declares:
+    // the declaration is a hard constraint only where hipfire builds a grammar for the
+    // model (MiniCPM), and a Qwen review or architect task did emit run_command and
+    // write_file. Refused before the repeat lookup and the approval gate, so nobody is
+    // asked to approve a call the role may not make.
+    let allowed = crate::tools::role_tools(role);
+    let observation = if !allowed.iter().any(|t| t.name == call.name) {
+        let names: Vec<&str> = allowed.iter().map(|t| t.name).collect();
+        format!(
+            "error: `{}` is not available to a {role:?} task; its tools are {}. Use one of \
+             those, or say in your answer what should be done.",
+            call.name,
+            names.join(", ")
+        )
+    } else if let Some(prior) = prior {
         prior
     } else if !missing.is_empty() {
         let refused = crate::tools::missing_required_error(call, &missing);
@@ -1664,13 +1733,23 @@ async fn gate_and_execute(
         seen.lock().unwrap().record(call, &denied);
         denied
     } else {
+        let gen = seen.lock().unwrap().gen;
         let observation = toolbox.execute(call).await;
         if call.name == "write_file" && observation.starts_with("wrote") {
             if let Some(path) = call.arguments.get("path").and_then(|p| p.as_str()) {
                 written.push(path.to_string());
             }
         }
-        seen.lock().unwrap().record(call, &observation);
+        let mut s = seen.lock().unwrap();
+        if crate::tools::is_mutating(call) {
+            s.invalidate();
+            s.record(call, &observation);
+        } else if s.gen == gen {
+            s.record(call, &observation);
+        }
+        // else: a sibling's mutation ran while this read did; its result may predate
+        // the change, so it is not cached.
+        drop(s);
         observation
     };
     let mut shown = observation.clone();
@@ -1783,7 +1862,7 @@ async fn run_native_tool_loop(
                 "{last}\n[stopped: turn budget reached]"
             )));
         }
-        let (text, _reasoning, server_calls) = client
+        let reply = client
             .respond_turns(
                 model,
                 &prompt,
@@ -1793,7 +1872,26 @@ async fn run_native_tool_loop(
                 Some(&tools),
                 Some(&effort),
             )
-            .await?;
+            .await;
+        let (text, _reasoning, server_calls) = match reply {
+            Ok(r) => r,
+            // Cut off at the output limit: neither an answer nor a usable call (a
+            // write_file cut off mid-`contents` is no call at all). Say so, spend the
+            // step, and ask for less. The partial is not replayed -- it is up to a
+            // full output cap of tokens the next step would carry for nothing.
+            Err(e) => match e.downcast::<crate::hipfire::Truncated>() {
+                Ok(t) => {
+                    let _ = events
+                        .send(AgentEvent::Error {
+                            message: format!("task {id}: {t}; asked for a shorter reply"),
+                        })
+                        .await;
+                    turns.push(serde_json::json!({"type": "message", "role": "user", "content": TRUNCATED_NOTE}));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            },
+        };
         let _ = events
             .send(AgentEvent::SubagentOutput {
                 id,
@@ -1857,7 +1955,7 @@ async fn run_native_tool_loop(
                 }
             }
             let observation = gate_and_execute(
-                call, &toolbox, approvals, events, id, written, seen, read_only,
+                call, &toolbox, approvals, events, id, written, seen, read_only, role,
             )
             .await;
             steps.push(crate::trace::Step {
@@ -1943,8 +2041,10 @@ async fn run_native_tool_loop(
         let mut observations = Vec::with_capacity(batch.len());
         for call in batch {
             observations.push(
-                gate_and_execute(call, &toolbox, approvals, events, id, written, seen, read_only)
-                    .await,
+                gate_and_execute(
+                    call, &toolbox, approvals, events, id, written, seen, read_only, role,
+                )
+                .await,
             );
         }
         if !text.trim().is_empty() {
@@ -2097,8 +2197,10 @@ async fn run_tool_loop(
                             touched.push(p.to_string());
                         }
                     }
-                    gate_and_execute(c, &toolbox, approvals, events, id, written, seen, read_only)
-                        .await
+                    gate_and_execute(
+                        c, &toolbox, approvals, events, id, written, seen, read_only, role,
+                    )
+                    .await
                 }
                 None => "error: no tool call produced".to_string(),
             },
@@ -2694,6 +2796,76 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // A CORRODE_USERS table that cannot be used keeps auth ON and admits nobody. It
+    // used to turn auth off, so a typo in the file opened the daemon to anyone.
+    #[tokio::test]
+    async fn an_unusable_user_table_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("corrode-users-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        assert!(parse_users(&file("bad.json", "{not json")).is_err());
+        assert!(parse_users(&file("empty.json", "{}")).is_err(), "no users is unusable");
+        assert!(parse_users(&file("notoken.json", r#"{"a": {}}"#)).is_err(), "token is required");
+        assert!(parse_users(&dir.join("missing.json").to_string_lossy()).is_err());
+        let good = parse_users(&file("ok.json", r#"{"alice": {"token": "t"}}"#)).unwrap();
+        assert_eq!(good.len(), 1);
+
+        let mut d = test_daemon();
+        d.users = Some(HashMap::new()); // what load_users yields for an unusable table
+        assert!(d.auth_on(), "auth stays on");
+        assert!(!d.authenticate("alice", "t"), "nobody authenticates");
+        d.users = Some(good);
+        assert!(d.authenticate("alice", "t"));
+        assert!(!d.authenticate("alice", "wrong"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A role's tool set holds whatever the model emits: a review task's run_command
+    // and a research task's write_file are refused before any approval prompt and
+    // never run, while their own tools still work.
+    #[tokio::test]
+    async fn out_of_role_calls_are_refused_before_approval() {
+        let dir = std::env::temp_dir().join(format!("corrode-role-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "keep").unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let (tx, mut rx) = mpsc::channel(16);
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let call = |name: &str, args: serde_json::Value| crate::toolcall::ToolCall {
+            name: name.to_string(),
+            arguments: args,
+        };
+        let approvals = ApprovalGate::default(); // nobody answers: an approval would hang
+        let run = call("run_command", serde_json::json!({"command": "rm a.txt"}));
+        let obs = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            gate_and_execute(&run, &toolbox, &approvals, &tx, 1, &mut written, &seen, false, Role::Review),
+        )
+        .await
+        .expect("refused without asking");
+        assert!(obs.contains("not available to a Review task"), "{obs}");
+        let write = call("write_file", serde_json::json!({"path": "a.txt", "contents": "x"}));
+        let obs = gate_and_execute(&write, &toolbox, &approvals, &tx, 1, &mut written, &seen, false, Role::Research).await;
+        assert!(obs.starts_with("error:"), "{obs}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "keep", "nothing ran");
+        while let Ok(ev) = rx.try_recv() {
+            assert!(!matches!(ev, AgentEvent::ApprovalRequest { .. }), "no approval was asked for");
+        }
+        let read = call("read_file", serde_json::json!({"path": "a.txt"}));
+        let obs = gate_and_execute(&read, &toolbox, &approvals, &tx, 1, &mut written, &seen, false, Role::Research).await;
+        assert!(obs.contains("keep"), "in-role calls still run: {obs}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // A client-chosen repo stays inside the home directory (never home itself) and,
     // when CORRODE_REPO_ALLOW is set, inside one of its entries. Env-dependent, so it
     // is one test (tests in a binary share the process environment).
@@ -2935,6 +3107,84 @@ mod tests {
         }
     }
 
+    // A reply hipfire cut off at the output limit (`status: "incomplete"`) used to be
+    // taken as the answer -- a coder's write_file cut off mid-`contents` ended its task
+    // Done with nothing written. Now the loop reports it, tells the model, and the
+    // half reply never becomes the task's output.
+    #[tokio::test]
+    async fn a_reply_cut_off_at_the_output_limit_is_never_the_answer() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let saw_note = Arc::new(AtomicUsize::new(0));
+        let (c, n) = (calls.clone(), saw_note.clone());
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Json<serde_json::Value>| {
+                let (c, n) = (c.clone(), n.clone());
+                async move {
+                    if body.0["input"].to_string().contains("hit the output limit") {
+                        n.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Json(if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                        serde_json::json!({
+                            "status": "incomplete",
+                            "incomplete_details": {"reason": "max_output_tokens"},
+                            "output_text": "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.md\", \"contents\": \"HALF",
+                            "output": [],
+                        })
+                    } else {
+                        serde_json::json!({"status": "completed", "output_text": "short answer", "output": []})
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = Client::new(format!("http://{addr}"), None);
+        let repo = std::path::PathBuf::from(".");
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&repo)),
+            repo,
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let (etx, mut erx) = mpsc::channel(64);
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let out = run_task(
+            &client,
+            "Qwen3.5-9B--oq4.25++",
+            Priority::Default,
+            &Dialects::default(),
+            None,
+            toolbox,
+            &ApprovalGate::default(),
+            "prefix",
+            Role::Research,
+            "summarize src/lib.rs",
+            &etx,
+            7,
+            &mut written,
+            true,
+            &seen,
+            None,
+        )
+        .await
+        .expect("the task recovers");
+        assert!(!out.contains("HALF"), "the cut-off reply became the answer: {out}");
+        assert!(out.contains("short answer"), "{out}");
+        assert_eq!(saw_note.load(Ordering::SeqCst), 1, "the model was told it was cut off");
+        let mut reported = false;
+        while let Ok(ev) = erx.try_recv() {
+            if let AgentEvent::Error { message } = ev {
+                reported |= message.contains("cut off");
+            }
+        }
+        assert!(reported, "the truncation is reported, not silent");
+    }
+
     // The void failure, made deterministic: a model routed native that answers without
     // ever emitting a call. A fake hipfire returns prose carrying `<tool_call>` markup
     // nothing can parse — the shape CLAUDE.md records for the 35B. `run_task` must not
@@ -3083,6 +3333,7 @@ mod tests {
             &mut written,
             &seen,
             false,
+            Role::Coder,
         )
         .await;
         assert!(out.contains("missing required argument"), "{out}");
@@ -3136,23 +3387,57 @@ mod tests {
         seen.record(&a, "denied: write_file a.rs was not approved");
         assert!(seen.repeat(&b).is_some(), "reordered args must collide");
 
-        // A failing mutating call does NOT invalidate — its repeat stays suppressed.
+        // Invalidation clears every cached result; the call that caused it is
+        // recorded after, so its own repeat stays suppressed (gate_and_execute).
         let bad = call("run_command", serde_json::json!({"command": "carg test"}));
+        seen.invalidate();
         seen.record(&bad, "exit 127:\ncarg: command not found");
-        assert!(seen.repeat(&bad).is_some());
-        assert!(
-            seen.repeat(&read).is_some(),
-            "reads survive a failed command"
-        );
+        assert!(seen.repeat(&bad).is_some(), "a failing command's retry stays dead");
+        assert!(seen.repeat(&read).is_none(), "the re-read runs for real");
+    }
 
-        // A successful mutating call clears everything: the re-read runs for real.
-        seen.record(&a, "wrote 1 bytes to a.rs");
-        assert!(
-            seen.repeat(&read).is_none(),
-            "read after write must not be suppressed"
+    // Any mutating call that RAN invalidates the cache, whatever it printed. A passing
+    // test run digests to `exit 0 — test run`, which the old `exit 0:` match missed:
+    // the file this command rewrote was then served from the cache, stale.
+    #[tokio::test]
+    async fn a_command_that_ran_invalidates_cached_reads_whatever_it_printed() {
+        let dir = std::env::temp_dir().join(format!("corrode-seen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(std::collections::HashMap::new()),
         );
-        assert!(seen.repeat(&bad).is_none());
-        assert!(seen.repeat(&a).is_some(), "the write itself stays recorded");
+        let approvals = Arc::new(ApprovalGate::default());
+        let (etx, mut erx) = mpsc::channel(16);
+        let g = approvals.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = erx.recv().await {
+                if let AgentEvent::ApprovalRequest { id, .. } = ev {
+                    g.resolve(id, true);
+                }
+            }
+        });
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let call = |name: &str, args: serde_json::Value| crate::toolcall::ToolCall {
+            name: name.to_string(),
+            arguments: args,
+        };
+        let read = call("read_file", serde_json::json!({"path": "a.txt"}));
+        let first = gate_and_execute(&read, &toolbox, &approvals, &etx, 1, &mut written, &seen, false, Role::Coder).await;
+        assert!(first.contains("one"), "{first}");
+        let cmd = call(
+            "run_command",
+            serde_json::json!({"command": "printf two > a.txt; echo 'test result: ok. 1 passed; 0 failed'"}),
+        );
+        let ran = gate_and_execute(&cmd, &toolbox, &approvals, &etx, 1, &mut written, &seen, false, Role::Coder).await;
+        assert!(!ran.starts_with("exit 0:"), "the digest format this guards against: {ran}");
+        let again = gate_and_execute(&read, &toolbox, &approvals, &etx, 1, &mut written, &seen, false, Role::Coder).await;
+        assert!(again.contains("two"), "stale read served from the cache: {again}");
+        assert!(!again.starts_with("note:"), "{again}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // A read-only pass (a fan-out proposal attempt) neither executes a mutating call
@@ -3190,6 +3475,7 @@ mod tests {
                 &mut written,
                 &seen,
                 true,
+                Role::Coder,
             ),
         )
         .await
@@ -3225,6 +3511,7 @@ mod tests {
             &mut written,
             &seen,
             true,
+            Role::Coder,
         )
         .await;
         assert!(obs.contains("fn f() {}"), "got: {obs}");
@@ -3292,6 +3579,7 @@ mod tests {
             &mut written,
             &seen,
             false,
+            Role::Coder,
         )
         .await;
         assert!(a.contains("fn f() {}"));
@@ -3304,6 +3592,7 @@ mod tests {
             &mut written,
             &seen,
             false,
+            Role::Coder,
         )
         .await;
         assert!(
@@ -3333,9 +3622,11 @@ mod tests {
             name: "write_file".into(),
             arguments: serde_json::json!({"path": "lib.rs", "contents": "fn g() {}"}),
         };
-        seen.lock()
-            .unwrap()
-            .record(&write, "wrote 9 bytes to lib.rs");
+        {
+            let mut s = seen.lock().unwrap();
+            s.invalidate();
+            s.record(&write, "wrote 9 bytes to lib.rs");
+        }
         assert!(
             seen.lock().unwrap().repeat(&read).is_none(),
             "read re-executes after a write"
