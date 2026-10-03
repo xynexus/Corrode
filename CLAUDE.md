@@ -66,7 +66,10 @@ swarm over the bridge.
 
 Env: `HIPFIRE_BASE_URL` (default `http://127.0.0.1:11435`), `HIPFIRE_API_KEY`,
 `CORRODE_MODEL` (offline fallback model for all roles), `CORRODE_ROLES` (path to a
-JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`),
+JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`), `CORRODE_REPO_ALLOW` (`:`-separated directories a
+client's `SelectRepo` may bind under; every selected repo must also be an existing directory
+strictly inside the daemon user's `$HOME` -- entries outside it are ignored, and an unset list
+allows anything inside home; the operator's own `CORRODE_REPO` is exempt),
 `CORRODE_GRAPH_DIR` (HelixDB path under `--features helix`; default
 `<CORRODE_REPO>/.corrode/graph` — the store travels with the repo it describes),
 `CORRODE_NEEDLE_ASSETS` (Needle asset dir under `--features needle`; defaults to the
@@ -141,7 +144,7 @@ absent table = anonymous) and the bound `Session`. A `Session` is keyed by
 tenant only resolves its own approvals). It holds `Arc` clones of `RepoResources`
 (graph/vfs/skills), which are keyed by canonical repo path and shared across users
 on a repo — the LMDB store can't open twice. `SelectRepo` (get-or-create the
-session) binds a repo; the first repo-scoped command with no prior select lazily
+session, confined by `daemon::allowed_repo`) binds a repo; the first repo-scoped command with no prior select lazily
 binds `CORRODE_REPO`, preserving single-tenant behaviour. The `Swarm`, `RoleModels`,
 `ToolCaller`, `Dialects`, and `Sandbox` stay shared on `Daemon`. Dispatch: `Prompt`→
 swarm (spawned concurrently — long-lived, may block on approval), `SelectRepo`/
