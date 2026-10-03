@@ -80,24 +80,14 @@ pub async fn run() -> bool {
 
     // --- auth table ---
     match std::env::var("CORRODE_USERS") {
-        Ok(path) => match std::fs::read_to_string(&path) {
-            Ok(data) => match serde_json::from_str::<serde_json::Value>(&data) {
-                Ok(v) if v.is_object() => {
-                    ok(&format!("auth: on, {} user(s) configured", v.as_object().unwrap().len()))
-                }
-                _ => {
-                    fatal += 1;
-                    fail(
-                        &format!("CORRODE_USERS at {path} is not a JSON object"),
-                        "expected {\"alice\": {\"token\": \"…\", \"hipfire_token\": \"…\"}}",
-                    );
-                }
-            },
+        Ok(path) => match crate::daemon::parse_users(&path) {
+            Ok(users) => ok(&format!("auth: on, {} user(s) configured", users.len())),
             Err(e) => {
                 fatal += 1;
                 fail(
-                    &format!("CORRODE_USERS unreadable at {path}: {e}"),
-                    "the daemon degrades to ANONYMOUS (auth silently off) on this error",
+                    &format!("CORRODE_USERS at {path} is unusable: {e}"),
+                    "expected {\"alice\": {\"token\": \"…\", \"hipfire_token\": \"…\"}} with at \
+                     least one user; until it is fixed auth stays on and no connection can authenticate",
                 );
             }
         },

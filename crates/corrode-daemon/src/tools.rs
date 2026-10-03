@@ -366,12 +366,12 @@ impl ToolBox {
                 Some(query) => self.search_files(query, arg_str(call, "path")).await,
                 None => "error: search_files needs a `query` argument".to_string(),
             },
-            "write_file" => match (arg_str(call, "path"), arg_str(call, "contents")) {
-                (Some(path), Some(contents)) => self.write_file(path, contents).await,
+            "write_file" => match (arg_str(call, "path"), arg_text(call, "contents")) {
+                (Some(path), Some(contents)) => self.write_file(path, &contents).await,
                 _ => "error: write_file needs `path` and `contents` arguments".to_string(),
             },
-            "run_command" => match arg_str(call, "command") {
-                Some(command) => self.run_command(command).await,
+            "run_command" => match arg_text(call, "command") {
+                Some(command) => self.run_command(command.trim()).await,
                 None => "error: run_command needs a `command` argument".to_string(),
             },
             "run_skill_script" => match arg_str(call, "target") {
@@ -604,15 +604,9 @@ impl ToolBox {
     async fn run_command(&self, command: &str) -> String {
         // sandbox.wrap is a no-op when disabled: plain `sh -c <command>`.
         let (prog, args) = self.sandbox.wrap(&self.root, &["sh", "-c", command]);
-        let output = tokio::process::Command::new(prog)
-            .args(args)
-            .current_dir(&self.root)
-            .output()
-            .await;
-        match output {
-            Ok(out) => format_command_output(out),
-            Err(e) => format!("error: could not run `{command}`: {e}"),
-        }
+        let mut cmd = tokio::process::Command::new(prog);
+        cmd.args(args).current_dir(&self.root);
+        run_bounded(cmd, &format!("`{command}`"), command_timeout()).await
     }
 
     /// Stage-3 skill execution: run a script bundled with an installed skill, from the
@@ -665,10 +659,7 @@ impl ToolBox {
         let (prog, args) = self.sandbox.wrap(&self.root, &argv);
         let mut cmd = tokio::process::Command::new(prog);
         cmd.args(args).current_dir(&self.root);
-        match cmd.output().await {
-            Ok(out) => format_command_output(out),
-            Err(e) => format!("error: could not run skill script `{target}`: {e}"),
-        }
+        run_bounded(cmd, &format!("skill script `{target}`"), command_timeout()).await
     }
 
     async fn read_file(&self, path: &str) -> String {
@@ -792,7 +783,7 @@ pub(crate) fn missing_required(call: &ToolCall) -> Vec<&'static str> {
     };
     tool.params
         .iter()
-        .filter(|p| p.required && call.arguments.get(p.name).and_then(|v| v.as_str()).is_none())
+        .filter(|p| p.required && call.arguments.get(p.name).is_none_or(|v| v.is_null()))
         .map(|p| p.name)
         .collect()
 }
@@ -801,12 +792,142 @@ pub(crate) fn arg_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
     call.arguments.get(key)?.as_str().map(str::trim)
 }
 
+/// A free-text argument (`contents`, `command`) exactly as sent: never trimmed, and a
+/// non-string value taken back as its JSON text. Trimming stripped every written
+/// file's trailing newline and first-line indentation (`cargo fmt --check` then
+/// failed on everything the swarm wrote), and a server that JSON-coerces tool
+/// arguments hands over a file whose contents parse as JSON -- a `package.json`, a
+/// bare number -- as an object or number, which read as "missing contents".
+pub(crate) fn arg_text<'a>(call: &'a ToolCall, key: &str) -> Option<std::borrow::Cow<'a, str>> {
+    match call.arguments.get(key)? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(std::borrow::Cow::Borrowed(s)),
+        other => Some(std::borrow::Cow::Owned(other.to_string())),
+    }
+}
+
 /// Format a finished process's exit code + stdout/stderr into a bounded observation.
 ///
 /// Delegates to [`crate::digest`], which recognizes rustc diagnostics and libtest
 /// results and renders them structured. It matters that this is not a plain truncation:
 /// a build log prints progress first and its verdict last, so the previous head-only cut
 /// kept the least useful bytes and dropped the counts entirely.
+/// Wall-clock limit for one `run_command` / `run_skill_script`:
+/// `CORRODE_COMMAND_TIMEOUT_S`, default 1800. A swarm runs unattended, so a
+/// command that never ends (a server, a deadlocked test, `cargo run` on a
+/// binary that waits) must end the call, not the turn.
+fn command_timeout() -> std::time::Duration {
+    let s = std::env::var("CORRODE_COMMAND_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s: &u64| s > 0)
+        .unwrap_or(1800);
+    std::time::Duration::from_secs(s)
+}
+
+/// Bytes kept from each of a command's stdout and stderr: this much of the head
+/// and this much of the tail, the middle dropped. Output past it is still read
+/// (so the child never blocks on a full pipe) but not kept -- `yes` used to grow
+/// the daemon without bound, and on a UMA host that RAM is the GPU's.
+const COMMAND_CAPTURE_HALF: usize = 512 * 1024;
+
+/// Read `r` to EOF, keeping the head and tail `COMMAND_CAPTURE_HALF` bytes.
+async fn read_capped(mut r: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let (mut head, mut tail, mut dropped) = (Vec::new(), Vec::new(), 0usize);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let mut chunk = &buf[..n];
+        if head.len() < COMMAND_CAPTURE_HALF {
+            let take = chunk.len().min(COMMAND_CAPTURE_HALF - head.len());
+            head.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+        }
+        tail.extend_from_slice(chunk);
+        if tail.len() > 2 * COMMAND_CAPTURE_HALF {
+            let cut = tail.len() - COMMAND_CAPTURE_HALF;
+            tail.drain(..cut);
+            dropped += cut;
+        }
+    }
+    if tail.len() > COMMAND_CAPTURE_HALF {
+        let cut = tail.len() - COMMAND_CAPTURE_HALF;
+        tail.drain(..cut);
+        dropped += cut;
+    }
+    if dropped > 0 {
+        head.extend_from_slice(format!("\n… [{dropped} bytes omitted] …\n").as_bytes());
+    }
+    head.extend_from_slice(&tail);
+    head
+}
+
+/// Run `cmd` to completion under `limit`, capturing bounded output. The child
+/// gets its own process group, and on timeout the whole group is killed --
+/// killing only `sh` would leave what it started (test binaries, servers, a
+/// backgrounded `&` that holds the pipe open) running.
+async fn run_bounded(
+    mut cmd: tokio::process::Command,
+    what: &str,
+    limit: std::time::Duration,
+) -> String {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return format!("error: could not run {what}: {e}"),
+    };
+    let pid = child.id();
+    let (so, se) = (child.stdout.take(), child.stderr.take());
+    let run = async {
+        let out = async {
+            if let Some(r) = so {
+                read_capped(r).await
+            } else {
+                Vec::new()
+            }
+        };
+        let err = async {
+            if let Some(r) = se {
+                read_capped(r).await
+            } else {
+                Vec::new()
+            }
+        };
+        tokio::join!(out, err, child.wait())
+    };
+    match tokio::time::timeout(limit, run).await {
+        Ok((stdout, stderr, Ok(status))) => format_command_output(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Ok((_, _, Err(e))) => format!("error: {what}: {e}"),
+        Err(_) => {
+            if let Some(pid) = pid {
+                // The group id is the child's pid (process_group(0)).
+                let _ = std::process::Command::new("kill")
+                    .args(["-s", "KILL", "--", &format!("-{pid}")])
+                    .status();
+            }
+            format!(
+                "exit timeout: {what} was still running after {}s and was killed \
+                 (CORRODE_COMMAND_TIMEOUT_S). Run long or never-ending commands with a \
+                 bound of their own (e.g. `timeout 60 ...`).",
+                limit.as_secs()
+            )
+        }
+    }
+}
+
 fn format_command_output(out: std::process::Output) -> String {
     let mut text = String::new();
     if !out.stdout.is_empty() {
@@ -894,6 +1015,65 @@ pub fn parse_tool_intent(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
 
+    fn sh(script: &str) -> tokio::process::Command {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", script]);
+        c
+    }
+
+    // A command that never ends must end the call, and take what it started with
+    // it: the backgrounded sleep holds stdout open, so without the group kill the
+    // read never sees EOF.
+    #[tokio::test]
+    async fn a_hung_command_is_killed_with_its_process_group() {
+        // A sleep length unique to this run marks the backgrounded grandchild.
+        let secs = 100_000 + std::process::id() % 100_000;
+        let t0 = std::time::Instant::now();
+        let out = super::run_bounded(
+            sh(&format!("sleep {secs} & sleep 300")),
+            "`hang`",
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(out.starts_with("exit timeout"), "{out}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let left = std::process::Command::new("pgrep")
+            .args(["-f", &format!("^sleep {secs}$")])
+            .output()
+            .unwrap();
+        assert!(
+            left.stdout.is_empty(),
+            "survivor: {}",
+            String::from_utf8_lossy(&left.stdout)
+        );
+    }
+
+    // Unbounded output is drained but not kept: head and tail survive, the middle
+    // is dropped with a count, and the exit status still comes through.
+    #[tokio::test]
+    async fn command_output_is_capped_head_and_tail() {
+        let raw = super::read_capped(std::io::Cursor::new({
+            let mut v = b"FIRST\n".to_vec();
+            v.extend(std::iter::repeat_n(b'x', 5 * super::COMMAND_CAPTURE_HALF));
+            v.extend_from_slice(b"\nLAST");
+            v
+        }))
+        .await;
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.starts_with("FIRST"), "head lost");
+        assert!(text.ends_with("LAST"), "tail lost");
+        assert!(text.contains("bytes omitted"));
+        assert!(raw.len() <= 2 * super::COMMAND_CAPTURE_HALF + 64);
+        let out = super::run_bounded(
+            sh("head -c 20000000 /dev/zero | tr '\\0' y; exit 3"),
+            "`flood`",
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert!(out.starts_with("exit 3"), "{}", &out[..out.len().min(200)]);
+    }
+
     // A native emitter was observed sending `write_file` with `path` and no `contents`;
     // it reached execution and came back as a per-tool error written by hand. The check
     // is schema-driven so every tool gets it, and it names what arrived so the model can
@@ -933,6 +1113,45 @@ mod tests {
             .await;
         assert!(!out.starts_with("error:"), "empty contents is a truncation, not an error: {out}");
         assert_eq!(std::fs::read_to_string(dir.join("keep.txt")).unwrap(), "");
+    }
+
+    // Contents arrive exactly as sent. Trimming stripped the trailing newline and the
+    // first line's indentation from every file the swarm wrote, and contents a server
+    // had JSON-coerced (a file that parses as JSON) were refused as missing.
+    #[tokio::test]
+    async fn write_file_contents_are_written_exactly_and_json_values_are_taken_as_text() {
+        let dir = std::env::temp_dir().join(format!("corrode-exact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(crate::vfs::PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(HashMap::new()),
+        );
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            name: name.to_string(),
+            arguments: args,
+        };
+        let src = "    fn f() {}\n";
+        let out = toolbox
+            .execute(&call("write_file", serde_json::json!({"path": "a.rs", "contents": src})))
+            .await;
+        assert!(out.starts_with("wrote"), "{out}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), src);
+
+        let call_json = call(
+            "write_file",
+            serde_json::json!({"path": "p.json", "contents": {"name": "x", "version": 1}}),
+        );
+        assert!(missing_required(&call_json).is_empty(), "coerced contents are present");
+        let out = toolbox.execute(&call_json).await;
+        assert!(out.starts_with("wrote"), "{out}");
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("p.json")).unwrap()).unwrap();
+        assert_eq!(back, serde_json::json!({"name": "x", "version": 1}));
+
+        let out = toolbox.execute(&call("run_command", serde_json::json!({"command": true}))).await;
+        assert!(out.starts_with("exit 0"), "`true` coerced to a bool still runs: {out}");
+        std::fs::remove_dir_all(&dir).ok();
     }
     use super::*;
     use crate::vfs::PassthroughVfs;

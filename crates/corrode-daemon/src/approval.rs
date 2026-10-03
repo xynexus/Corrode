@@ -24,6 +24,15 @@ use std::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+fn approval_timeout() -> std::time::Duration {
+    let s = std::env::var("CORRODE_APPROVAL_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s: &u64| s > 0)
+        .unwrap_or(3600);
+    std::time::Duration::from_secs(s)
+}
+
 /// Registry of in-flight approval requests, shared (`Arc`) between the command loop
 /// (which resolves responses) and the tool loops (which await them).
 #[derive(Default)]
@@ -71,7 +80,16 @@ impl ApprovalGate {
             self.pending.lock().unwrap().remove(&id);
             return false; // client gone -> deny
         }
-        rx.await.unwrap_or(false) // dropped without answering -> deny
+        // Deny when the client goes away after the request was sent (nothing would
+        // ever answer it) or nobody answers within CORRODE_APPROVAL_TIMEOUT_S
+        // (default 3600): a swarm is often left alone, and a turn must end.
+        let approved = tokio::select! {
+            r = rx => r.unwrap_or(false), // dropped without answering -> deny
+            _ = events.closed() => false,
+            _ = tokio::time::sleep(approval_timeout()) => false,
+        };
+        self.pending.lock().unwrap().remove(&id);
+        approved
     }
 
     /// Resolve a pending request with a human's decision. Unknown/duplicate ids are a
@@ -122,6 +140,24 @@ mod tests {
         let (etx, erx) = mpsc::channel(1);
         drop(erx); // client gone
         assert!(!gate.request(&etx, "write file".into()).await);
+    }
+
+    // The client disconnects after the request went out: nobody can answer, so the
+    // call is denied at once instead of waiting forever.
+    #[tokio::test]
+    async fn a_client_gone_mid_request_denies() {
+        let gate = std::sync::Arc::new(ApprovalGate::default());
+        let (etx, mut erx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let _ = erx.recv().await; // receives the request, then disconnects
+        });
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            gate.request(&etx, "write file".into()),
+        )
+        .await;
+        assert_eq!(r, Ok(false));
+        assert!(gate.pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

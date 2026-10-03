@@ -138,10 +138,10 @@ the guard.
 Only when set. `CORRODE_USERS` points to a JSON `user -> {token, hipfire_token?}`
 table; its presence turns on auth (connections must `Authenticate` before any
 repo-scoped command).
-- **Detect:** the file exists and parses as the expected shape.
-- **Warn if unparseable:** the daemon logs `CORRODE_USERS parse failed … auth
-  disabled` and runs *anonymous* — a silent downgrade from "locked" to "open",
-  worth flagging loudly.
+- **Detect:** the file exists and parses as the expected shape, with at least one
+  user (doctor uses the daemon's own parser, `daemon::parse_users`).
+- **Fatal if unusable:** the daemon keeps auth on and admits nobody until it is
+  fixed (it used to fall back to anonymous, silently opening a locked daemon).
 - **Info:** per-user fairness only activates for users whose entry has a
   `hipfire_token`; without one, that user shares the daemon's hipfire principal.
 

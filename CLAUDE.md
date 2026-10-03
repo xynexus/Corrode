@@ -86,7 +86,13 @@ duration, artifacts, ok/error; absent -> disabled), `CORRODE_MAX_FOLLOWUPS` (emi
 the plan-review round is its own drive; past it emissions are dropped and logged), `CORRODE_MAX_TOOL_STEPS` (tool calls a task may make before it must answer, default 16;
 a note on the tool result warns at 3 left; when spent, one more generation asks for the final answer
 — tools still declared, none run), `CORRODE_MAX_TOKENS` (per-call output cap,
-default 8192 — a ceiling, so short outputs are unaffected), `CORRODE_STREAM`
+default 8192 — a ceiling, so short outputs are unaffected; a reply hipfire cuts off at it
+or at the KV capacity left comes back `status: incomplete`, which the client turns into a
+`hipfire::Truncated` error: the native tool loop tells the model and asks for a shorter
+reply, the planner retries once at reasoning effort `medium`, anything else fails the task
+visibly rather than taking half an answer as whole), `CORRODE_CONTEXT_TOKENS` (the serving
+model's context, default 32768; the tool loop stops gathering once the conversation leaves
+less than one `CORRODE_MAX_TOKENS` of it, so the final answer always fits), `CORRODE_STREAM`
 (stream single-shot subagent output over SSE, relaying `SubagentDelta` events to
 the UI as tokens generate; off unless `1`/`true`/`on` — the non-streaming path is
 unchanged when off), `CORRODE_FANOUT` (coder-task ensemble size — K read-only proposal
@@ -98,14 +104,21 @@ work is awaited; absent/0 -> unbounded), `CORRODE_SANDBOX` (bubblewrap-confine e
 — `run_command`/`run_skill_script` and the web terminal — off unless `on`/`1`/`true`;
 see `sandbox.rs` + `docs/sessions-and-sandbox.md`), `CORRODE_SANDBOX_NET` (share the
 host network into the sandbox; off by default — needed for tools that fetch),
-`CORRODE_AUTO_APPROVE` (auto-approve every mutating tool call instead of blocking on
+`CORRODE_COMMAND_TIMEOUT_S` (wall-clock limit for one `run_command`/`run_skill_script`,
+default 1800; past it the command's whole process group is killed and the call returns
+`exit timeout` — output is capped at 512 KiB head + 512 KiB tail per stream either way),
+`CORRODE_REQUEST_TIMEOUT_S` (limit on one hipfire call, the whole generation included,
+default 3600; a timed-out call fails rather than retrying), `CORRODE_APPROVAL_TIMEOUT_S`
+(how long a mutating call waits for a human before it is denied, default 3600; it is
+also denied at once if the client disconnects), `CORRODE_AUTO_APPROVE` (auto-approve every mutating tool call instead of blocking on
 a human — for unattended/headless swarms that would otherwise fail closed; off unless
 `1`/`true`/`on`, and meant to be paired with `CORRODE_SANDBOX` so writes/commands stay
 confined; each auto-approval is logged and the call still streams back as a
 `ToolResult`), `CORRODE_USERS` (path to a JSON `user -> {token, hipfire_token?}` table; present =
 auth on, connections must `Authenticate` before repo-scoped commands, and each
 user's `hipfire_token` — if set — attributes their swarm to a distinct hipfire
-principal for per-user fairness; absent = auth off, connections anonymous). The
+principal for per-user fairness; absent = auth off, connections anonymous; set but
+unreadable, unparseable or empty = auth stays on and nobody can authenticate). The
 hipfire background daemon must be up (`hipfire start`, not just
 `serve` — `serve` is only the HTTP frontend) for the daemon to resolve roles and
 generate.
