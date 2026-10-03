@@ -37,6 +37,48 @@ fn canonical(path: &str) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
 }
 
+/// A repo a client asked for (`SelectRepo`), confined. It must be an existing
+/// directory strictly inside the daemon user's home directory -- the top of what a
+/// client may reach -- and, when `CORRODE_REPO_ALLOW` is set (a `:`-separated list of
+/// directories), inside one of those. Allow-list entries outside home are ignored; if
+/// none remain, nothing is allowed.
+///
+/// Any host path used to bind: the repo becomes the VFS root, the terminal's cwd, the
+/// sandbox's `--bind` and the doc root, so a client could open a shell in `/`, or read
+/// `~/.ssh` through a repo of `~` itself (hence strictly inside, not home itself).
+/// The operator's own `CORRODE_REPO` default is not subject to this.
+fn allowed_repo(path: &str) -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .and_then(|h| std::fs::canonicalize(h).ok())
+        .ok_or_else(|| anyhow::anyhow!("no home directory to confine repos to"))?;
+    let repo =
+        std::fs::canonicalize(path).map_err(|e| anyhow::anyhow!("repo {path}: {e}"))?;
+    anyhow::ensure!(repo.is_dir(), "repo {path} is not a directory");
+    anyhow::ensure!(
+        repo != home && repo.starts_with(&home),
+        "repo {} is not inside {}",
+        repo.display(),
+        home.display()
+    );
+    if let Some(list) = std::env::var_os("CORRODE_REPO_ALLOW") {
+        let roots: Vec<PathBuf> = std::env::split_paths(&list)
+            .filter_map(|r| match std::fs::canonicalize(&r) {
+                Ok(r) if r.starts_with(&home) => Some(r),
+                _ => {
+                    eprintln!("CORRODE_REPO_ALLOW: ignoring {} (missing or outside home)", r.display());
+                    None
+                }
+            })
+            .collect();
+        anyhow::ensure!(
+            roots.iter().any(|r| repo.starts_with(r)),
+            "repo {} is not under CORRODE_REPO_ALLOW",
+            repo.display()
+        );
+    }
+    Ok(repo)
+}
+
 /// One entry in the `CORRODE_USERS` table: the token that authenticates to the
 /// daemon, plus (optionally) a per-user hipfire bearer for fairness attribution.
 /// JSON: `{"alice": {"token": "…", "hipfire_token": "…"}}` (hipfire_token optional).
@@ -231,7 +273,7 @@ impl Daemon {
         let repo = if path.is_empty() {
             self.default_repo.clone()
         } else {
-            canonical(path)
+            allowed_repo(path)?
         };
         let key = SessionKey {
             user: user.unwrap_or_default(),
@@ -2650,6 +2692,37 @@ mod tests {
         assert!(written.is_empty(), "nothing was executed");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A client-chosen repo stays inside the home directory (never home itself) and,
+    // when CORRODE_REPO_ALLOW is set, inside one of its entries. Env-dependent, so it
+    // is one test (tests in a binary share the process environment).
+    #[test]
+    fn selected_repos_are_confined_to_home_and_the_allow_list() {
+        let home = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap();
+        let base = home.join(format!(".corrode-allow-test-{}", std::process::id()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+
+        std::env::remove_var("CORRODE_REPO_ALLOW");
+        assert_eq!(allowed_repo(&s(&a)).unwrap(), a, "inside home is allowed");
+        assert!(allowed_repo(&s(&home)).is_err(), "home itself is not");
+        assert!(allowed_repo("/").is_err());
+        assert!(allowed_repo("/tmp").is_err());
+        assert!(allowed_repo(&s(&base.join("missing"))).is_err());
+        assert!(allowed_repo(&format!("{}/../..", s(&a))).is_err(), "resolved, then checked");
+
+        std::env::set_var("CORRODE_REPO_ALLOW", format!("{}:/etc", s(&a)));
+        assert!(allowed_repo(&s(&a)).is_ok(), "listed");
+        assert!(allowed_repo(&s(&b)).is_err(), "inside home but not listed");
+        assert!(allowed_repo("/etc").is_err(), "a listed dir outside home is ignored");
+
+        std::env::set_var("CORRODE_REPO_ALLOW", "/etc");
+        assert!(allowed_repo(&s(&a)).is_err(), "no usable entry allows nothing");
+        std::env::remove_var("CORRODE_REPO_ALLOW");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     // Multi-tenancy keying: a (user, repo) session is created once and reused across

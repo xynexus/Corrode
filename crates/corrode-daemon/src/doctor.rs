@@ -103,6 +103,10 @@ pub async fn run() -> bool {
         },
         Err(_) => info("auth: off (no CORRODE_USERS) — connections are anonymous"),
     }
+    match std::env::var("CORRODE_REPO_ALLOW") {
+        Ok(list) => info(&format!("SelectRepo: confined to {list} (entries inside $HOME only)")),
+        Err(_) => info("SelectRepo: any directory inside $HOME (CORRODE_REPO_ALLOW unset)"),
+    }
 
     // --- repo ---
     let repo = std::env::var("CORRODE_REPO").unwrap_or_else(|_| ".".into());
