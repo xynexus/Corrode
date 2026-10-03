@@ -813,17 +813,53 @@ impl Daemon {
             model: orch_model,
             owner_token: session.owner_token.clone(),
         };
-        let plan_text = self
+        let plan_prompt = plan_task.prompt.clone();
+        let first = self
             .swarm
             .run(vec![plan_task])
             .next()
             .await
             .map(|(_, r)| r)
-            .transpose()?
-            .unwrap_or_default();
+            .transpose();
+        // A planner cut off mid-thought returned its raw reasoning as the plan. Retry
+        // once with a bounded thinking budget ("medium": still thinking, which
+        // planning needs, but within the output cap) before giving up on structure.
+        let plan_text = match first {
+            Ok(t) => t.unwrap_or_default(),
+            Err(e) => match e.downcast::<crate::hipfire::Truncated>() {
+                Ok(t) => {
+                    eprintln!("planner: {t}; retrying with reasoning effort medium");
+                    let model = self.roles.model_for(Role::Orchestration).unwrap_or_default();
+                    match self
+                        .swarm
+                        .client()
+                        .respond_full(
+                            model,
+                            &plan_prompt,
+                            priority,
+                            session.owner_token.as_deref(),
+                            None,
+                            Some("medium"),
+                        )
+                        .await
+                    {
+                        Ok((text, _, _)) => text,
+                        Err(e) => {
+                            eprintln!("planner: retry failed too: {e}");
+                            String::new()
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            },
+        };
 
         let mut plan = planner::parse_plan(&plan_text);
         if plan.is_empty() {
+            eprintln!(
+                "planner: no usable plan in {} bytes; falling back to one coder task",
+                plan_text.len()
+            );
             // Degrade to one coder task on the raw prompt (still behind the shared
             // prefix) so a plan the model couldn't structure still gets attempted
             // rather than dropped.
@@ -1337,9 +1373,14 @@ const NO_CALL_REMINDER: &str = "You replied without calling a tool. Changes to t
 through tool calls: to create or change a file, call write_file with its full contents -- do not paste \
 file contents as your reply. If the task truly needs no tool, repeat your final answer.";
 
+const TRUNCATED_NOTE: &str = "Your last reply hit the output limit and was cut off, so none of it was \
+used -- not its text, not any tool call in it. Make this reply shorter: answer more concisely, or if you \
+were writing a large file, write it in smaller pieces (several smaller files, or one write_file followed \
+by appending the rest with run_command if you have it).";
+
 /// `CORRODE_CONTEXT_TOKENS`: the serving model's context (default 32768, the
 /// swarm models' hipfire max_seq). The tool loop stops gathering once the
-/// conversation leaves less than [`ANSWER_RESERVE_TOKENS`] of it.
+/// conversation leaves less than one output cap of it.
 fn context_tokens() -> usize {
     std::env::var("CORRODE_CONTEXT_TOKENS")
         .ok()
@@ -1347,15 +1388,15 @@ fn context_tokens() -> usize {
         .unwrap_or(32768)
 }
 
-/// Tokens kept free for the final answer.
-const ANSWER_RESERVE_TOKENS: usize = 4096;
 
 /// Whether `prompt` plus the replayed `turns` is too close to the context to take
 /// another tool step. Estimated, not tokenized: 3 bytes per token is conservative
 /// for code and markdown (Qwen's tokenizer averages ~3.5-4 on this repo).
 fn over_context_budget(prompt: &str, turns: &[serde_json::Value]) -> bool {
     let bytes = prompt.len() + turns.iter().map(|t| t.to_string().len()).sum::<usize>();
-    bytes / 3 + ANSWER_RESERVE_TOKENS > context_tokens()
+    // Keep a whole output cap free: hipfire clamps a reply to the KV capacity left, so
+    // a 4096-token reserve under an 8192-token cap cut long final answers short.
+    bytes / 3 + crate::hipfire::max_output_tokens() as usize > context_tokens()
 }
 
 /// Tool calls one step may run. A step is one generation; the model may emit several
@@ -1741,7 +1782,7 @@ async fn run_native_tool_loop(
                 "{last}\n[stopped: turn budget reached]"
             )));
         }
-        let (text, _reasoning, server_calls) = client
+        let reply = client
             .respond_turns(
                 model,
                 &prompt,
@@ -1751,7 +1792,26 @@ async fn run_native_tool_loop(
                 Some(&tools),
                 Some(&effort),
             )
-            .await?;
+            .await;
+        let (text, _reasoning, server_calls) = match reply {
+            Ok(r) => r,
+            // Cut off at the output limit: neither an answer nor a usable call (a
+            // write_file cut off mid-`contents` is no call at all). Say so, spend the
+            // step, and ask for less. The partial is not replayed -- it is up to a
+            // full output cap of tokens the next step would carry for nothing.
+            Err(e) => match e.downcast::<crate::hipfire::Truncated>() {
+                Ok(t) => {
+                    let _ = events
+                        .send(AgentEvent::Error {
+                            message: format!("task {id}: {t}; asked for a shorter reply"),
+                        })
+                        .await;
+                    turns.push(serde_json::json!({"type": "message", "role": "user", "content": TRUNCATED_NOTE}));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            },
+        };
         let _ = events
             .send(AgentEvent::SubagentOutput {
                 id,
@@ -2860,6 +2920,84 @@ mod tests {
                 );
             }
         }
+    }
+
+    // A reply hipfire cut off at the output limit (`status: "incomplete"`) used to be
+    // taken as the answer -- a coder's write_file cut off mid-`contents` ended its task
+    // Done with nothing written. Now the loop reports it, tells the model, and the
+    // half reply never becomes the task's output.
+    #[tokio::test]
+    async fn a_reply_cut_off_at_the_output_limit_is_never_the_answer() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let saw_note = Arc::new(AtomicUsize::new(0));
+        let (c, n) = (calls.clone(), saw_note.clone());
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Json<serde_json::Value>| {
+                let (c, n) = (c.clone(), n.clone());
+                async move {
+                    if body.0["input"].to_string().contains("hit the output limit") {
+                        n.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Json(if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                        serde_json::json!({
+                            "status": "incomplete",
+                            "incomplete_details": {"reason": "max_output_tokens"},
+                            "output_text": "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.md\", \"contents\": \"HALF",
+                            "output": [],
+                        })
+                    } else {
+                        serde_json::json!({"status": "completed", "output_text": "short answer", "output": []})
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = Client::new(format!("http://{addr}"), None);
+        let repo = std::path::PathBuf::from(".");
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&repo)),
+            repo,
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let (etx, mut erx) = mpsc::channel(64);
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let out = run_task(
+            &client,
+            "Qwen3.5-9B--oq4.25++",
+            Priority::Default,
+            &Dialects::default(),
+            None,
+            toolbox,
+            &ApprovalGate::default(),
+            "prefix",
+            Role::Research,
+            "summarize src/lib.rs",
+            &etx,
+            7,
+            &mut written,
+            true,
+            &seen,
+            None,
+        )
+        .await
+        .expect("the task recovers");
+        assert!(!out.contains("HALF"), "the cut-off reply became the answer: {out}");
+        assert!(out.contains("short answer"), "{out}");
+        assert_eq!(saw_note.load(Ordering::SeqCst), 1, "the model was told it was cut off");
+        let mut reported = false;
+        while let Ok(ev) = erx.try_recv() {
+            if let AgentEvent::Error { message } = ev {
+                reported |= message.contains("cut off");
+            }
+        }
+        assert!(reported, "the truncation is reported, not silent");
     }
 
     // The void failure, made deterministic: a model routed native that answers without

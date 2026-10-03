@@ -37,6 +37,8 @@ enum SseDelta {
     Reasoning(String),
     /// The final, authoritative full answer text (`response.output_text.done`).
     TextDone(String),
+    /// The reply was cut off (`response.incomplete`), with hipfire's reason.
+    Incomplete(String),
 }
 
 /// Whether a response status is transient overload worth retrying (hipfire sheds
@@ -57,6 +59,41 @@ fn answer_or_reasoning(output_text: String, reasoning: &str) -> String {
     } else {
         output_text
     }
+}
+
+/// A reply hipfire cut off (`status: "incomplete"`): at `max_output_tokens`, or at
+/// the KV capacity the session had left. An error, not a reply, so no caller can take
+/// half an answer for a whole one -- a coder's `write_file` cut off mid-`contents` used
+/// to end its task Done with no file written. Callers that can recover (the tool loop,
+/// the planner) downcast to this; the rest fail the task, visibly.
+#[derive(Debug)]
+pub struct Truncated {
+    /// What the model produced before it was cut off (answer, else reasoning).
+    pub partial: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for Truncated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "reply cut off before it finished ({}, {} bytes produced)",
+            self.reason,
+            self.partial.len()
+        )
+    }
+}
+
+impl std::error::Error for Truncated {}
+
+/// Per-call output cap, `CORRODE_MAX_TOKENS` (default 8192). Shared with the tool
+/// loop's context guard, which must keep this much of the context free: hipfire clamps
+/// a reply to the KV capacity left, so a smaller reserve cut long answers short.
+pub fn max_output_tokens() -> u32 {
+    std::env::var("CORRODE_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192)
 }
 
 /// Parse ONE complete SSE event block (the text between `\n\n` boundaries) into a
@@ -98,6 +135,12 @@ fn parse_sse_event(block: &str) -> Option<SseDelta> {
         "response.output_text.done" => {
             Some(SseDelta::TextDone(json.get("text")?.as_str()?.to_string()))
         }
+        "response.incomplete" => Some(SseDelta::Incomplete(
+            json.pointer("/incomplete_details/reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("max_output_tokens")
+                .to_string(),
+        )),
         _ => None,
     }
 }
@@ -129,6 +172,11 @@ struct ResponsesRequest<'a> {
 
 #[derive(Deserialize)]
 pub struct ResponsesReply {
+    /// `completed`, or `incomplete` when hipfire cut the reply off (see [`Truncated`]).
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub incomplete_details: Option<serde_json::Value>,
     #[serde(default)]
     pub output_text: String,
     /// Output items. Reasoning rides here rather than inside `output_text`, so the
@@ -253,10 +301,7 @@ impl Client {
         // write_file of a 14 KB document (~4K tokens plus JSON escaping).
         // ponytail: still one cap for every call. Split per-role (a planner wants more
         // than a research skim) once we tune it.
-        let max_output_tokens = std::env::var("CORRODE_MAX_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8192);
+        let max_output_tokens = max_output_tokens();
         let stream = matches!(
             std::env::var("CORRODE_STREAM").ok().as_deref(),
             Some("1") | Some("true") | Some("on")
@@ -432,6 +477,17 @@ impl Client {
         let body = serde_json::to_value(&req)?;
         let reply = self.post_responses(&body, owner_token).await?;
         let reasoning = reply.reasoning().to_string();
+        if reply.status == "incomplete" {
+            let reason = reply
+                .incomplete_details
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(|r| r.as_str())
+                .unwrap_or("incomplete")
+                .to_string();
+            let partial = answer_or_reasoning(reply.output_text, &reasoning);
+            return Err(Truncated { partial, reason }.into());
+        }
         let calls = reply.tool_calls();
         Ok((
             answer_or_reasoning(reply.output_text, &reasoning),
@@ -531,6 +587,7 @@ impl Client {
 
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut cut_off: Option<String> = None;
         let mut apply = |ev: Option<SseDelta>, text: &mut String, reasoning: &mut String| {
             match ev {
                 Some(SseDelta::Text(d)) => {
@@ -548,6 +605,7 @@ impl Client {
                 // and carry the real answer in the deltas we accumulated.
                 Some(SseDelta::TextDone(full)) if !full.is_empty() => *text = full,
                 Some(SseDelta::TextDone(_)) | None => {}
+                Some(SseDelta::Incomplete(reason)) => cut_off = Some(reason),
             }
         };
         // Buffer BYTES, not a lossy string: a chunk can split a multi-byte UTF-8 char
@@ -573,7 +631,11 @@ impl Client {
                 apply(parse_sse_event(&block), &mut text, &mut reasoning);
             }
         }
-        Ok((answer_or_reasoning(text, &reasoning), reasoning))
+        let answer = answer_or_reasoning(text, &reasoning);
+        if let Some(reason) = cut_off {
+            return Err(Truncated { partial: answer, reason }.into());
+        }
+        Ok((answer, reasoning))
     }
 
     /// Embed one string (`/v1/embeddings`) — code/doc/skill retrieval is a hipfire
@@ -723,6 +785,16 @@ mod tests {
         assert_eq!(calls[0].name, "list_dir");
     }
     use super::*;
+
+    #[test]
+    fn a_streamed_reply_cut_off_is_reported_incomplete() {
+        assert_eq!(
+            parse_sse_event(
+                "event: response.incomplete\ndata: {\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}"
+            ),
+            Some(SseDelta::Incomplete("max_output_tokens".into()))
+        );
+    }
 
     #[test]
     fn parses_output_reasoning_and_done_events_ignores_the_rest() {
