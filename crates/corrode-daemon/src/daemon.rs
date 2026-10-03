@@ -1642,6 +1642,7 @@ async fn gate_and_execute(
     written: &mut Vec<String>,
     seen: &std::sync::Mutex<SeenCalls>,
     read_only: bool,
+    role: Role,
 ) -> String {
     // The map is turn-shared across concurrent tasks: lock only around map ops,
     // never across an await (the approval gate can block for minutes). Two tasks
@@ -1652,7 +1653,21 @@ async fn gate_and_execute(
     // `contents` spends their attention on a call that was always going to be rejected,
     // and `describe` renders it as a plausible-looking write.
     let missing = crate::tools::missing_required(call);
-    let observation = if let Some(prior) = prior {
+    // Each role's tool set is enforced HERE, not only by what its request declares:
+    // the declaration is a hard constraint only where hipfire builds a grammar for the
+    // model (MiniCPM), and a Qwen review or architect task did emit run_command and
+    // write_file. Refused before the repeat lookup and the approval gate, so nobody is
+    // asked to approve a call the role may not make.
+    let allowed = crate::tools::role_tools(role);
+    let observation = if !allowed.iter().any(|t| t.name == call.name) {
+        let names: Vec<&str> = allowed.iter().map(|t| t.name).collect();
+        format!(
+            "error: `{}` is not available to a {role:?} task; its tools are {}. Use one of \
+             those, or say in your answer what should be done.",
+            call.name,
+            names.join(", ")
+        )
+    } else if let Some(prior) = prior {
         prior
     } else if !missing.is_empty() {
         let refused = crate::tools::missing_required_error(call, &missing);
@@ -1898,7 +1913,7 @@ async fn run_native_tool_loop(
                 }
             }
             let observation = gate_and_execute(
-                call, &toolbox, approvals, events, id, written, seen, read_only,
+                call, &toolbox, approvals, events, id, written, seen, read_only, role,
             )
             .await;
             steps.push(crate::trace::Step {
@@ -1984,8 +1999,10 @@ async fn run_native_tool_loop(
         let mut observations = Vec::with_capacity(batch.len());
         for call in batch {
             observations.push(
-                gate_and_execute(call, &toolbox, approvals, events, id, written, seen, read_only)
-                    .await,
+                gate_and_execute(
+                    call, &toolbox, approvals, events, id, written, seen, read_only, role,
+                )
+                .await,
             );
         }
         if !text.trim().is_empty() {
@@ -2138,8 +2155,10 @@ async fn run_tool_loop(
                             touched.push(p.to_string());
                         }
                     }
-                    gate_and_execute(c, &toolbox, approvals, events, id, written, seen, read_only)
-                        .await
+                    gate_and_execute(
+                        c, &toolbox, approvals, events, id, written, seen, read_only, role,
+                    )
+                    .await
                 }
                 None => "error: no tool call produced".to_string(),
             },
@@ -2763,6 +2782,48 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // A role's tool set holds whatever the model emits: a review task's run_command
+    // and a research task's write_file are refused before any approval prompt and
+    // never run, while their own tools still work.
+    #[tokio::test]
+    async fn out_of_role_calls_are_refused_before_approval() {
+        let dir = std::env::temp_dir().join(format!("corrode-role-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "keep").unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(std::collections::HashMap::new()),
+        );
+        let (tx, mut rx) = mpsc::channel(16);
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let call = |name: &str, args: serde_json::Value| crate::toolcall::ToolCall {
+            name: name.to_string(),
+            arguments: args,
+        };
+        let approvals = ApprovalGate::default(); // nobody answers: an approval would hang
+        let run = call("run_command", serde_json::json!({"command": "rm a.txt"}));
+        let obs = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            gate_and_execute(&run, &toolbox, &approvals, &tx, 1, &mut written, &seen, false, Role::Review),
+        )
+        .await
+        .expect("refused without asking");
+        assert!(obs.contains("not available to a Review task"), "{obs}");
+        let write = call("write_file", serde_json::json!({"path": "a.txt", "contents": "x"}));
+        let obs = gate_and_execute(&write, &toolbox, &approvals, &tx, 1, &mut written, &seen, false, Role::Research).await;
+        assert!(obs.starts_with("error:"), "{obs}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "keep", "nothing ran");
+        while let Ok(ev) = rx.try_recv() {
+            assert!(!matches!(ev, AgentEvent::ApprovalRequest { .. }), "no approval was asked for");
+        }
+        let read = call("read_file", serde_json::json!({"path": "a.txt"}));
+        let obs = gate_and_execute(&read, &toolbox, &approvals, &tx, 1, &mut written, &seen, false, Role::Research).await;
+        assert!(obs.contains("keep"), "in-role calls still run: {obs}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // Multi-tenancy keying: a (user, repo) session is created once and reused across
     // that user's connections; different users on the same repo get separate sessions
     // (separate terminals + approval gate). Uses the default repo (path "") so it hits
@@ -3199,6 +3260,7 @@ mod tests {
             &mut written,
             &seen,
             false,
+            Role::Coder,
         )
         .await;
         assert!(out.contains("missing required argument"), "{out}");
@@ -3291,15 +3353,15 @@ mod tests {
             arguments: args,
         };
         let read = call("read_file", serde_json::json!({"path": "a.txt"}));
-        let first = gate_and_execute(&read, &toolbox, &approvals, &etx, 1, &mut written, &seen, false).await;
+        let first = gate_and_execute(&read, &toolbox, &approvals, &etx, 1, &mut written, &seen, false, Role::Coder).await;
         assert!(first.contains("one"), "{first}");
         let cmd = call(
             "run_command",
             serde_json::json!({"command": "printf two > a.txt; echo 'test result: ok. 1 passed; 0 failed'"}),
         );
-        let ran = gate_and_execute(&cmd, &toolbox, &approvals, &etx, 1, &mut written, &seen, false).await;
+        let ran = gate_and_execute(&cmd, &toolbox, &approvals, &etx, 1, &mut written, &seen, false, Role::Coder).await;
         assert!(!ran.starts_with("exit 0:"), "the digest format this guards against: {ran}");
-        let again = gate_and_execute(&read, &toolbox, &approvals, &etx, 1, &mut written, &seen, false).await;
+        let again = gate_and_execute(&read, &toolbox, &approvals, &etx, 1, &mut written, &seen, false, Role::Coder).await;
         assert!(again.contains("two"), "stale read served from the cache: {again}");
         assert!(!again.starts_with("note:"), "{again}");
         std::fs::remove_dir_all(&dir).ok();
@@ -3340,6 +3402,7 @@ mod tests {
                 &mut written,
                 &seen,
                 true,
+                Role::Coder,
             ),
         )
         .await
@@ -3375,6 +3438,7 @@ mod tests {
             &mut written,
             &seen,
             true,
+            Role::Coder,
         )
         .await;
         assert!(obs.contains("fn f() {}"), "got: {obs}");
@@ -3442,6 +3506,7 @@ mod tests {
             &mut written,
             &seen,
             false,
+            Role::Coder,
         )
         .await;
         assert!(a.contains("fn f() {}"));
@@ -3454,6 +3519,7 @@ mod tests {
             &mut written,
             &seen,
             false,
+            Role::Coder,
         )
         .await;
         assert!(
