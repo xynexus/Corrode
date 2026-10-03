@@ -41,29 +41,34 @@ fn canonical(path: &str) -> PathBuf {
 /// daemon, plus (optionally) a per-user hipfire bearer for fairness attribution.
 /// JSON: `{"alice": {"token": "…", "hipfire_token": "…"}}` (hipfire_token optional).
 #[derive(serde::Deserialize, Clone)]
-struct UserEntry {
+pub(crate) struct UserEntry {
     token: String,
     #[serde(default)]
     hipfire_token: Option<String>,
 }
 
-/// Load the auth table from `CORRODE_USERS` (a JSON file path). Absent or
-/// unreadable => `None` (auth off, connections anonymous).
+/// Read and parse the `CORRODE_USERS` table at `path`. Shared with `doctor`, so it
+/// checks the schema the daemon actually reads.
+pub(crate) fn parse_users(path: &str) -> anyhow::Result<HashMap<String, UserEntry>> {
+    let data = std::fs::read_to_string(path)?;
+    let users: HashMap<String, UserEntry> = serde_json::from_str(&data)?;
+    anyhow::ensure!(!users.is_empty(), "the table has no users");
+    Ok(users)
+}
+
+/// The auth table from `CORRODE_USERS`. Absent => `None` (auth off, anonymous).
+/// Set => auth is ON: a table that cannot be read or parsed, or is empty, leaves it
+/// on with nobody able to authenticate. It used to turn auth off -- a typo in the
+/// file opened the daemon to anyone who could reach it.
 fn load_users() -> Option<HashMap<String, UserEntry>> {
     let path = std::env::var("CORRODE_USERS").ok()?;
-    match std::fs::read_to_string(&path) {
-        Ok(data) => match serde_json::from_str(&data) {
-            Ok(map) => Some(map),
-            Err(e) => {
-                eprintln!("CORRODE_USERS parse failed ({e}); auth disabled");
-                None
-            }
-        },
-        Err(e) => {
-            eprintln!("CORRODE_USERS read failed at {path} ({e}); auth disabled");
-            None
-        }
-    }
+    Some(parse_users(&path).unwrap_or_else(|e| {
+        eprintln!(
+            "CORRODE_USERS at {path} is unusable ({e}); auth stays ON and no connection \
+             can authenticate until it is fixed (`corrode-daemon doctor` checks it)"
+        );
+        HashMap::new()
+    }))
 }
 /// Cap on the README digest folded into the shared prefix. Generous on purpose: this
 /// is prefix content, prefilled once per model and reused across the turn's fan-out
@@ -170,16 +175,17 @@ impl Daemon {
         }
     }
 
-    /// Whether a user table is configured (auth on). Empty table = off.
+    /// Whether auth is on: `CORRODE_USERS` is set, whether or not its table is usable.
     fn auth_on(&self) -> bool {
-        self.users.as_ref().is_some_and(|u| !u.is_empty())
+        self.users.is_some()
     }
 
-    /// Validate a user/token. Auth off => always accepts.
+    /// Validate a user/token. Auth off => always accepts; an unusable table accepts
+    /// nobody.
     fn authenticate(&self, user: &str, token: &str) -> bool {
         match &self.users {
-            Some(map) if !map.is_empty() => map.get(user).is_some_and(|e| e.token == token),
-            _ => true,
+            Some(map) => map.get(user).is_some_and(|e| e.token == token),
+            None => true,
         }
     }
 
@@ -2726,6 +2732,34 @@ mod tests {
         }
         assert!(written.is_empty(), "nothing was executed");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A CORRODE_USERS table that cannot be used keeps auth ON and admits nobody. It
+    // used to turn auth off, so a typo in the file opened the daemon to anyone.
+    #[tokio::test]
+    async fn an_unusable_user_table_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("corrode-users-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        assert!(parse_users(&file("bad.json", "{not json")).is_err());
+        assert!(parse_users(&file("empty.json", "{}")).is_err(), "no users is unusable");
+        assert!(parse_users(&file("notoken.json", r#"{"a": {}}"#)).is_err(), "token is required");
+        assert!(parse_users(&dir.join("missing.json").to_string_lossy()).is_err());
+        let good = parse_users(&file("ok.json", r#"{"alice": {"token": "t"}}"#)).unwrap();
+        assert_eq!(good.len(), 1);
+
+        let mut d = test_daemon();
+        d.users = Some(HashMap::new()); // what load_users yields for an unusable table
+        assert!(d.auth_on(), "auth stays on");
+        assert!(!d.authenticate("alice", "t"), "nobody authenticates");
+        d.users = Some(good);
+        assert!(d.authenticate("alice", "t"));
+        assert!(!d.authenticate("alice", "wrong"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
