@@ -81,11 +81,27 @@ impl PassthroughVfs {
 /// ponytail: check-then-open, not openat2(RESOLVE_BENEATH): a process racing to swap a
 /// directory for a link between the check and the open can still escape.
 fn confine(root: &Path, full: &Path) -> anyhow::Result<()> {
-    if real_path(full)?.starts_with(real_path(root)?) {
-        Ok(())
-    } else {
-        anyhow::bail!("path leaves the repository: {}", full.display())
+    confine_in(root, full, crate::sandbox::home().as_deref())
+}
+
+/// [`confine`] with the home directory given: also refuses home's credential stores
+/// ([`crate::sandbox::PROTECTED_HOME_PATHS`]), which a repo of `~` itself contains.
+/// The file tools run in the daemon, outside any sandbox, so this is where they are
+/// kept from `~/.ssh`.
+fn confine_in(root: &Path, full: &Path, home: Option<&Path>) -> anyhow::Result<()> {
+    let real = real_path(full)?;
+    if !real.starts_with(real_path(root)?) {
+        anyhow::bail!("path leaves the repository: {}", full.display());
     }
+    if let Some(home) = home {
+        if let Some(p) = crate::sandbox::protected_paths(home)
+            .into_iter()
+            .find(|p| real.starts_with(p))
+        {
+            anyhow::bail!("refusing a credentials path: {}", p.display());
+        }
+    }
+    Ok(())
 }
 
 /// `p` with every existing part resolved (symlinks followed) and the part that does
@@ -128,6 +144,9 @@ impl Vfs for PassthroughVfs {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<FileNodeView>> {
             confine(&root, &base)?;
+            let protected = crate::sandbox::home()
+                .map(|h| crate::sandbox::protected_paths(&h))
+                .unwrap_or_default();
             let mut entries = Vec::new();
             for entry in std::fs::read_dir(&base)? {
                 let entry = entry?;
@@ -137,6 +156,11 @@ impl Vfs for PassthroughVfs {
                 // search_files prune, keeping both the explorer and agents' list_dir on
                 // source (agents were observed inventing `.git/revisions` paths).
                 if name == ".git" || name == "target" {
+                    continue;
+                }
+                // Credential stores are not listed either, not just unreadable.
+                let real = std::fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path());
+                if protected.iter().any(|p| real.starts_with(p)) {
                     continue;
                 }
                 let rel = if dir.is_empty() || dir == "/" {
@@ -250,6 +274,29 @@ impl Vfs for PassthroughVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A repo of `~` itself contains the credential stores: they are refused by real
+    // path, through a link too, while the rest of home stays reachable.
+    #[test]
+    fn credential_stores_under_home_are_refused() {
+        let home = std::env::temp_dir().join(format!("corrode-cred-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id_ed25519"), "key").unwrap();
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        std::fs::write(home.join("proj/main.rs"), "fn main() {}").unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh/id_ed25519"), home.join("proj/k")).unwrap();
+        let home = std::fs::canonicalize(&home).unwrap();
+        let ok = |p: &str| confine_in(&home, &home.join(p), Some(&home));
+
+        assert!(ok(".ssh/id_ed25519").is_err());
+        assert!(ok(".ssh").is_err());
+        assert!(ok(".ssh/new_key").is_err(), "writes into the store too");
+        assert!(ok("proj/k").is_err(), "a link into the store");
+        assert!(ok(".netrc").is_err(), "absent stores are refused before they exist");
+        assert!(ok("proj/main.rs").is_ok());
+        assert!(ok("proj/new.rs").is_ok());
+        std::fs::remove_dir_all(&home).ok();
+    }
 
     // Links planted in the repo must not carry reads or writes out of it: an existing
     // outside target, a dangling one (the write would create it), and a linked
