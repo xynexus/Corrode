@@ -113,7 +113,12 @@ host network into the sandbox; off by default — needed for tools that fetch),
 default 1800; past it the command's whole process group is killed and the call returns
 `exit timeout` — output is capped at 512 KiB head + 512 KiB tail per stream either way),
 `CORRODE_REQUEST_TIMEOUT_S` (limit on one hipfire call, the whole generation included,
-default 3600; a timed-out call fails rather than retrying), `CORRODE_APPROVAL_TIMEOUT_S`
+default 3600; a timed-out call fails rather than retrying), `CORRODE_RETRY_WINDOW_S` (how long a
+hipfire call keeps retrying 503/429 and connection failures -- capped exponential backoff with
+jitter, honouring Retry-After -- default 180, longer than a worker respawn; a 4xx such as
+`context_length_exceeded` is a typed `hipfire::Rejected` and never retried, a 500 is not retried by
+the client, and a task that still fails for a retryable reason runs once more before its
+dependents are written off), `CORRODE_APPROVAL_TIMEOUT_S`
 (how long a mutating call waits for a human before it is denied, default 3600; it is
 also denied at once if the client disconnects), `CORRODE_AUTO_APPROVE` (auto-approve every mutating tool call instead of blocking on
 a human — for unattended/headless swarms that would otherwise fail closed; off unless
