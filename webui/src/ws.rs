@@ -185,6 +185,7 @@ fn apply_event(
                 l.push(LogEntry::Ws(format!("ingested {path} -> {doc_id}: {chunks} chunks {note}")))
             });
         }
+        AgentEvent::TurnStarted { .. } => {}
         AgentEvent::TurnComplete { plan_id } => {
             busy.set(false);
             log.update(|l| l.push(LogEntry::Turn { plan_id }));

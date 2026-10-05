@@ -70,6 +70,12 @@ pub struct Outcome {
     pub artifacts: Vec<String>,
 }
 
+impl Outcome {
+    pub fn failed(e: anyhow::Error) -> Self {
+        Self { output: Err(e), emitted: Vec::new(), artifacts: Vec::new() }
+    }
+}
+
 /// A node in the provenance subgraph a plan produces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvNode {
@@ -387,30 +393,101 @@ where
     E: Fn(PlanTask) -> Fut,
     Fut: Future<Output = Outcome>,
 {
-    run_reactive_until(graph, execute, None).await
+    run_reactive_until(graph, execute, &Bounds::default()).await
 }
 
-/// [`run_reactive`] with a wall-clock ceiling for the turn.
+/// How long work still running at the turn's deadline may go on before it is cut off.
+/// ponytail: a constant; make it a knob if a deployment wants hard or longer stops.
+pub const TURN_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What stops a reactive drive.
+#[derive(Clone)]
+pub struct Bounds {
+    /// The turn's ceiling: nothing launches or folds in past it, and work still running
+    /// `grace` later is cut off.
+    pub deadline: Option<std::time::Instant>,
+    /// [`TURN_GRACE`] outside tests.
+    pub grace: std::time::Duration,
+    /// Ceiling on one task, retries and tool steps included (`CORRODE_TASK_TIMEOUT_S`).
+    pub task_timeout: Option<std::time::Duration>,
+    /// Flips to `true` on `CancelTurn`: launch nothing more and cut off what runs.
+    pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+impl Default for Bounds {
+    fn default() -> Self {
+        Self { deadline: None, grace: TURN_GRACE, task_timeout: None, cancel: None }
+    }
+}
+
+impl Bounds {
+    pub fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| *c.borrow())
+    }
+
+    /// Resolves when running work must be dropped: the deadline's grace is up, or the
+    /// turn was cancelled. Never, for an unbounded, uncancellable drive.
+    pub async fn cut_off(&self) {
+        let grace = async {
+            match self.deadline {
+                Some(d) => tokio::time::sleep_until((d + self.grace).into()).await,
+                None => std::future::pending().await,
+            }
+        };
+        let cancel = async {
+            if let Some(mut c) = self.cancel.clone() {
+                if c.wait_for(|v| *v).await.is_ok() {
+                    return;
+                }
+            }
+            // No switch, or its sender dropped: nothing will cancel this drive.
+            std::future::pending::<()>().await
+        };
+        tokio::select! {
+            _ = grace => {}
+            _ = cancel => {}
+        }
+    }
+
+    /// `fut` under these bounds, for turn work outside the graph (planning): `None`
+    /// when the task ceiling, the cut-off or a cancel comes first.
+    pub async fn run<T>(&self, fut: impl Future<Output = T>) -> Option<T> {
+        let ceiling = async {
+            match self.task_timeout {
+                Some(t) => tokio::time::sleep(t).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            v = fut => Some(v),
+            _ = ceiling => None,
+            _ = self.cut_off() => None,
+        }
+    }
+}
+
+/// [`run_reactive`] under [`Bounds`].
 ///
-/// Past the deadline no NEW task is launched and no emission is folded in; work already
-/// in flight is awaited rather than killed, because a half-finished mutating tool call
-/// is worse than a slow turn. Shedding stops the graph growing — an agent that emits a
-/// follow-up on every turn otherwise has no natural end, and one observed turn ran 494s
-/// with nothing able to say "that is enough".
-///
-/// ponytail: shed-on-deadline, not cancellation. Killing a running branch needs an abort
-/// path through the tool loop and the approval gate; this bounds growth, which is the
-/// half that can be done without one.
+/// Past the deadline no NEW task is launched and no emission is folded in. Shedding
+/// stops the graph growing — an agent that emits a follow-up on every turn otherwise has
+/// no natural end, and one observed turn ran 494s with nothing able to say "that is
+/// enough". Work in flight gets [`TURN_GRACE`] more, then is dropped and marked Failed,
+/// as it is at once on a cancel; a task past its own ceiling fails alone. Liveness is the
+/// scheduler's, not each await's: a wedged generation, a `cargo run` of a server or an
+/// unanswered approval used to hold a turn silent forever, and the deadline could not
+/// interrupt a step already running. Dropping a task drops its tool call with it (a
+/// command's process group is killed, an approval wait is abandoned).
 pub async fn run_reactive_until<E, Fut>(
     graph: &mut PlanGraph,
     execute: E,
-    deadline: Option<std::time::Instant>,
+    bounds: &Bounds,
 ) -> RunSummary
 where
     E: Fn(PlanTask) -> Fut,
     Fut: Future<Output = Outcome>,
 {
-    let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
+    let past_deadline = || bounds.deadline.is_some_and(|d| std::time::Instant::now() >= d);
+    let expired = || past_deadline() || bounds.cancelled();
     let mut summary = RunSummary::default();
     let mut followups = 0usize;
     let mut inflight = FuturesUnordered::new();
@@ -421,12 +498,40 @@ where
                 let id = task.id;
                 graph.set_status(id, Status::Running);
                 let fut = execute(task); // borrows `execute`; only the future is moved
-                inflight.push(async move { (id, fut.await) });
+                let limit = bounds.task_timeout;
+                inflight.push(async move {
+                    let Some(t) = limit else {
+                        return (id, fut.await, false);
+                    };
+                    match tokio::time::timeout(t, fut).await {
+                        Ok(o) => (id, o, false),
+                        Err(_) => {
+                            let e = anyhow::anyhow!(
+                                "task {id} timed out after {}s (CORRODE_TASK_TIMEOUT_S)",
+                                t.as_secs()
+                            );
+                            (id, Outcome::failed(e), true)
+                        }
+                    }
+                });
             }
         }
-        let Some((id, outcome)) = inflight.next().await else {
+        let next = tokio::select! {
+            n = inflight.next() => n,
+            _ = bounds.cut_off() => {
+                for n in graph.nodes.iter_mut().filter(|n| n.status == Status::Running) {
+                    n.status = Status::Failed;
+                    summary.cut_off += 1;
+                }
+                break; // drops `inflight`, and with it everything still running
+            }
+        };
+        let Some((id, outcome, timed_out)) = next else {
             break; // nothing running and nothing ready -> settled (or all remaining are stuck)
         };
+        if timed_out {
+            summary.timed_out.push(id);
+        }
         graph.set_status(
             id,
             if outcome.output.is_ok() {
@@ -475,7 +580,8 @@ where
             .filter(|n| n.status == Status::Pending)
             .count();
     }
-    summary.expired = expired();
+    summary.expired = past_deadline();
+    summary.cancelled = bounds.cancelled();
     summary
 }
 
@@ -488,6 +594,12 @@ pub struct RunSummary {
     pub unlaunched: usize,
     /// Emissions dropped by `followup_cap`.
     pub capped: usize,
+    /// The drive was cancelled (`CancelTurn`).
+    pub cancelled: bool,
+    /// Tasks still running when the drive was cut off, now Failed.
+    pub cut_off: usize,
+    /// Tasks that failed by passing `task_timeout`.
+    pub timed_out: Vec<TaskId>,
 }
 
 /// Extract the single follow-up instruction an agent proposed, from a `NEXT:` line
@@ -929,7 +1041,7 @@ mod tests {
         let summary = run_reactive_until(
             &mut g,
             |_t: PlanTask| async move { unreachable!() },
-            Some(past),
+            &Bounds { deadline: Some(past), ..Default::default() },
         )
         .await;
         assert!(summary.expired);
@@ -954,7 +1066,7 @@ mod tests {
                     artifacts: Vec::new(),
                 }
             },
-            Some(soon),
+            &Bounds { deadline: Some(soon), ..Default::default() },
         )
         .await;
         assert!(summary2.expired);
@@ -962,6 +1074,83 @@ mod tests {
         assert_eq!(g2.nodes.len(), 1, "graph did not grow past the deadline");
         // The in-flight task was awaited, not killed.
         assert_eq!(g2.nodes[0].status, Status::Done);
+    }
+
+    /// A task past its ceiling fails alone; its sibling finishes and the turn settles.
+    #[tokio::test]
+    async fn a_task_past_its_ceiling_fails_and_the_rest_carry_on() {
+        let mut g = PlanGraph::new("plan-ceiling");
+        g.add(Role::Coder, "hangs", vec![]);
+        g.add(Role::Coder, "quick", vec![]);
+        let b = Bounds {
+            task_timeout: Some(std::time::Duration::from_millis(50)),
+            ..Default::default()
+        };
+        let summary = run_reactive_until(
+            &mut g,
+            |task: PlanTask| async move {
+                if task.prompt == "hangs" {
+                    std::future::pending::<()>().await;
+                }
+                Outcome { output: Ok("ok".into()), emitted: vec![], artifacts: vec![] }
+            },
+            &b,
+        )
+        .await;
+        assert_eq!(summary.timed_out, vec![0]);
+        assert_eq!(g.nodes[0].status, Status::Failed);
+        assert_eq!(g.nodes[1].status, Status::Done);
+    }
+
+    /// Work still running past deadline + grace is dropped, not awaited forever.
+    #[tokio::test]
+    async fn work_running_past_the_grace_is_cut_off() {
+        let mut g = PlanGraph::new("plan-cut");
+        g.add(Role::Coder, "hangs", vec![]);
+        let b = Bounds {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(20)),
+            grace: std::time::Duration::from_millis(20),
+            ..Default::default()
+        };
+        let summary = run_reactive_until(
+            &mut g,
+            |_t: PlanTask| async move {
+                std::future::pending::<()>().await;
+                unreachable!()
+            },
+            &b,
+        )
+        .await;
+        assert!(summary.expired);
+        assert_eq!(summary.cut_off, 1);
+        assert_eq!(g.nodes[0].status, Status::Failed);
+    }
+
+    /// A cancel drops what runs and launches nothing more.
+    #[tokio::test]
+    async fn a_cancel_cuts_off_the_drive() {
+        let mut g = PlanGraph::new("plan-cancel");
+        g.add(Role::Coder, "hangs", vec![]);
+        g.add(Role::Coder, "after", vec![0]);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let b = Bounds { cancel: Some(rx), ..Default::default() };
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            tx.send(true).unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await; // keep it open
+        });
+        let summary = run_reactive_until(
+            &mut g,
+            |_t: PlanTask| async move {
+                std::future::pending::<()>().await;
+                unreachable!()
+            },
+            &b,
+        )
+        .await;
+        assert!(summary.cancelled);
+        assert_eq!(summary.cut_off, 1);
+        assert_eq!(g.nodes[1].status, Status::Pending, "nothing launched after the cancel");
     }
 
     /// No budget set -> unchanged behaviour, emissions included.
@@ -987,7 +1176,7 @@ mod tests {
                     artifacts: Vec::new(),
                 }
             },
-            None,
+            &Bounds::default(),
         )
         .await;
         assert_eq!(summary, RunSummary::default());

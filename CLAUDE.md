@@ -107,8 +107,12 @@ unchanged when off), `CORRODE_FANOUT` (coder-task ensemble size — K read-only 
 attempts judged by the review model before one writable execution; default 1 = off,
 clamped to 8), `CORRODE_PLAN_REVIEW` (plan-level review pass after the plan settles;
 on unless set off), `CORRODE_TURN_BUDGET_S` (wall-clock ceiling for one Prompt
-turn — past it no new task launches and no emission is folded in, though in-flight
-work is awaited; absent/0 -> unbounded), `CORRODE_SANDBOX` (bubblewrap-confine every spawned process
+turn, planning included — past it no new task launches and no emission is folded in,
+and work still running `plan_graph::TURN_GRACE` (120 s) later is dropped and marked
+Failed; absent/0 -> unbounded), `CORRODE_TASK_TIMEOUT_S` (ceiling on one task, its
+retries and tool steps included, and on planning; default 3600, 0 disables; past it the
+task fails alone and what it was running is dropped — a command's process group
+killed), `CORRODE_SANDBOX` (bubblewrap-confine every spawned process
 — `run_command`/`run_skill_script` and the web terminal — off unless set on;
 see `sandbox.rs` + `docs/sessions-and-sandbox.md`; it gets the Rust toolchain -- `RUSTUP_HOME`
 read-only, `CARGO_HOME` under a throwaway overlay -- so builds and tests run, and `doctor`
@@ -167,7 +171,10 @@ swarm (spawned concurrently — long-lived, may block on approval), `SelectRepo`
 ingest / list ingested docs), `ListNeighbors`→session graph (expand a provenance
 node's one-hop neighborhood for the interactive graph explorer),
 `TerminalInput`→session pty (client id is per browser tab), `ApprovalResponse`→
-resolves a pending approval on the connection's session gate. The read-only graph/
+resolves a pending approval on the connection's session gate, `CancelTurn{plan_id}`→
+flips that turn's cancel switch (`Session::turns`; a tenant cancels only its own). A
+Prompt turn opens with `TurnStarted{plan_id}` and always ends with `TurnComplete` —
+sent by a drop guard (`TurnEnd`), so a failed plan, a cancel or a panic still ends it. The read-only graph/
 vfs commands no-op cleanly to an empty reply when no store is configured.
 
 ## Roles
@@ -195,8 +202,12 @@ marks it, folds in the tasks it emitted, and reschedules — until nothing is re
 or in flight. A subagent emits follow-up work (a test contract, a research
 spin-off) by ending its reply with a fenced ` ```tasks ` JSON block, which
 `parse_emitted` folds back in (`after: true` depends on the emitter). `run_reactive_until`
-bounds the turn: past `CORRODE_TURN_BUDGET_S` it launches nothing new and drops
-emissions, so a swarm that emits a follow-up every turn still terminates. Tasks left
+bounds the turn (`plan_graph::Bounds`): past `CORRODE_TURN_BUDGET_S` it launches nothing
+new and drops emissions, so a swarm that emits a follow-up every turn still terminates;
+each task runs under `CORRODE_TASK_TIMEOUT_S`; and the drive races its in-flight set
+against the deadline's grace and `CancelTurn`, dropping what still runs — liveness is
+the scheduler's, so a wedged generation, a never-ending command or an unanswered
+approval cannot hold a turn silent. Tasks left
 unschedulable after the run settles (`stuck`) surface as an Error. `band_for` maps
 role→band (orchestration→Realtime, architect/coder/review→Default,
 research→Opportunistic).

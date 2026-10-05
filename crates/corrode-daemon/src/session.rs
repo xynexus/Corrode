@@ -70,6 +70,9 @@ pub struct Session {
     /// Per-user hipfire bearer token for this session's generation calls (fairness).
     /// `None` => the daemon's shared key (all tenants share one fair share).
     pub owner_token: Option<String>,
+    /// Running Prompt turns' cancel switches, by plan id. Per-session, so a tenant can
+    /// cancel only its own turns.
+    pub turns: std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
 }
 
 impl Session {
@@ -93,6 +96,7 @@ impl Session {
             skill_scripts: repo.skill_scripts,
             owner_token,
             key,
+            turns: Default::default(),
         }
     }
 }

@@ -37,6 +37,7 @@ const FLAGS: &[&str] = &[
 /// Counts and whole seconds.
 const WHOLE: &[&str] = &[
     "CORRODE_TURN_BUDGET_S",
+    "CORRODE_TASK_TIMEOUT_S",
     "CORRODE_REQUEST_TIMEOUT_S",
     "CORRODE_COMMAND_TIMEOUT_S",
     "CORRODE_APPROVAL_TIMEOUT_S",
