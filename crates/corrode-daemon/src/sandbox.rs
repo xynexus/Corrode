@@ -77,6 +77,26 @@ fn credential_masks(repo: &Path, home: &Path) -> Vec<String> {
     a
 }
 
+/// bwrap arguments giving the sandbox the Rust toolchain, so the swarm can build and
+/// test what it writes -- without them every `cargo` exited 127 while turns completed
+/// as if fine. Rustup's toolchains read-only; CARGO_HOME (its bin proxies and crate
+/// cache) under a throwaway overlay, because cargo writes there (its package-cache
+/// lock, fetches when the net is shared) but nothing the swarm runs may alter the
+/// host's cache. Absent dirs are skipped. ponytail: Rust only -- give other
+/// toolchains (node, a python venv) the same when a repo wants them.
+fn toolchain_binds(cargo_home: Option<PathBuf>, rustup_home: Option<PathBuf>) -> Vec<String> {
+    let mut a = Vec::new();
+    if let Some(p) = rustup_home.filter(|p| p.is_dir()) {
+        let p = p.to_string_lossy().into_owned();
+        a.extend(["--ro-bind".to_string(), p.clone(), p]);
+    }
+    if let Some(p) = cargo_home.filter(|p| p.is_dir()) {
+        let p = p.to_string_lossy().into_owned();
+        a.extend(["--overlay-src".to_string(), p.clone(), "--tmp-overlay".to_string(), p]);
+    }
+    a
+}
+
 #[derive(Clone)]
 pub struct Sandbox {
     enabled: bool,
@@ -86,15 +106,10 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
-    /// `CORRODE_SANDBOX` = `on`/`1`/`true` enables (anything else, or unset, is off).
-    /// `CORRODE_SANDBOX_NET` = `on`/`1`/`true` shares the host network.
+    /// `CORRODE_SANDBOX` on enables; `CORRODE_SANDBOX_NET` on shares the host network
+    /// (both through [`crate::knobs::flag`]).
     pub fn from_env() -> Self {
-        let on = |k: &str| {
-            matches!(
-                std::env::var(k).unwrap_or_default().to_ascii_lowercase().as_str(),
-                "on" | "1" | "true" | "yes"
-            )
-        };
+        let on = |k: &str| crate::knobs::flag(k, false);
         let s = Self { enabled: on("CORRODE_SANDBOX"), share_net: on("CORRODE_SANDBOX_NET") };
         if s.enabled {
             eprintln!(
@@ -144,6 +159,8 @@ impl Sandbox {
         push(&["--ro-bind-try", "/lib64", "/lib64"]);
         push(&["--ro-bind-try", "/sbin", "/sbin"]);
         push(&["--ro-bind", "/etc", "/etc"]);
+        // No /dev/dri: a GPU in the sandbox would let a command reach the hipfire
+        // daemon's device.
         push(&["--proc", "/proc"]);
         push(&["--dev", "/dev"]);
         push(&["--tmpfs", "/tmp"]);
@@ -155,6 +172,15 @@ impl Sandbox {
         push(&["--bind", &repo, &repo]);
         let corrode = format!("{repo}/.corrode");
         push(&["--ro-bind-try", &corrode, &corrode]);
+        // After the repo bind, so a repo at `~` cannot hide them (a later bind of a
+        // parent covers the mounts beneath it).
+        let toolchain_dir = |var: &str, dir: &str| {
+            std::env::var_os(var).map(PathBuf::from).or_else(|| home().map(|h| h.join(dir)))
+        };
+        a.extend(toolchain_binds(
+            toolchain_dir("CARGO_HOME", ".cargo"),
+            toolchain_dir("RUSTUP_HOME", ".rustup"),
+        ));
         // A repo that contains home's credential stores (the repo is `~` itself) must
         // not hand them to the command: mount over them, after the bind.
         if let Some(home) = home() {
@@ -219,6 +245,21 @@ mod tests {
         assert!(!a.contains(".aws"), "absent stores need no mask: {a}");
         assert!(credential_masks(&home.join("proj"), &home).is_empty());
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn rust_toolchain_is_reachable_but_not_writable() {
+        let d = std::env::temp_dir().join(format!("corrode-tc-{}", std::process::id()));
+        let (cargo, rustup) = (d.join("cargo"), d.join("rustup"));
+        std::fs::create_dir_all(&cargo).unwrap();
+        std::fs::create_dir_all(&rustup).unwrap();
+        let (c, r) = (cargo.to_string_lossy(), rustup.to_string_lossy());
+        let a = toolchain_binds(Some(cargo.clone()), Some(rustup.clone())).join(" ");
+        assert!(a.contains(&format!("--ro-bind {r} {r}")), "{a}");
+        assert!(a.contains(&format!("--overlay-src {c} --tmp-overlay {c}")), "{a}");
+        assert!(!a.contains("--bind "), "nothing writable through to the host: {a}");
+        assert!(toolchain_binds(Some(d.join("absent")), None).is_empty());
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

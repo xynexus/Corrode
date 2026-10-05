@@ -29,6 +29,16 @@ pub async fn run() -> bool {
     let mut fatal = 0u32;
     let has_fallback = std::env::var("CORRODE_MODEL").is_ok();
 
+    // --- knobs: the daemon refuses to start on any of these ---
+    let bad = crate::knobs::check();
+    for b in &bad {
+        fatal += 1;
+        fail(b, "fix or unset it — the daemon refuses to start with it");
+    }
+    if bad.is_empty() {
+        ok("knobs: every set CORRODE_* flag and bound parses");
+    }
+
     // --- hipfire ---
     let base = std::env::var("HIPFIRE_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
     let client = Client::new(base.clone(), std::env::var("HIPFIRE_API_KEY").ok());
@@ -61,12 +71,21 @@ pub async fn run() -> bool {
     }
 
     // --- sandbox (only meaningful when enabled) ---
-    let sb = std::env::var("CORRODE_SANDBOX").unwrap_or_default().to_ascii_lowercase();
-    if matches!(sb.as_str(), "on" | "1" | "true" | "yes") {
-        match bwrap_usable() {
-            Ok(()) => ok(
-                "sandbox: bwrap confines (repo rw, .corrode ro, home credential stores masked, no net)",
-            ),
+    let repo = std::env::var("CORRODE_REPO").unwrap_or_else(|_| ".".into());
+    let sandbox_on = crate::knobs::flag("CORRODE_SANDBOX", false);
+    if sandbox_on {
+        let root = std::fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone().into());
+        match sandboxed(&root, &["true"]) {
+            Ok(_) => {
+                ok("sandbox: bwrap confines (repo rw, .corrode ro, home credential stores masked, no net)");
+                match sandboxed(&root, &["sh", "-c", "command -v cargo >/dev/null && cargo --version"]) {
+                    Ok(v) => ok(&format!("sandbox: builds can run ({})", v.trim())),
+                    Err(e) => warn(&format!(
+                        "sandbox: no cargo inside it ({e}) — every build and test the swarm runs \
+                         exits 127; put ~/.cargo/bin on the daemon's PATH"
+                    )),
+                }
+            }
             Err(e) => {
                 fatal += 1;
                 fail(
@@ -83,6 +102,17 @@ pub async fn run() -> bool {
             "sandbox: off — run_command, skill scripts and the web terminal can read ~/.ssh \
              and other credential stores (set CORRODE_SANDBOX=on to confine them)",
         );
+    }
+
+    if crate::knobs::flag("CORRODE_AUTO_APPROVE", false) {
+        if sandbox_on {
+            info("auto-approve: on — writes and commands run without a human, inside the sandbox");
+        } else {
+            warn(
+                "auto-approve: on WITHOUT the sandbox — every write and command the swarm \
+                 proposes runs unconfined with the daemon's privileges (set CORRODE_SANDBOX=on)",
+            );
+        }
     }
 
     // --- auth table ---
@@ -106,7 +136,6 @@ pub async fn run() -> bool {
     }
 
     // --- repo ---
-    let repo = std::env::var("CORRODE_REPO").unwrap_or_else(|_| ".".into());
     if Path::new(&repo).is_dir() {
         ok(&format!("repo: {repo}"));
     } else {
@@ -133,6 +162,10 @@ pub async fn run() -> bool {
     for k in [
         "CORRODE_SANDBOX",
         "CORRODE_SANDBOX_NET",
+        "CORRODE_AUTO_APPROVE",
+        "CORRODE_TURN_BUDGET_S",
+        "CORRODE_MAX_CONCURRENCY",
+        "CORRODE_REASONING_EFFORT",
         "CORRODE_USERS",
         "CORRODE_REPO",
         "CORRODE_GRAPH_DIR",
@@ -155,9 +188,6 @@ pub async fn run() -> bool {
     }
 }
 
-/// The real usability test for the sandbox: actually run an unprivileged bwrap.
-/// Its failure modes (missing binary, AppArmor/userns restriction) are hard to
-/// enumerate from config alone, so we just try it.
 /// Print the model each role will run on. `RoleModels::resolve` drops an override
 /// naming a model hipfire does not serve, so a typo in `CORRODE_ROLES` would put
 /// that role on the default pick without a word — warn about each one here.
@@ -185,40 +215,19 @@ fn role_assignments(served: &[String]) {
     }
 }
 
-fn bwrap_usable() -> anyhow::Result<()> {
-    let out = Command::new("bwrap")
-        .args([
-            "--unshare-all",
-            "--die-with-parent",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            // Mirror the real sandbox's bind set: /bin (merged-usr symlink) plus the
-            // lib dirs, or a dynamically-linked probe binary can't find its ELF
-            // interpreter and execvp reports a misleading ENOENT.
-            "--ro-bind-try",
-            "/bin",
-            "/bin",
-            "--ro-bind-try",
-            "/lib",
-            "/lib",
-            "--ro-bind-try",
-            "/lib64",
-            "/lib64",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            "--",
-            "/usr/bin/true",
-        ])
+/// Run `argv` through the daemon's real [`crate::sandbox::Sandbox::wrap`] for `repo`,
+/// returning its stdout. A probe with its own bwrap arguments said "ok" while the
+/// real bind set left cargo unreachable.
+fn sandboxed(repo: &Path, argv: &[&str]) -> anyhow::Result<String> {
+    let (prog, args) = crate::sandbox::Sandbox::from_env().wrap(repo, argv);
+    let out = Command::new(&prog)
+        .args(&args)
         .output()
-        .map_err(|e| anyhow::anyhow!("cannot exec bwrap ({e}) — is bubblewrap installed?"))?;
+        .map_err(|e| anyhow::anyhow!("cannot exec {prog} ({e}) — is bubblewrap installed?"))?;
     if out.status.success() {
-        Ok(())
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim())
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("exit {} {}", out.status.code().unwrap_or(-1), err.trim())
     }
 }

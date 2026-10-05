@@ -64,6 +64,11 @@ Run the pair: start `corrode-daemon` (needs `hipfire serve` up for role resoluti
 then `corrode-web`, then open http://127.0.0.1:8787 — the dev page drives the
 swarm over the bridge.
 
+Every on/off knob reads through `knobs::flag` (`1`/`true`/`on`/`yes` or
+`0`/`false`/`off`/`no`), and a set flag, bound or `CORRODE_REASONING_EFFORT` that does
+not parse stops the daemon at startup and fails `doctor` (`knobs::check`) rather than
+failing open (`TURN_BUDGET_S=2h` used to mean unbounded).
+
 Env: `HIPFIRE_BASE_URL` (default `http://127.0.0.1:11435`), `HIPFIRE_API_KEY`,
 `CORRODE_MODEL` (offline fallback model for all roles), `CORRODE_ROLES` (path to a
 JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`), `CORRODE_REPO_ALLOW` (`:`-separated directories a
@@ -97,15 +102,17 @@ visibly rather than taking half an answer as whole), `CORRODE_CONTEXT_TOKENS` (t
 model's context, default 32768; the tool loop stops gathering once the conversation leaves
 less than one `CORRODE_MAX_TOKENS` of it, so the final answer always fits), `CORRODE_STREAM`
 (stream single-shot subagent output over SSE, relaying `SubagentDelta` events to
-the UI as tokens generate; off unless `1`/`true`/`on` — the non-streaming path is
+the UI as tokens generate; off unless set on — the non-streaming path is
 unchanged when off), `CORRODE_FANOUT` (coder-task ensemble size — K read-only proposal
 attempts judged by the review model before one writable execution; default 1 = off,
 clamped to 8), `CORRODE_PLAN_REVIEW` (plan-level review pass after the plan settles;
-on unless `0`/`false`), `CORRODE_TURN_BUDGET_S` (wall-clock ceiling for one Prompt
+on unless set off), `CORRODE_TURN_BUDGET_S` (wall-clock ceiling for one Prompt
 turn — past it no new task launches and no emission is folded in, though in-flight
 work is awaited; absent/0 -> unbounded), `CORRODE_SANDBOX` (bubblewrap-confine every spawned process
-— `run_command`/`run_skill_script` and the web terminal — off unless `on`/`1`/`true`;
-see `sandbox.rs` + `docs/sessions-and-sandbox.md`; home's credential stores -- `~/.ssh`, `~/.gnupg`, `~/.aws`,
+— `run_command`/`run_skill_script` and the web terminal — off unless set on;
+see `sandbox.rs` + `docs/sessions-and-sandbox.md`; it gets the Rust toolchain -- `RUSTUP_HOME`
+read-only, `CARGO_HOME` under a throwaway overlay -- so builds and tests run, and `doctor`
+checks cargo through the real `wrap()`; home's credential stores -- `~/.ssh`, `~/.gnupg`, `~/.aws`,
 `~/.config/gh`, `~/.netrc`, … (`sandbox::PROTECTED_HOME_PATHS`) -- are masked when the repo
 contains them, and the file tools refuse them whether or not the sandbox is on), `CORRODE_SANDBOX_NET` (share the
 host network into the sandbox; off by default — needed for tools that fetch),
@@ -122,8 +129,8 @@ dependents are written off), `CORRODE_APPROVAL_TIMEOUT_S`
 (how long a mutating call waits for a human before it is denied, default 3600; it is
 also denied at once if the client disconnects), `CORRODE_AUTO_APPROVE` (auto-approve every mutating tool call instead of blocking on
 a human — for unattended/headless swarms that would otherwise fail closed; off unless
-`1`/`true`/`on`, and meant to be paired with `CORRODE_SANDBOX` so writes/commands stay
-confined; each auto-approval is logged and the call still streams back as a
+set on, and meant to be paired with `CORRODE_SANDBOX` so writes/commands stay
+confined — the daemon and `doctor` warn when it is not; each auto-approval is logged and the call still streams back as a
 `ToolResult`), `CORRODE_USERS` (path to a JSON `user -> {token, hipfire_token?}` table; present =
 auth on, connections must `Authenticate` before repo-scoped commands, and each
 user's `hipfire_token` — if set — attributes their swarm to a distinct hipfire

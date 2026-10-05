@@ -379,10 +379,7 @@ impl Client {
         // ponytail: still one cap for every call. Split per-role (a planner wants more
         // than a research skim) once we tune it.
         let max_output_tokens = max_output_tokens();
-        let stream = matches!(
-            std::env::var("CORRODE_STREAM").ok().as_deref(),
-            Some("1") | Some("true") | Some("on")
-        );
+        let stream = crate::knobs::flag("CORRODE_STREAM", false);
         // Every call is bounded. Nothing else was: no timeout here or in hipfire,
         // so one wedged generation hung its turn forever. The bound covers the
         // whole generation (a non-streamed reply arrives only when it is done), so

@@ -13,6 +13,9 @@ Type=exec
 # EnvironmentFile carries the deployment's config (see corrode.env.example). At
 # minimum set CORRODE_REPO; turn on the sandbox and auth for a real deployment.
 EnvironmentFile=%h/Corrode/deploy/corrode.env
+# systemd's default PATH has no ~/.cargo/bin: without it the daemon's rustfmt
+# normalizer and every cargo the (sandboxed) swarm runs is "not found".
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=%h/Corrode
 # Build first: cargo build -p corrode-daemon --release --features helix,docling
 #   (needs OpenSSL+pkg-config for helix — see CLAUDE.md). Point ExecStart at the
