@@ -19,6 +19,7 @@ mod fuse;
 mod graph;
 mod graphvfs;
 mod hipfire;
+mod knobs;
 mod normalize;
 #[cfg(feature = "docling")]
 mod ingest;
@@ -70,6 +71,22 @@ async fn main() -> anyhow::Result<()> {
         let root = std::env::var("CORRODE_REPO").unwrap_or_else(|_| ".".to_string());
         let ok = normalize::main(&project::Project::load(std::path::Path::new(&root)), write);
         std::process::exit(if ok { 0 } else { 1 });
+    }
+
+    // A malformed bound or flag stops the daemon here instead of failing open later
+    // (`TURN_BUDGET_S=2h` meant unbounded, `AUTO_APPROVE=yes` meant a human gate).
+    let bad = knobs::check();
+    if !bad.is_empty() {
+        for b in &bad {
+            eprintln!("corrode-daemon: refusing to start: {b}");
+        }
+        std::process::exit(2);
+    }
+    if knobs::flag("CORRODE_AUTO_APPROVE", false) && !knobs::flag("CORRODE_SANDBOX", false) {
+        eprintln!(
+            "warning: CORRODE_AUTO_APPROVE is on without CORRODE_SANDBOX — every write and \
+             command the swarm proposes runs unconfined, with this daemon's privileges"
+        );
     }
 
     let base_url =

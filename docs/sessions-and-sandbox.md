@@ -236,6 +236,10 @@ bwrap \
 - **Network is deny-by-default.** That breaks tools that fetch — `cargo`, `pip`,
   `git clone`. Make `--share-net` an explicit per-session opt-in, or gate it
   through the approval prompt.
+- **The Rust toolchain is in.** `RUSTUP_HOME` is bound read-only and `CARGO_HOME`
+  under a throwaway overlay (cargo writes its lock and any fetch there; the host's
+  crate cache is never touched), so `cargo build`/`test` work offline against the
+  cached registry. `doctor` runs `cargo --version` through the real `wrap()`.
 - **Env is a choice.** Shells inherit the daemon's env today (PATH, venv). Inside
   bwrap decide between passthrough and `--clearenv` + an allow-list.
 - **Fail closed in service mode.** If `bwrap` is missing or userns is disabled:

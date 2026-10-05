@@ -1579,12 +1579,9 @@ fn max_concurrency() -> usize {
         .unwrap_or(1024)
 }
 
-/// `CORRODE_PLAN_REVIEW`: the plan-level review pass, on unless set to `0`/`false`.
+/// `CORRODE_PLAN_REVIEW`: the plan-level review pass, on unless set off.
 fn plan_review_enabled() -> bool {
-    !matches!(
-        std::env::var("CORRODE_PLAN_REVIEW").as_deref(),
-        Ok("0") | Ok("false")
-    )
+    crate::knobs::flag("CORRODE_PLAN_REVIEW", true)
 }
 
 /// Turn-wide memory of tool calls already made, keyed on (tool, canonical args) —
@@ -4055,13 +4052,7 @@ mod tests {
         // This never fired before because the swarm was not calling tools at all: a
         // hipfire flag left the qwen35 template unrendered, so no tools block reached the
         // model and `executed_mutating` was always 0. The assertion passed by vacuity.
-        let auto_approve = matches!(
-            std::env::var("CORRODE_AUTO_APPROVE")
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .as_str(),
-            "1" | "true" | "on"
-        );
+        let auto_approve = crate::knobs::flag("CORRODE_AUTO_APPROVE", false);
         assert!(
             auto_approve || executed_mutating <= approvals.len(),
             "{executed_mutating} executed mutating tool results but only {} approvals — \

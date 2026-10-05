@@ -44,13 +44,10 @@ pub struct ApprovalGate {
 }
 
 impl ApprovalGate {
-    /// A gate whose auto-approve is read from `CORRODE_AUTO_APPROVE`
-    /// (`1`/`true`/`on`). Off otherwise — the human-in-the-loop default.
+    /// A gate whose auto-approve is read from `CORRODE_AUTO_APPROVE`. Off unless set
+    /// on — the human-in-the-loop default.
     pub fn from_env() -> Self {
-        let auto_approve = matches!(
-            std::env::var("CORRODE_AUTO_APPROVE").ok().as_deref(),
-            Some("1") | Some("true") | Some("on")
-        );
+        let auto_approve = crate::knobs::flag("CORRODE_AUTO_APPROVE", false);
         Self {
             auto_approve,
             ..Default::default()
