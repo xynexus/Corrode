@@ -41,11 +41,88 @@ enum SseDelta {
     Incomplete(String),
 }
 
-/// Whether a response status is transient overload worth retrying (hipfire sheds
-/// with 5xx under memory pressure; 429 is explicit rate-limit). A 4xx is our bug —
-/// don't retry it.
+/// Whether a status means "come back shortly": hipfire answers 503 while its
+/// worker is respawned (with Retry-After) and 429 to rate-limit; 502/504 are a
+/// proxy saying the same. A 500 is a fault, and a 4xx a request that will never
+/// succeed: neither is retried here (a 500 gets one task-level retry instead).
 fn is_transient(status: reqwest::StatusCode) -> bool {
-    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    use reqwest::StatusCode as S;
+    matches!(
+        status,
+        S::SERVICE_UNAVAILABLE | S::TOO_MANY_REQUESTS | S::BAD_GATEWAY | S::GATEWAY_TIMEOUT
+    )
+}
+
+/// A request hipfire refused for good (4xx): the prompt does not fit
+/// (`context_length_exceeded`), the model does not exist, or the request is
+/// malformed. Retrying cannot help, so nothing does.
+#[derive(Debug)]
+pub struct Rejected {
+    pub status: u16,
+    pub code: Option<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = self.code.as_deref().unwrap_or("rejected");
+        write!(f, "hipfire {} {code}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+/// A call that ran the whole request timeout (`CORRODE_REQUEST_TIMEOUT_S`).
+#[derive(Debug)]
+pub struct TimedOut(pub String);
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "hipfire request timed out (CORRODE_REQUEST_TIMEOUT_S): {}", self.0)
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// Whether a failed task is worth running once more: not when hipfire refused the
+/// request, the reply was cut off at the output limit (it would be again), or the
+/// call already ran the whole request timeout.
+pub fn is_retryable(e: &anyhow::Error) -> bool {
+    !(e.is::<Rejected>() || e.is::<Truncated>() || e.is::<TimedOut>())
+}
+
+/// How long transient failures (503/429, an unreachable server) are retried for:
+/// `CORRODE_RETRY_WINDOW_S`, default 180 -- longer than hipfire takes to respawn
+/// a worker and reload its model. Past it the call fails.
+fn retry_window() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("CORRODE_RETRY_WINDOW_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(180),
+    )
+}
+
+/// The wait before retry `attempt` (0-based): the server's Retry-After if it
+/// gave one, else 1 s doubling to a 30 s cap -- plus up to 25% jitter, so the
+/// swarm's concurrent calls do not come back in lockstep and re-coalesce into
+/// the same failure.
+fn retry_delay(attempt: u32, retry_after: Option<u64>) -> std::time::Duration {
+    let base = retry_after.unwrap_or_else(|| (1u64 << attempt.min(5)).min(30)) * 1000;
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+        % (base / 4 + 1);
+    std::time::Duration::from_millis(base + jitter)
+}
+
+/// hipfire's error body: `{"error": {"message", "code"}}`, or the raw text.
+fn error_body(text: &str) -> (Option<String>, String) {
+    let v: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+    let e = &v["error"];
+    let message = e["message"].as_str().map(str::to_string).unwrap_or_else(|| text.to_string());
+    (e["code"].as_str().map(str::to_string), message)
 }
 
 /// The usable answer from a `/v1/responses` reply. Some hipfire model builds (the
@@ -510,10 +587,10 @@ impl Client {
         body: &serde_json::Value,
         owner_token: Option<&str>,
     ) -> anyhow::Result<ResponsesReply> {
-        const MAX_ATTEMPTS: u32 = 4;
-        let mut backoff = std::time::Duration::from_millis(400);
-        let mut last: Option<anyhow::Error> = None;
-        for attempt in 0..MAX_ATTEMPTS {
+        let started = std::time::Instant::now();
+        let window = retry_window();
+        let mut attempt = 0u32;
+        loop {
             let mut rb = self
                 .http
                 .post(format!("{}/v1/responses", self.base_url))
@@ -521,28 +598,44 @@ impl Client {
             if let Some(token) = owner_token.or(self.api_key.as_deref()) {
                 rb = rb.bearer_auth(token);
             }
-            match rb.send().await {
-                Ok(resp) if is_transient(resp.status()) => {
-                    last = Some(anyhow::anyhow!("hipfire sched-shed {}", resp.status()));
+            let (failure, retry_after) = match rb.send().await {
+                Ok(resp) if resp.status().is_success() => return Ok(resp.json().await?),
+                Ok(resp) => {
+                    let status = resp.status();
+                    let retry_after = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<u64>().ok());
+                    let (code, message) = error_body(&resp.text().await.unwrap_or_default());
+                    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        return Err(Rejected { status: status.as_u16(), code, message }.into());
+                    }
+                    let err = anyhow::anyhow!("hipfire {status}: {message}");
+                    if !is_transient(status) {
+                        return Err(err);
+                    }
+                    (err, retry_after)
                 }
-                Ok(resp) => return Ok(resp.error_for_status()?.json().await?),
-                // Unreachable (restarting, not up yet): back off and retry. A call
-                // that ran the whole request timeout is not shedding, it is stuck or
-                // far too slow -- retrying would multiply the wait, so fail it.
-                Err(e) if e.is_connect() => last = Some(e.into()),
-                Err(e) if e.is_timeout() => {
-                    return Err(anyhow::anyhow!(
-                        "hipfire request timed out (CORRODE_REQUEST_TIMEOUT_S): {e}"
-                    ))
-                }
+                // Unreachable (restarting, not up yet), or the connection dropped
+                // before a reply: back off and retry. A call that ran the whole
+                // request timeout is not shedding, it is stuck or far too slow --
+                // retrying would multiply the wait, so fail it.
+                Err(e) if e.is_timeout() => return Err(TimedOut(e.to_string()).into()),
+                Err(e) if e.is_connect() || e.is_request() => (e.into(), None),
                 Err(e) => return Err(e.into()), // non-transient -> don't retry
+            };
+            let wait = retry_delay(attempt, retry_after);
+            if started.elapsed() + wait > window {
+                return Err(failure.context(format!(
+                    "hipfire still unavailable after retrying for {}s (CORRODE_RETRY_WINDOW_S)",
+                    started.elapsed().as_secs()
+                )));
             }
-            if attempt + 1 < MAX_ATTEMPTS {
-                tokio::time::sleep(backoff).await;
-                backoff *= 2;
-            }
+            eprintln!("hipfire: {failure}; retrying in {:.1}s", wait.as_secs_f32());
+            tokio::time::sleep(wait).await;
+            attempt += 1;
         }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("hipfire: retries exhausted")))
     }
 
     /// Like [`Self::respond`], but streams: `on_delta` is called with each incremental
@@ -859,10 +952,95 @@ mod tests {
         assert_eq!(client.input_items("unrelated"), "unrelated");
     }
 
+    /// A fake hipfire whose replies are scripted in order, counting requests.
+    async fn scripted(replies: Vec<(u16, Option<&'static str>, &'static str)>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::{response::IntoResponse, routing::post, Router};
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+        let n = Arc::new(AtomicUsize::new(0));
+        let (seen, replies) = (n.clone(), Arc::new(replies));
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let (seen, replies) = (seen.clone(), replies.clone());
+                async move {
+                    let i = seen.fetch_add(1, Ordering::SeqCst).min(replies.len() - 1);
+                    let (code, retry_after, body) = replies[i];
+                    let mut r = (axum::http::StatusCode::from_u16(code).unwrap(), body.to_string()).into_response();
+                    if let Some(ra) = retry_after {
+                        r.headers_mut().insert("retry-after", ra.parse().unwrap());
+                    }
+                    r
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), n)
+    }
+
+    // A prompt that cannot fit is refused once, typed, and never retried; a 503
+    // with Retry-After is retried until it answers; a 500 fails at once (the task
+    // gets its own single retry instead).
+    #[tokio::test]
+    async fn errors_are_classified_and_only_transient_ones_retried() {
+        use std::sync::atomic::Ordering;
+        const OK: &str = r#"{"status":"completed","output_text":"fine","output":[]}"#;
+        let ctx = r#"{"error":{"message":"the prompt is 40000 tokens","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        let (url, n) = scripted(vec![(400, None, ctx)]).await;
+        let err = Client::new(url, None).respond("m", "p", Priority::Default, None).await.unwrap_err();
+        let r = err.downcast_ref::<Rejected>().expect("typed rejection");
+        assert_eq!(r.code.as_deref(), Some("context_length_exceeded"));
+        assert!(r.message.contains("40000"));
+        assert!(!is_retryable(&err));
+        assert_eq!(n.load(Ordering::SeqCst), 1, "never retried");
+
+        let busy = r#"{"error":{"message":"worker respawning","type":"service_unavailable"}}"#;
+        let (url, n) = scripted(vec![(503, Some("0"), busy), (503, Some("0"), busy), (200, None, OK)]).await;
+        let out = Client::new(url, None).respond("m", "p", Priority::Default, None).await.unwrap();
+        assert_eq!(out, "fine");
+        assert_eq!(n.load(Ordering::SeqCst), 3, "retried through the 503s");
+
+        let (url, n) = scripted(vec![(500, None, r#"{"error":{"message":"boom"}}"#), (200, None, OK)]).await;
+        let err = Client::new(url, None).respond("m", "p", Priority::Default, None).await.unwrap_err();
+        assert!(err.to_string().contains("boom"), "{err}");
+        assert!(is_retryable(&err), "a 500 is worth one task-level retry");
+        assert_eq!(n.load(Ordering::SeqCst), 1, "not retried by the client");
+    }
+
+    // Against a live hipfire (ignored: needs the server and kills its worker). An
+    // oversized prompt is refused at once, typed; a request whose worker is killed
+    // mid-generation rides out the 503 and succeeds once the worker is respawned.
+    #[tokio::test]
+    #[ignore]
+    async fn live_rejection_and_retry_through_a_worker_restart() {
+        let model = std::env::var("CORRODE_LIVE_MODEL").unwrap_or("Qwen3.6-35B-A3B--oq4.25++".into());
+        let c = Client::new("http://127.0.0.1:11435", None);
+        let t0 = std::time::Instant::now();
+        let err = c.respond(&model, &"word ".repeat(60_000), Priority::Default, None).await.unwrap_err();
+        let r = err.downcast_ref::<Rejected>().expect("typed rejection");
+        assert_eq!(r.code.as_deref(), Some("context_length_exceeded"), "{err}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "refused, not retried");
+
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let _ = std::process::Command::new("sh")
+                .args(["-c", "kill -9 $(ps -eo pid,args | awk '$2 ~ /hipfire$/ && $3==\"daemon\" {print $1}')"])
+                .status();
+        });
+        let t0 = std::time::Instant::now();
+        let out = c
+            .respond(&model, "Write a 300-word essay about prime numbers.", Priority::Default, None)
+            .await
+            .expect("retried through the restart");
+        eprintln!("answered {} bytes after {:.1}s", out.len(), t0.elapsed().as_secs_f32());
+        assert!(!out.is_empty());
+    }
+
     #[test]
     fn transient_statuses_retry_client_errors_dont() {
         use reqwest::StatusCode;
-        assert!(is_transient(StatusCode::INTERNAL_SERVER_ERROR)); // 500 — hipfire shed
+        assert!(!is_transient(StatusCode::INTERNAL_SERVER_ERROR)); // 500 — a fault, task-level retry
         assert!(is_transient(StatusCode::SERVICE_UNAVAILABLE)); // 503
         assert!(is_transient(StatusCode::TOO_MANY_REQUESTS)); // 429
         assert!(!is_transient(StatusCode::BAD_REQUEST)); // 400 — our bug

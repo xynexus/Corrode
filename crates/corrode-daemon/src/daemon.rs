@@ -510,54 +510,77 @@ impl Daemon {
                         // attempts first when CORRODE_FANOUT > 1; everything else runs
                         // the capability paths directly (see `run_task`).
                         let mut artifacts = Vec::new();
-                        let toolbox = ToolBox::new(vfs, root, skill_scripts)
-                            .with_sandbox(sandbox)
-                            .with_graph(graph)
-                            .with_reranker(reranker)
-                            .with_owner_token(owner_token)
-                            .with_plan(&plan_for_task);
                         let started = std::time::Instant::now();
-                        let output = if role == Role::Coder && fanout > 1 {
-                            run_fanout(
-                                fanout,
-                                &client,
-                                &model,
-                                &review_model,
-                                band,
-                                &dialects,
-                                tool_caller.clone(),
-                                toolbox,
-                                &approvals,
-                                &prefix,
-                                role,
-                                &prompt,
-                                &events,
-                                id,
-                                &mut artifacts,
-                                &seen,
-                                deadline,
-                            )
-                            .await
-                        } else {
-                            run_task(
-                                &client,
-                                &model,
-                                band,
-                                &dialects,
-                                tool_caller.clone(),
-                                toolbox,
-                                &approvals,
-                                &prefix,
-                                role,
-                                &prompt,
-                                &events,
-                                id,
-                                &mut artifacts,
-                                false,
-                                &seen,
-                                deadline,
-                            )
-                            .await
+                        // A task that failed for a reason that may pass (the worker
+                        // was being respawned past the client's retry window, a 500)
+                        // runs once more before its dependents are written off as
+                        // unschedulable. Not a rejected request, a cut-off reply or a
+                        // timed-out call: those would only fail again.
+                        let mut attempt = 0;
+                        let output = loop {
+                            let toolbox = ToolBox::new(vfs.clone(), root.clone(), skill_scripts.clone())
+                                .with_sandbox(sandbox.clone())
+                                .with_graph(graph.clone())
+                                .with_reranker(reranker.clone())
+                                .with_owner_token(owner_token.clone())
+                                .with_plan(&plan_for_task);
+                            let output = if role == Role::Coder && fanout > 1 {
+                                run_fanout(
+                                    fanout,
+                                    &client,
+                                    &model,
+                                    &review_model,
+                                    band,
+                                    &dialects,
+                                    tool_caller.clone(),
+                                    toolbox,
+                                    &approvals,
+                                    &prefix,
+                                    role,
+                                    &prompt,
+                                    &events,
+                                    id,
+                                    &mut artifacts,
+                                    &seen,
+                                    deadline,
+                                )
+                                .await
+                            } else {
+                                run_task(
+                                    &client,
+                                    &model,
+                                    band,
+                                    &dialects,
+                                    tool_caller.clone(),
+                                    toolbox,
+                                    &approvals,
+                                    &prefix,
+                                    role,
+                                    &prompt,
+                                    &events,
+                                    id,
+                                    &mut artifacts,
+                                    false,
+                                    &seen,
+                                    deadline,
+                                )
+                                .await
+                            };
+                            match &output {
+                                Err(e)
+                                    if attempt == 0
+                                        && crate::hipfire::is_retryable(e)
+                                        && !deadline.is_some_and(|d| std::time::Instant::now() >= d) =>
+                                {
+                                    let _ = events
+                                        .send(AgentEvent::Error {
+                                            message: format!("task {id}: {e}; running it once more"),
+                                        })
+                                        .await;
+                                    attempt += 1;
+                                }
+                                _ => break output,
+                            }
                         };
 
                         // One line per execution, before follow-up emission so a task
