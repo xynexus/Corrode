@@ -18,7 +18,64 @@
 //! env. When sessions land, it becomes a per-session `SandboxProfile` bound to the
 //! session's own repo, which is also how per-user filesystem isolation falls out.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Credential stores under the daemon user's home that no tool may reach: not the
+/// file tools (the VFS, which runs in the daemon, outside any sandbox) and not a
+/// sandboxed command or terminal. Matters because a client may bind `~` itself as its
+/// repo. ponytail: a fixed list -- make it configurable if a deployment keeps secrets
+/// somewhere else under home.
+pub const PROTECTED_HOME_PATHS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".config/gh",
+    ".config/gcloud",
+    ".password-store",
+    ".local/share/keyrings",
+    ".netrc",
+    ".git-credentials",
+];
+
+/// The daemon user's home directory (its real path), if `HOME` is set.
+pub fn home() -> Option<PathBuf> {
+    let h = PathBuf::from(std::env::var_os("HOME")?);
+    Some(std::fs::canonicalize(&h).unwrap_or(h))
+}
+
+/// [`PROTECTED_HOME_PATHS`] under `home`, as real paths where they exist (a `~/.ssh`
+/// that is a link elsewhere protects its target).
+pub fn protected_paths(home: &Path) -> Vec<PathBuf> {
+    PROTECTED_HOME_PATHS
+        .iter()
+        .map(|p| {
+            let p = home.join(p);
+            std::fs::canonicalize(&p).unwrap_or(p)
+        })
+        .collect()
+}
+
+/// bwrap arguments hiding every protected path that the bind of `repo` would expose:
+/// an empty tmpfs over a directory, `/dev/null` over a file. Outside the repo nothing
+/// is mounted, so nothing needs hiding.
+fn credential_masks(repo: &Path, home: &Path) -> Vec<String> {
+    let mut a = Vec::new();
+    for p in protected_paths(home) {
+        if !p.starts_with(repo) {
+            continue;
+        }
+        let s = p.to_string_lossy().into_owned();
+        if p.is_dir() {
+            a.extend(["--tmpfs".to_string(), s]);
+        } else if p.exists() {
+            a.extend(["--ro-bind".to_string(), "/dev/null".to_string(), s]);
+        }
+    }
+    a
+}
 
 #[derive(Clone)]
 pub struct Sandbox {
@@ -98,6 +155,12 @@ impl Sandbox {
         push(&["--bind", &repo, &repo]);
         let corrode = format!("{repo}/.corrode");
         push(&["--ro-bind-try", &corrode, &corrode]);
+        // A repo that contains home's credential stores (the repo is `~` itself) must
+        // not hand them to the command: mount over them, after the bind.
+        if let Some(home) = home() {
+            a.extend(credential_masks(Path::new(&repo), &home));
+        }
+        let mut push = |parts: &[&str]| a.extend(parts.iter().map(|s| s.to_string()));
         push(&["--chdir", &repo]);
 
         push(&["--"]);
@@ -135,6 +198,27 @@ mod tests {
         // the real command survives, verbatim, after `--`.
         let dd = args.iter().position(|s| s == "--").expect("has --");
         assert_eq!(&args[dd + 1..], &["sh", "-c", "ls"]);
+    }
+
+    // With the repo at home itself, the bind would expose the credential stores, so
+    // each existing one is mounted over; a repo below home exposes none.
+    #[test]
+    fn credential_stores_inside_the_repo_are_masked() {
+        let home = std::env::temp_dir().join(format!("corrode-masks-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join(".config/gh")).unwrap();
+        std::fs::write(home.join(".netrc"), "machine x").unwrap();
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        let home = std::fs::canonicalize(&home).unwrap();
+        let s = |p: &str| home.join(p).to_string_lossy().into_owned();
+
+        let a = credential_masks(&home, &home).join(" ");
+        assert!(a.contains(&format!("--tmpfs {}", s(".ssh"))), "{a}");
+        assert!(a.contains(&format!("--tmpfs {}", s(".config/gh"))), "{a}");
+        assert!(a.contains(&format!("--ro-bind /dev/null {}", s(".netrc"))), "{a}");
+        assert!(!a.contains(".aws"), "absent stores need no mask: {a}");
+        assert!(credential_masks(&home.join("proj"), &home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

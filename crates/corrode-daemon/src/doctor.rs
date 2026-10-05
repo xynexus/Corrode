@@ -64,7 +64,9 @@ pub async fn run() -> bool {
     let sb = std::env::var("CORRODE_SANDBOX").unwrap_or_default().to_ascii_lowercase();
     if matches!(sb.as_str(), "on" | "1" | "true" | "yes") {
         match bwrap_usable() {
-            Ok(()) => ok("sandbox: bwrap confines (repo rw, .corrode ro, no net)"),
+            Ok(()) => ok(
+                "sandbox: bwrap confines (repo rw, .corrode ro, home credential stores masked, no net)",
+            ),
             Err(e) => {
                 fatal += 1;
                 fail(
@@ -75,7 +77,12 @@ pub async fn run() -> bool {
             }
         }
     } else {
-        info("sandbox: off (set CORRODE_SANDBOX=on to confine spawned processes)");
+        // The file tools refuse ~/.ssh and the other credential stores either way; a
+        // command or the terminal outside the sandbox can still read them.
+        warn(
+            "sandbox: off — run_command, skill scripts and the web terminal can read ~/.ssh \
+             and other credential stores (set CORRODE_SANDBOX=on to confine them)",
+        );
     }
 
     // --- auth table ---

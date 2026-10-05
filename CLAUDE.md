@@ -105,7 +105,9 @@ on unless `0`/`false`), `CORRODE_TURN_BUDGET_S` (wall-clock ceiling for one Prom
 turn — past it no new task launches and no emission is folded in, though in-flight
 work is awaited; absent/0 -> unbounded), `CORRODE_SANDBOX` (bubblewrap-confine every spawned process
 — `run_command`/`run_skill_script` and the web terminal — off unless `on`/`1`/`true`;
-see `sandbox.rs` + `docs/sessions-and-sandbox.md`), `CORRODE_SANDBOX_NET` (share the
+see `sandbox.rs` + `docs/sessions-and-sandbox.md`; home's credential stores -- `~/.ssh`, `~/.gnupg`, `~/.aws`,
+`~/.config/gh`, `~/.netrc`, … (`sandbox::PROTECTED_HOME_PATHS`) -- are masked when the repo
+contains them, and the file tools refuse them whether or not the sandbox is on), `CORRODE_SANDBOX_NET` (share the
 host network into the sandbox; off by default — needed for tools that fetch),
 `CORRODE_COMMAND_TIMEOUT_S` (wall-clock limit for one `run_command`/`run_skill_script`,
 default 1800; past it the command's whole process group is killed and the call returns
