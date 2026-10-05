@@ -126,6 +126,10 @@ pub enum AgentCommand {
     SelectRepo { path: String },
     /// Free-form instruction; the daemon plans and fans out a swarm.
     Prompt { text: String, priority: Priority },
+    /// Stop a running Prompt turn of this session (the `plan_id` its `TurnStarted`
+    /// carried): nothing more launches, running tasks are dropped (a command's process
+    /// group killed), and the turn ends with an Error and `TurnComplete`.
+    CancelTurn { plan_id: String },
     /// A keystroke chunk for the wasm virtual terminal's active session.
     TerminalInput { session: String, data: Vec<u8> },
     /// Terminal geometry (also opens the session/pty on first receipt), so the
@@ -210,8 +214,12 @@ pub enum AgentEvent {
     /// dropped — the kind pair implies them; carry them when the explorer needs
     /// labeled edges.
     PlanGraph { plan_id: String, nodes: Vec<GraphNodeView> },
+    /// A Prompt turn began; `plan_id` names it for `CancelTurn` and matches its
+    /// `TurnComplete`.
+    TurnStarted { plan_id: String },
     /// The Prompt turn settled: every task ran and provenance persisted. Clients
-    /// wait on this, not on the stream going quiet.
+    /// wait on this, not on the stream going quiet. Sent on every exit from a turn,
+    /// a failed plan, a cancel or a panic included.
     TurnComplete { plan_id: String },
     Error { message: String },
 }
@@ -326,6 +334,10 @@ mod tests {
                 observation: "exit 0:\nok".into(),
             },
             r#"{"ToolResult":{"id":3,"call":"run_command: cargo test","observation":"exit 0:\nok"}}"#,
+        );
+        pin(
+            &AgentEvent::TurnStarted { plan_id: "plan-0".into() },
+            r#"{"TurnStarted":{"plan_id":"plan-0"}}"#,
         );
         pin(
             &AgentEvent::TurnComplete { plan_id: "plan-0".into() },

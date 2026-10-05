@@ -415,7 +415,34 @@ impl Daemon {
                     self.next_plan_id
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 ));
-                let (subtasks, prefix) = match self.plan(session, &text, priority).await {
+                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                session.turns.lock().unwrap().insert(plan_id.clone(), cancel_tx);
+                let _end = TurnEnd {
+                    events: events.clone(),
+                    plan_id: plan_id.clone(),
+                    session: Arc::clone(session),
+                };
+                let _ = events.send(AgentEvent::TurnStarted { plan_id: plan_id.clone() }).await;
+                // The turn declares its ceiling before anything runs, planning included
+                // (it used to start the clock after planning and its embed call).
+                // hipfire's bands schedule the GPU; nothing else bounds how much work the
+                // swarm decides to create for itself.
+                let deadline = turn_budget().map(|d| std::time::Instant::now() + d);
+                let bounds = plan_graph::Bounds {
+                    deadline,
+                    task_timeout: task_timeout(),
+                    cancel: Some(cancel_rx),
+                    ..Default::default()
+                };
+                let planned = bounds
+                    .run(self.plan(session, &text, priority))
+                    .await
+                    .unwrap_or_else(|| {
+                        Err(anyhow::anyhow!(
+                            "cut off (CORRODE_TASK_TIMEOUT_S, the turn budget, or CancelTurn)"
+                        ))
+                    });
+                let (subtasks, prefix) = match planned {
                     Ok(planned) => planned,
                     Err(e) => {
                         let _ = events
@@ -423,7 +450,6 @@ impl Daemon {
                                 message: format!("planning failed: {e}"),
                             })
                             .await;
-                        let _ = events.send(AgentEvent::TurnComplete { plan_id }).await;
                         return;
                     }
                 };
@@ -452,10 +478,6 @@ impl Daemon {
                 // re-executing, and each launching task's tail carries a digest of
                 // what the swarm already did.
                 let turn_seen = Arc::new(std::sync::Mutex::new(SeenCalls::default()));
-                // The turn declares its ceiling before it starts. hipfire's bands
-                // schedule the GPU; nothing else bounds how much work the swarm
-                // decides to create for itself.
-                let deadline = turn_budget().map(|d| std::time::Instant::now() + d);
                 // Cap concurrent generations: a wide plan otherwise fires every ready
                 // task's request at once, and a memory-tight or fragile backend can
                 // CRASH (not just shed) under that burst — observed with a DeltaNet
@@ -621,7 +643,7 @@ impl Daemon {
                     }
                 };
                 let mut budget =
-                    plan_graph::run_reactive_until(&mut graph, &execute, deadline).await;
+                    plan_graph::run_reactive_until(&mut graph, &execute, &bounds).await;
 
                 // One plan-level review pass over the settled work: the review role
                 // reads the digest (and, through its tools, the written files) and
@@ -629,15 +651,28 @@ impl Daemon {
                 // reactive drive runs the review task and whatever it emits.
                 // ponytail: one round — loop-until-clean is the upgrade once fix
                 // quality is measured.
-                if plan_review_enabled() {
+                if plan_review_enabled() && !budget.cancelled {
                     if let Some(digest) = graph.review_digest(REVIEW_OUTPUT_CAP) {
                         graph.add(Role::Review, planner::plan_review_task(&digest), Vec::new());
                         let second =
-                            plan_graph::run_reactive_until(&mut graph, &execute, deadline).await;
+                            plan_graph::run_reactive_until(&mut graph, &execute, &bounds).await;
                         budget.expired |= second.expired;
+                        budget.cancelled |= second.cancelled;
                         budget.shed += second.shed;
                         budget.unlaunched = second.unlaunched;
+                        budget.cut_off += second.cut_off;
+                        budget.timed_out.extend(second.timed_out);
                     }
+                }
+                if !budget.timed_out.is_empty() {
+                    let _ = events
+                        .send(AgentEvent::Error {
+                            message: format!(
+                                "task(s) {:?} timed out and were dropped (CORRODE_TASK_TIMEOUT_S)",
+                                budget.timed_out
+                            ),
+                        })
+                        .await;
                 }
 
                 // Tasks left pending after the scheduler settled had a failed or
@@ -646,13 +681,23 @@ impl Daemon {
                 // A turn cut short by its budget is reported as such: "could not be
                 // scheduled (a dependency failed)" would be a lie, and the two have
                 // opposite fixes — raise the budget vs debug the failure.
-                if budget.expired {
+                if budget.cancelled {
+                    let _ = events
+                        .send(AgentEvent::Error {
+                            message: format!(
+                                "turn cancelled: {} running task(s) dropped, {} not launched",
+                                budget.cut_off, budget.unlaunched
+                            ),
+                        })
+                        .await;
+                } else if budget.expired {
                     let _ = events
                         .send(AgentEvent::Error {
                             message: format!(
                                 "turn budget exhausted: {} task(s) not launched, \
-                                 {} emission(s) dropped (CORRODE_TURN_BUDGET_S)",
-                                budget.unlaunched, budget.shed
+                                 {} emission(s) dropped, {} still running after the grace \
+                                 dropped (CORRODE_TURN_BUDGET_S)",
+                                budget.unlaunched, budget.shed, budget.cut_off
                             ),
                         })
                         .await;
@@ -701,10 +746,22 @@ impl Daemon {
                         nodes,
                     })
                     .await;
-
-                // The turn's end is explicit: clients (and the e2e) wait on this
-                // event, not on the stream going quiet.
-                let _ = events.send(AgentEvent::TurnComplete { plan_id }).await;
+                // `_end` sends TurnComplete as it drops, here or on any earlier exit.
+            }
+            AgentCommand::CancelTurn { plan_id } => {
+                let switch = session.turns.lock().unwrap().get(&plan_id).cloned();
+                match switch {
+                    Some(tx) => {
+                        let _ = tx.send(true);
+                    }
+                    None => {
+                        let _ = events
+                            .send(AgentEvent::Error {
+                                message: format!("CancelTurn: no running turn {plan_id} in this session"),
+                            })
+                            .await;
+                    }
+                }
             }
             AgentCommand::DocQuery { question } => {
                 let ev = self.doc_query(session, &question).await;
@@ -1577,6 +1634,39 @@ fn max_concurrency() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .map(|n| n.max(1))
         .unwrap_or(1024)
+}
+
+/// `CORRODE_TASK_TIMEOUT_S`: ceiling on one task, its retries and tool steps included.
+/// Default 3600; 0 disables. Past it the task fails, what it was running is dropped
+/// (a command's process group killed), and the rest of the turn carries on.
+fn task_timeout() -> Option<std::time::Duration> {
+    let s = std::env::var("CORRODE_TASK_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3600);
+    (s > 0).then(|| std::time::Duration::from_secs(s))
+}
+
+/// Ends a Prompt turn when dropped: unregisters its cancel switch and sends
+/// `TurnComplete` -- on every exit, a panic included. A panic in turn-end ingest used
+/// to leave the client waiting on a turn that would never complete.
+struct TurnEnd {
+    events: mpsc::Sender<AgentEvent>,
+    plan_id: String,
+    session: Arc<Session>,
+}
+
+impl Drop for TurnEnd {
+    fn drop(&mut self) {
+        let plan_id = std::mem::take(&mut self.plan_id);
+        if let Ok(mut turns) = self.session.turns.lock() {
+            turns.remove(&plan_id);
+        }
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let _ = events.send(AgentEvent::TurnComplete { plan_id }).await;
+        });
+    }
 }
 
 /// `CORRODE_PLAN_REVIEW`: the plan-level review pass, on unless set off.
@@ -4144,6 +4234,44 @@ mod tests {
             observation.contains("pub fn is_prime"),
             "got: {observation}"
         );
+    }
+
+    // A turn names itself, can be cancelled while it is still planning against a
+    // hipfire that never answers (this client's port is closed and connection failures
+    // are retried for minutes), and ends with TurnComplete; once it has ended, its plan
+    // id cancels nothing.
+    #[tokio::test]
+    async fn a_planning_turn_cancels_and_still_completes() {
+        let (ctx, crx) = mpsc::channel(8);
+        let (etx, mut erx) = mpsc::channel(64);
+        tokio::spawn(Arc::new(test_daemon()).run(crx, etx));
+        async fn next(rx: &mut mpsc::Receiver<AgentEvent>) -> AgentEvent {
+            tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+                .await
+                .expect("an event within 20s")
+                .expect("daemon alive")
+        }
+        ctx.send(AgentCommand::Prompt { text: "anything".into(), priority: Priority::Default })
+            .await
+            .unwrap();
+        let plan_id = match next(&mut erx).await {
+            AgentEvent::TurnStarted { plan_id } => plan_id,
+            other => panic!("expected TurnStarted, got {other:?}"),
+        };
+        ctx.send(AgentCommand::CancelTurn { plan_id: plan_id.clone() }).await.unwrap();
+        match next(&mut erx).await {
+            AgentEvent::Error { message } => assert!(message.contains("planning failed: cut off"), "{message}"),
+            other => panic!("expected the planning error, got {other:?}"),
+        }
+        match next(&mut erx).await {
+            AgentEvent::TurnComplete { plan_id: done } => assert_eq!(done, plan_id),
+            other => panic!("expected TurnComplete, got {other:?}"),
+        }
+        ctx.send(AgentCommand::CancelTurn { plan_id }).await.unwrap();
+        match next(&mut erx).await {
+            AgentEvent::Error { message } => assert!(message.contains("no running turn"), "{message}"),
+            other => panic!("expected no running turn, got {other:?}"),
+        }
     }
 
     // The hipfire-free dispatch path: DocQuery without a graph store reports itself

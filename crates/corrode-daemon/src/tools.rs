@@ -866,6 +866,22 @@ async fn read_capped(mut r: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
     head
 }
 
+/// Kills a command's whole process group when dropped, unless disarmed: on timeout,
+/// and when the task running the command is itself dropped (its ceiling, the turn's
+/// cut-off, CancelTurn) -- `kill_on_drop` reaches only the direct child.
+struct GroupKill(Option<u32>);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            // The group id is the child's pid (process_group(0)).
+            let _ = std::process::Command::new("kill")
+                .args(["-s", "KILL", "--", &format!("-{pid}")])
+                .status();
+        }
+    }
+}
+
 /// Run `cmd` to completion under `limit`, capturing bounded output. The child
 /// gets its own process group, and on timeout the whole group is killed --
 /// killing only `sh` would leave what it started (test binaries, servers, a
@@ -885,7 +901,7 @@ async fn run_bounded(
         Ok(c) => c,
         Err(e) => return format!("error: could not run {what}: {e}"),
     };
-    let pid = child.id();
+    let mut group = GroupKill(child.id());
     let (so, se) = (child.stdout.take(), child.stderr.take());
     let run = async {
         let out = async {
@@ -904,7 +920,12 @@ async fn run_bounded(
         };
         tokio::join!(out, err, child.wait())
     };
-    match tokio::time::timeout(limit, run).await {
+    let done = tokio::time::timeout(limit, run).await;
+    if done.is_ok() {
+        group.0 = None; // finished: leave alone whatever it deliberately left running
+    }
+    drop(group);
+    match done {
         Ok((stdout, stderr, Ok(status))) => format_command_output(std::process::Output {
             status,
             stdout,
@@ -912,12 +933,6 @@ async fn run_bounded(
         }),
         Ok((_, _, Err(e))) => format!("error: {what}: {e}"),
         Err(_) => {
-            if let Some(pid) = pid {
-                // The group id is the child's pid (process_group(0)).
-                let _ = std::process::Command::new("kill")
-                    .args(["-s", "KILL", "--", &format!("-{pid}")])
-                    .status();
-            }
             format!(
                 "exit timeout: {what} was still running after {}s and was killed \
                  (CORRODE_COMMAND_TIMEOUT_S). Run long or never-ending commands with a \
@@ -1037,6 +1052,29 @@ mod tests {
         .await;
         assert!(out.starts_with("exit timeout"), "{out}");
         assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let left = std::process::Command::new("pgrep")
+            .args(["-f", &format!("^sleep {secs}$")])
+            .output()
+            .unwrap();
+        assert!(
+            left.stdout.is_empty(),
+            "survivor: {}",
+            String::from_utf8_lossy(&left.stdout)
+        );
+    }
+
+    // A task dropped mid-command (its ceiling, the turn's cut-off, CancelTurn) must
+    // take the command's whole group with it, not just `sh`.
+    #[tokio::test]
+    async fn dropping_a_running_command_kills_its_process_group() {
+        let secs = 200_000 + std::process::id() % 100_000;
+        let run = super::run_bounded(
+            sh(&format!("sleep {secs} & sleep 300")),
+            "`dropped`",
+            std::time::Duration::from_secs(600),
+        );
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(500), run).await.is_err());
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let left = std::process::Command::new("pgrep")
             .args(["-f", &format!("^sleep {secs}$")])
