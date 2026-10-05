@@ -38,14 +38,15 @@ fn canonical(path: &str) -> PathBuf {
 }
 
 /// A repo a client asked for (`SelectRepo`), confined. It must be an existing
-/// directory strictly inside the daemon user's home directory -- the top of what a
-/// client may reach -- and, when `CORRODE_REPO_ALLOW` is set (a `:`-separated list of
-/// directories), inside one of those. Allow-list entries outside home are ignored; if
-/// none remain, nothing is allowed.
+/// directory inside the daemon user's home directory -- the top of what a client may
+/// reach, and itself allowed -- and, when `CORRODE_REPO_ALLOW` is set (a `:`-separated
+/// list of directories), inside one of those. Allow-list entries outside home are
+/// ignored; if none remain, nothing is allowed.
 ///
 /// Any host path used to bind: the repo becomes the VFS root, the terminal's cwd, the
-/// sandbox's `--bind` and the doc root, so a client could open a shell in `/`, or read
-/// `~/.ssh` through a repo of `~` itself (hence strictly inside, not home itself).
+/// sandbox's `--bind` and the doc root, so a client could open a shell in `/`. Binding
+/// `~` itself exposes everything under it (`~/.ssh` included) to that client; that is
+/// accepted, and `CORRODE_USERS` or a narrower `CORRODE_REPO_ALLOW` limits who gets it.
 /// The operator's own `CORRODE_REPO` default is not subject to this.
 fn allowed_repo(path: &str) -> anyhow::Result<PathBuf> {
     let home = std::env::var_os("HOME")
@@ -55,7 +56,7 @@ fn allowed_repo(path: &str) -> anyhow::Result<PathBuf> {
         std::fs::canonicalize(path).map_err(|e| anyhow::anyhow!("repo {path}: {e}"))?;
     anyhow::ensure!(repo.is_dir(), "repo {path} is not a directory");
     anyhow::ensure!(
-        repo != home && repo.starts_with(&home),
+        repo.starts_with(&home),
         "repo {} is not inside {}",
         repo.display(),
         home.display()
@@ -2866,7 +2867,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // A client-chosen repo stays inside the home directory (never home itself) and,
+    // A client-chosen repo stays inside the home directory (home itself included) and,
     // when CORRODE_REPO_ALLOW is set, inside one of its entries. Env-dependent, so it
     // is one test (tests in a binary share the process environment).
     #[test]
@@ -2880,11 +2881,11 @@ mod tests {
 
         std::env::remove_var("CORRODE_REPO_ALLOW");
         assert_eq!(allowed_repo(&s(&a)).unwrap(), a, "inside home is allowed");
-        assert!(allowed_repo(&s(&home)).is_err(), "home itself is not");
+        assert_eq!(allowed_repo(&s(&home)).unwrap(), home, "home itself is allowed");
         assert!(allowed_repo("/").is_err());
         assert!(allowed_repo("/tmp").is_err());
         assert!(allowed_repo(&s(&base.join("missing"))).is_err());
-        assert!(allowed_repo(&format!("{}/../..", s(&a))).is_err(), "resolved, then checked");
+        assert!(allowed_repo(&format!("{}/../../..", s(&a))).is_err(), "resolved to home's parent, then checked");
 
         std::env::set_var("CORRODE_REPO_ALLOW", format!("{}:/etc", s(&a)));
         assert!(allowed_repo(&s(&a)).is_ok(), "listed");
