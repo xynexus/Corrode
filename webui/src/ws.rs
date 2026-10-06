@@ -18,7 +18,8 @@ use crate::model::Shared;
 /// kind instead of pattern-matching strings back apart.
 #[derive(Clone)]
 pub enum LogEntry {
-    Agent { id: u64, text: String },
+    /// `plan` is the turn: per-task ids restart at 0 every turn.
+    Agent { plan: String, id: u64, text: String },
     Tool { call: String, observation: String },
     Turn { plan_id: String },
     Doc { text: String, grounded_on: Vec<String> },
@@ -27,8 +28,12 @@ pub enum LogEntry {
     Ws(String),
 }
 
-/// Open the socket, wire both pump loops, and return the sender UI callbacks push
-/// `AgentCommand`s into. Failures surface in `log` rather than panicking.
+/// Open the socket and keep it open: return the sender UI callbacks push
+/// `AgentCommand`s into, and reconnect whenever the socket closes. The commands that
+/// bind a connection (`Authenticate`, `SelectRepo`) are resent on every new socket,
+/// so it lands on the same session, and the daemon replays that session's recent
+/// turn events -- a reload, a sleep or a proxy restart no longer loses a turn's
+/// answers. The console is cleared on reconnect and rebuilt from that replay.
 pub fn spawn_agent(
     url: String,
     shared: Shared,
@@ -37,48 +42,100 @@ pub fn spawn_agent(
     approvals: RwSignal<Vec<(u64, String)>>,
     busy: RwSignal<bool>,
 ) -> UnboundedSender<AgentCommand> {
+    use futures::future::{select, Either};
     let (cmd_tx, mut cmd_rx) = unbounded::<AgentCommand>();
-
-    let ws = match WebSocket::open(&url) {
-        Ok(ws) => ws,
-        Err(e) => {
-            log.update(|l| l.push(LogEntry::Ws(format!("open failed: {e:?}"))));
-            return cmd_tx;
-        }
-    };
-    let (mut sink, mut stream) = ws.split();
-
-    // UI commands -> daemon
     spawn_local(async move {
-        while let Some(cmd) = cmd_rx.next().await {
-            if let Ok(txt) = serde_json::to_string(&cmd) {
-                if sink.send(Message::Text(txt)).await.is_err() {
-                    break;
+        let mut binding: Vec<AgentCommand> = Vec::new();
+        let mut unsent: Vec<AgentCommand> = Vec::new();
+        let mut first = true;
+        loop {
+            let ws = match WebSocket::open(&url) {
+                Ok(ws) => ws,
+                Err(e) => {
+                    log.update(|l| l.push(LogEntry::Ws(format!("open failed: {e:?}"))));
+                    sleep_ms(2000).await;
+                    continue;
+                }
+            };
+            if !first {
+                log.set(vec![LogEntry::Ws("reconnected; replaying this session's recent turns".into())]);
+                approvals.set(Vec::new());
+            }
+            first = false;
+            let (mut sink, mut stream) = ws.split();
+            let resend: Vec<AgentCommand> = binding.iter().cloned().chain(unsent.drain(..)).collect();
+            let mut alive = true;
+            for cmd in resend {
+                if alive && send(&mut sink, &cmd).await.is_err() {
+                    alive = false;
+                }
+                if !alive && !is_binding(&cmd) {
+                    unsent.push(cmd);
                 }
             }
-        }
-    });
-
-    // daemon events -> UI
-    spawn_local(async move {
-        while let Some(Ok(msg)) = stream.next().await {
-            let txt = match msg {
-                Message::Text(t) => t,
-                Message::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
-            };
-            match serde_json::from_str::<AgentEvent>(&txt) {
-                Ok(ev) => apply_event(ev, &shared, log, entries, approvals, busy),
-                Err(e) => log.update(|l| l.push(LogEntry::Ws(format!("undecodable event: {e}")))),
+            while alive {
+                match select(cmd_rx.next(), stream.next()).await {
+                    Either::Left((None, _)) => return, // the UI is gone
+                    Either::Left((Some(cmd), _)) => {
+                        if is_binding(&cmd) {
+                            let same = std::mem::discriminant(&cmd);
+                            binding.retain(|c| std::mem::discriminant(c) != same);
+                            binding.push(cmd.clone());
+                        }
+                        if send(&mut sink, &cmd).await.is_err() {
+                            if !is_binding(&cmd) {
+                                unsent.push(cmd);
+                            }
+                            alive = false;
+                        }
+                    }
+                    Either::Right((Some(Ok(msg)), _)) => {
+                        let txt = match msg {
+                            Message::Text(t) => t,
+                            Message::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+                        };
+                        match serde_json::from_str::<AgentEvent>(&txt) {
+                            Ok(ev) => apply_event(ev, None, &shared, log, entries, approvals, busy),
+                            Err(e) => log.update(|l| {
+                                l.push(LogEntry::Ws(format!("undecodable event: {e}")))
+                            }),
+                        }
+                    }
+                    Either::Right(_) => alive = false,
+                }
             }
+            log.update(|l| l.push(LogEntry::Ws("agent socket closed; reconnecting".into())));
+            sleep_ms(2000).await;
         }
-        log.update(|l| l.push(LogEntry::Ws("agent socket closed".into())));
     });
-
     cmd_tx
+}
+
+/// Commands that bind a connection to its session, resent on every new socket.
+fn is_binding(cmd: &AgentCommand) -> bool {
+    matches!(cmd, AgentCommand::Authenticate { .. } | AgentCommand::SelectRepo { .. })
+}
+
+async fn send(
+    sink: &mut futures::stream::SplitSink<WebSocket, Message>,
+    cmd: &AgentCommand,
+) -> Result<(), ()> {
+    let txt = serde_json::to_string(cmd).map_err(|_| ())?;
+    sink.send(Message::Text(txt)).await.map_err(|_| ())
+}
+
+async fn sleep_ms(ms: i32) {
+    let wait = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(w) = web_sys::window() {
+            let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(wait).await;
 }
 
 fn apply_event(
     ev: AgentEvent,
+    plan: Option<&str>,
     shared: &Shared,
     log: RwSignal<Vec<LogEntry>>,
     entries: RwSignal<Vec<(String, bool, Option<String>)>>,
@@ -126,24 +183,32 @@ fn apply_event(
         }
         // Incremental streamed output: append to this id's entry, or start one.
         AgentEvent::SubagentDelta { id, text } => log.update(|l| {
-            match l.iter_mut().rev().find(|e| matches!(e, LogEntry::Agent { id: i, .. } if *i == id)) {
+            let plan = plan.unwrap_or_default();
+            match l.iter_mut().rev().find(
+                |e| matches!(e, LogEntry::Agent { plan: p, id: i, .. } if *i == id && p == plan),
+            ) {
                 Some(LogEntry::Agent { text: t, .. }) => t.push_str(&text),
-                _ => l.push(LogEntry::Agent { id, text }),
+                _ => l.push(LogEntry::Agent { plan: plan.to_string(), id, text }),
             }
         }),
         // Authoritative full text: finalize this id's entry (reconciling any streamed
         // deltas), or start one when nothing streamed (non-streaming mode).
         AgentEvent::SubagentOutput { id, text } => log.update(|l| {
-            match l.iter_mut().rev().find(|e| matches!(e, LogEntry::Agent { id: i, .. } if *i == id)) {
+            let plan = plan.unwrap_or_default();
+            match l.iter_mut().rev().find(
+                |e| matches!(e, LogEntry::Agent { plan: p, id: i, .. } if *i == id && p == plan),
+            ) {
                 Some(LogEntry::Agent { text: t, .. }) => *t = text,
-                _ => l.push(LogEntry::Agent { id, text }),
+                _ => l.push(LogEntry::Agent { plan: plan.to_string(), id, text }),
             }
         }),
         // A mutating tool call blocked on a human; the console renders the queue
         // with approve/deny buttons that reply `ApprovalResponse`.
-        AgentEvent::ApprovalRequest { id, action } => {
-            approvals.update(|a| a.push((id, action)))
-        }
+        AgentEvent::ApprovalRequest { id, action } => approvals.update(|a| {
+            if !a.iter().any(|(i, _)| *i == id) {
+                a.push((id, action))
+            }
+        }),
         AgentEvent::DocAnswer { text, grounded_on } => {
             log.update(|l| l.push(LogEntry::Doc { text, grounded_on }))
         }
@@ -185,7 +250,16 @@ fn apply_event(
                 l.push(LogEntry::Ws(format!("ingested {path} -> {doc_id}: {chunks} chunks {note}")))
             });
         }
-        AgentEvent::TurnStarted { .. } => {}
+        // A turn's events, tagged with the turn.
+        AgentEvent::Turn { plan_id, event } => {
+            apply_event(*event, Some(&plan_id), shared, log, entries, approvals, busy)
+        }
+        AgentEvent::TurnList { turns } => log.update(|l| {
+            for t in turns {
+                l.push(LogEntry::Ws(format!("{} [{}] {}", t.plan_id, t.status, t.prompt)));
+            }
+        }),
+        AgentEvent::TurnStarted { .. } => busy.set(true),
         AgentEvent::TurnComplete { plan_id } => {
             busy.set(false);
             log.update(|l| l.push(LogEntry::Turn { plan_id }));

@@ -252,6 +252,24 @@ impl PlanGraph {
     /// role, prompt, output (capped at `per_task_cap` bytes), and written paths, plus
     /// a line per `Failed` task — the reviewer must see the gaps, not only the wins.
     /// `None` when nothing completed — there is nothing to review.
+    pub fn journal_tasks(&self, per_task_cap: usize) -> serde_json::Value {
+        let cap = |s: &str| s[..crate::tools::floor_char_boundary(s, per_task_cap.min(s.len()))].to_string();
+        self.nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.task.id,
+                    "role": n.task.role.as_str(),
+                    "status": format!("{:?}", n.status),
+                    "prompt": cap(&n.task.prompt),
+                    "output": n.output.as_deref().map(cap),
+                    "artifacts": n.artifacts,
+                    "emitted_by": n.emitted_by,
+                })
+            })
+            .collect()
+    }
+
     pub fn review_digest(&self, per_task_cap: usize) -> Option<String> {
         let done: Vec<_> = self
             .nodes

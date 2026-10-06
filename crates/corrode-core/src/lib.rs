@@ -96,6 +96,20 @@ pub struct FileNodeView {
     pub mode: Option<ProjectionMode>,
 }
 
+/// One Prompt turn of the session (a row of `TurnList`): running, or finished and
+/// recorded in the repo's turn journal (`.corrode/turns.jsonl`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TurnSummary {
+    pub plan_id: String,
+    /// `running`, `complete`, `cancelled`, `budget exhausted`, or `planning failed`.
+    pub status: String,
+    /// The prompt, capped for display.
+    pub prompt: String,
+    /// Unix seconds.
+    pub started: u64,
+    pub ended: Option<u64>,
+}
+
 /// One ingested document in the doc GraphRAG (reply row of `ListDocs`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DocEntry {
@@ -126,6 +140,9 @@ pub enum AgentCommand {
     SelectRepo { path: String },
     /// Free-form instruction; the daemon plans and fans out a swarm.
     Prompt { text: String, priority: Priority },
+    /// The session's running turns and its most recent finished ones (reply is
+    /// `TurnList`).
+    ListTurns,
     /// Stop a running Prompt turn of this session (the `plan_id` its `TurnStarted`
     /// carried): nothing more launches, running tasks are dropped (a command's process
     /// group killed), and the turn ends with an Error and `TurnComplete`.
@@ -214,6 +231,14 @@ pub enum AgentEvent {
     /// dropped — the kind pair implies them; carry them when the explorer needs
     /// labeled edges.
     PlanGraph { plan_id: String, nodes: Vec<GraphNodeView> },
+    /// Everything a Prompt turn emits, tagged with the turn. A turn's events go to
+    /// every connection bound to its session, and a connection that (re)attaches is
+    /// first replayed the recent ones -- a turn used to die with the socket that
+    /// started it while its GPU work carried on. Per-task ids restart at 0 every
+    /// turn, so a client keys them by `(plan_id, id)`.
+    Turn { plan_id: String, event: Box<AgentEvent> },
+    /// Reply to `ListTurns`: running turns first, then the most recent finished.
+    TurnList { turns: Vec<TurnSummary> },
     /// A Prompt turn began; `plan_id` names it for `CancelTurn` and matches its
     /// `TurnComplete`.
     TurnStarted { plan_id: String },
@@ -339,6 +364,14 @@ mod tests {
             &AgentEvent::TurnStarted { plan_id: "plan-0".into() },
             r#"{"TurnStarted":{"plan_id":"plan-0"}}"#,
         );
+        pin(
+            &AgentEvent::Turn {
+                plan_id: "plan-0".into(),
+                event: Box::new(AgentEvent::SubagentOutput { id: 3, text: "done".into() }),
+            },
+            r#"{"Turn":{"plan_id":"plan-0","event":{"SubagentOutput":{"id":3,"text":"done"}}}}"#,
+        );
+        pin(&AgentCommand::ListTurns, r#""ListTurns""#);
         pin(
             &AgentEvent::TurnComplete { plan_id: "plan-0".into() },
             r#"{"TurnComplete":{"plan_id":"plan-0"}}"#,

@@ -96,20 +96,40 @@ async fn proxy_socket(browser: WebSocket, daemon_url: Arc<String>) {
         }
     });
 
-    // daemon -> browser
+    // daemon -> browser, pinging the browser every 30 s: a laptop that slept or a
+    // dropped proxy then surfaces as a failed send instead of a half-open socket
+    // held for ~15 minutes.
     let d2b = tokio::spawn(async move {
-        while let Some(Ok(msg)) = daemon_rx.next().await {
-            match msg {
-                WsMsg::Text(t) => {
-                    if browser_tx.send(AxMsg::Text(t.as_str().into())).await.is_err() {
+        let mut ping = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                msg = daemon_rx.next() => match msg {
+                    Some(Ok(WsMsg::Text(t))) => {
+                        if browser_tx.send(AxMsg::Text(t.as_str().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMsg::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {}
+                },
+                _ = ping.tick() => {
+                    if browser_tx.send(AxMsg::Ping(Default::default())).await.is_err() {
                         break;
                     }
                 }
-                WsMsg::Close(_) => break,
-                _ => {}
             }
         }
     });
 
-    let _ = tokio::join!(b2d, d2b);
+    // Either side ending ends both. `join!` waited for the other pump, so a closed
+    // browser kept the daemon connection -- and its session binding -- open until
+    // the daemon next wrote to it. The daemon's turns no longer depend on this
+    // socket: a reconnecting client is replayed what it missed.
+    let (mut b2d, mut d2b) = (b2d, d2b);
+    tokio::select! {
+        _ = &mut b2d => {}
+        _ = &mut d2b => {}
+    }
+    b2d.abort();
+    d2b.abort();
 }

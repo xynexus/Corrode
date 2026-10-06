@@ -79,7 +79,7 @@ fn esc(s: &str) -> String {
 fn entry_html(e: &ws::LogEntry) -> String {
     use ws::LogEntry::*;
     match e {
-        Agent { id, text } => {
+        Agent { id, text, .. } => {
             let hue = (*id * 137) % 360;
             format!(
                 "<div class=\"msg agent\"><span class=\"agent-badge\" \
