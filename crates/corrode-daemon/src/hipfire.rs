@@ -333,15 +333,31 @@ pub struct CallScope {
     /// The part of `usage` spent on the remote endpoint (`crate::remote`), which is
     /// what costs money.
     remote: std::sync::Mutex<Usage>,
+    /// Ask hipfire to run this scope's calls alone (`metadata.hipfire_deterministic`).
+    deterministic: bool,
 }
 
 impl CallScope {
     pub fn new(id: impl Into<String>) -> std::sync::Arc<Self> {
+        Self::with(id.into(), false)
+    }
+
+    /// A scope whose hipfire calls run alone: their answers are the ones an idle
+    /// server gives, whatever else it is batching. At temperature 0 a near-tie
+    /// otherwise resolves differently alone than beside other requests (a busy and
+    /// an idle server gave the 27B two different answers) -- for the planner, whose
+    /// plan shapes the whole turn, that is two different turns.
+    pub fn deterministic(id: impl Into<String>) -> std::sync::Arc<Self> {
+        Self::with(id.into(), true)
+    }
+
+    fn with(id: String, deterministic: bool) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            id: id.into(),
+            id,
             seq: Default::default(),
             usage: Default::default(),
             remote: Default::default(),
+            deterministic,
         })
     }
 
@@ -356,6 +372,16 @@ impl CallScope {
 
 tokio::task_local! {
     pub static CALLS: std::sync::Arc<CallScope>;
+}
+
+/// The request metadata hipfire reads: the priority band, and whether the running
+/// scope wants its calls run alone.
+fn request_metadata(priority: Priority) -> serde_json::Value {
+    let mut metadata = serde_json::json!({ "hipfire_priority": priority.as_u8() });
+    if CALLS.try_with(|c| c.deterministic).unwrap_or(false) {
+        metadata["hipfire_deterministic"] = serde_json::json!(true);
+    }
+    metadata
 }
 
 /// The next request id of the running scope, if one is set.
@@ -784,7 +810,7 @@ impl Client {
             model,
             input,
             max_output_tokens: self.max_output_tokens,
-            metadata: serde_json::json!({ "hipfire_priority": priority.as_u8() }),
+            metadata: request_metadata(priority),
             tools,
             reasoning_effort: effort,
         };
@@ -986,7 +1012,7 @@ impl Client {
             model,
             input: self.input_items(input),
             max_output_tokens: self.max_output_tokens,
-            metadata: serde_json::json!({ "hipfire_priority": priority.as_u8() }),
+            metadata: request_metadata(priority),
             tools: None,
             reasoning_effort: effort,
         };
@@ -1303,6 +1329,42 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), n)
+    }
+
+    // A deterministic scope's calls ask hipfire to run them alone; others do not.
+    #[tokio::test]
+    async fn a_deterministic_scope_asks_hipfire_to_run_its_calls_alone() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        let metas = Arc::new(Mutex::new(Vec::new()));
+        let seen = metas.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(body.0["metadata"].clone());
+                    r#"{"status":"completed","output_text":"ok","output":[]}"#
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(url, None);
+        CALLS
+            .scope(CallScope::deterministic("p/plan"), async {
+                client.respond("m", "p", Priority::Realtime, None, None).await.unwrap();
+            })
+            .await;
+        CALLS
+            .scope(CallScope::new("p/1"), async {
+                client.respond("m", "p", Priority::Default, None, None).await.unwrap();
+            })
+            .await;
+        let metas = metas.lock().unwrap();
+        assert_eq!(metas[0]["hipfire_deterministic"], true);
+        assert!(metas[1].get("hipfire_deterministic").is_none(), "{}", metas[1]);
     }
 
     // Calls made inside a scope carry `<scope>/<n>` as X-Request-Id and add their
