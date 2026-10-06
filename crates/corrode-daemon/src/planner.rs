@@ -216,12 +216,19 @@ fn balanced_array_at(text: &str, start: usize) -> Option<&str> {
 /// parses as a subtask list — so stray brackets in prose (`[note]`) or inside task
 /// strings (`a[0]`) don't defeat it. Unknown roles fall back to Coder.
 pub fn parse_plan(text: &str) -> Vec<PlannedSubtask> {
+    // An empty array is never the plan: a stray `[]` in the prose before the real
+    // array used to win and leave the turn with nothing to do.
     let raw: Vec<RawSubtask> = serde_json::from_str(text)
         .ok()
+        .filter(|v: &Vec<RawSubtask>| !v.is_empty())
         .or_else(|| {
             text.match_indices('[')
                 .filter_map(|(i, _)| balanced_array_at(text, i))
-                .find_map(|slice| serde_json::from_str::<Vec<RawSubtask>>(slice).ok())
+                .find_map(|slice| {
+                    serde_json::from_str::<Vec<RawSubtask>>(slice)
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                })
         })
         .unwrap_or_default();
 
@@ -334,6 +341,14 @@ mod tests {
         assert_eq!(plan[0].after, Vec::<usize>::new());
         assert_eq!(plan[1].after, vec![0]);
         assert_eq!(plan[2].after, vec![0, 1]);
+    }
+
+    #[test]
+    fn parse_plan_skips_an_empty_array_before_the_plan() {
+        let out = r#"No prior tasks ([]). Plan: [{"role": "coder", "task": "fix clamp"}]"#;
+        let plan = parse_plan(out);
+        assert_eq!(plan.len(), 1, "{plan:?}");
+        assert_eq!(plan[0].prompt, "fix clamp");
     }
 
     #[test]
