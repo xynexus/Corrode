@@ -32,6 +32,8 @@ const FLAGS: &[&str] = &[
     "CORRODE_AUTO_APPROVE",
     "CORRODE_STREAM",
     "CORRODE_PLAN_REVIEW",
+    "CORRODE_VFS_GRAPH",
+    "CORRODE_VFS_VERIFY",
 ];
 
 /// Counts and whole seconds.
@@ -213,6 +215,14 @@ mod tests {
             ("CORRODE_OPENAI_PRICE_IN", "0.27"),
         ])
         .is_empty());
+    }
+
+    // The VFS flags parsed themselves, so `yes` silently meant off.
+    #[test]
+    fn vfs_flags_go_through_the_shared_parser() {
+        let bad = check_of(&[("CORRODE_VFS_GRAPH", "maybe"), ("CORRODE_VFS_VERIFY", "sure")]);
+        assert_eq!(bad.len(), 2, "{bad:?}");
+        assert!(check_of(&[("CORRODE_VFS_GRAPH", "yes"), ("CORRODE_VFS_VERIFY", "0")]).is_empty());
     }
 
     #[test]

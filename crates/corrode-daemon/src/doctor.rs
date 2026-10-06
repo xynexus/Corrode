@@ -177,15 +177,55 @@ pub async fn run() -> bool {
         }
     }
 
-    // --- env echo ---
+    // --- effective policy: what the daemon will do, defaults applied, read through the
+    // same functions the daemon uses -- the raw env echo showed a hand-kept subset and
+    // nothing for an unset knob ---
+    use crate::knobs::flag;
+    let on = |b: bool| if b { "on" } else { "off" };
+    let secs = |d: Option<std::time::Duration>| {
+        d.map_or_else(|| "unbounded".to_string(), |d| format!("{}s", d.as_secs()))
+    };
+    println!("\npolicy (effective):");
+    println!(
+        "  sandbox {} (network {}), auto-approve {}",
+        on(flag("CORRODE_SANDBOX", true)),
+        on(flag("CORRODE_SANDBOX_NET", false)),
+        on(flag("CORRODE_AUTO_APPROVE", false))
+    );
+    println!(
+        "  turn budget {}, task timeout {}, command timeout {}s, request timeout {}s, approval timeout {}s, retry window {}s",
+        secs(crate::daemon::turn_budget()),
+        secs(crate::daemon::task_timeout()),
+        crate::tools::command_timeout().as_secs(),
+        crate::hipfire::request_timeout_s(),
+        crate::approval::approval_timeout().as_secs(),
+        crate::hipfire::retry_window().as_secs()
+    );
+    println!(
+        "  tool steps {} (research {}), follow-ups {} per drive, fan-out {}, plan review {}, concurrency {}",
+        crate::daemon::max_tool_steps(),
+        crate::daemon::max_tool_steps_for(roles::Role::Research),
+        crate::plan_graph::max_followups(),
+        crate::daemon::fanout_k(),
+        on(crate::daemon::plan_review_enabled()),
+        crate::daemon::max_concurrency()
+    );
+    println!(
+        "  context {} tokens, output cap {} tokens, streaming {}, graph-backed vfs {}",
+        crate::daemon::context_tokens(),
+        crate::hipfire::max_output_tokens(),
+        on(flag("CORRODE_STREAM", false)),
+        on(flag("CORRODE_VFS_GRAPH", false))
+    );
+    let efforts: Vec<String> = roles::Role::ALL
+        .iter()
+        .map(|&r| format!("{}={}", r.as_str(), roles::effort_for(r)))
+        .collect();
+    println!("  reasoning effort: {}", efforts.join(", "));
+
+    // --- env echo (where things are, not how they behave) ---
     println!("\nenv:");
     for k in [
-        "CORRODE_SANDBOX",
-        "CORRODE_SANDBOX_NET",
-        "CORRODE_AUTO_APPROVE",
-        "CORRODE_TURN_BUDGET_S",
-        "CORRODE_MAX_CONCURRENCY",
-        "CORRODE_REASONING_EFFORT",
         "CORRODE_USERS",
         "CORRODE_REPO",
         "CORRODE_GRAPH_DIR",

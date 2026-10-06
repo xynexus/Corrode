@@ -1735,7 +1735,7 @@ impl Daemon {
 /// runaway loops. `CORRODE_MAX_TOOL_STEPS` overrides. 6 was too few for a real repo:
 /// "read 15 crates' manifests and roots" needs ~30, and every task on CAE spent its
 /// budget mid-read. Steps are cheap with prefix reuse (each forks the last checkpoint).
-fn max_tool_steps() -> usize {
+pub(crate) fn max_tool_steps() -> usize {
     std::env::var("CORRODE_MAX_TOOL_STEPS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -1756,7 +1756,7 @@ by appending the rest with run_command if you have it).";
 /// `CORRODE_CONTEXT_TOKENS`: the serving model's context (default 32768, the
 /// swarm models' hipfire max_seq). The tool loop stops gathering once the
 /// conversation leaves less than one output cap of it.
-fn context_tokens() -> usize {
+pub(crate) fn context_tokens() -> usize {
     std::env::var("CORRODE_CONTEXT_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1865,7 +1865,7 @@ fn steps_left_note(left: usize) -> String {
 /// given 16 it simply read twice as much -- 107K prompt tokens of file contents for
 /// three tasks, the prefill that dominated the turn. Other roles keep the full budget
 /// (a coder's edits are sequential).
-fn max_tool_steps_for(role: Role) -> usize {
+pub(crate) fn max_tool_steps_for(role: Role) -> usize {
     let all = max_tool_steps();
     if role != Role::Research {
         return all;
@@ -1921,7 +1921,7 @@ const TOOL_RESULT_CAP: usize = 2048;
 /// before executing (1 = off, today's single-shot behavior).
 /// ponytail: clamped to 8 — hipfire's admission control is the real limit; raise
 /// the cap when a wider ensemble measurably helps.
-fn fanout_k() -> usize {
+pub(crate) fn fanout_k() -> usize {
     std::env::var("CORRODE_FANOUT")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -1933,7 +1933,7 @@ fn fanout_k() -> usize {
 /// unparseable -> unbounded, which is today's behaviour and stays the default: a ceiling
 /// that silently truncates work is worse than a slow turn for anyone who has not asked
 /// for one.
-fn turn_budget() -> Option<std::time::Duration> {
+pub(crate) fn turn_budget() -> Option<std::time::Duration> {
     std::env::var("CORRODE_TURN_BUDGET_S")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -1945,7 +1945,7 @@ fn turn_budget() -> Option<std::time::Duration> {
 /// 1024 (effectively unlimited — the swarm is bounded by MAX_PLAN_TASKS and hipfire's
 /// own admission control). Set to a small N to serialize on a backend that crashes
 /// under a concurrent burst. A parsed 0 is treated as 1 (never a zero-permit deadlock).
-fn max_concurrency() -> usize {
+pub(crate) fn max_concurrency() -> usize {
     std::env::var("CORRODE_MAX_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -1956,7 +1956,7 @@ fn max_concurrency() -> usize {
 /// `CORRODE_TASK_TIMEOUT_S`: ceiling on one task, its retries and tool steps included.
 /// Default 3600; 0 disables. Past it the task fails, what it was running is dropped
 /// (a command's process group killed), and the rest of the turn carries on.
-fn task_timeout() -> Option<std::time::Duration> {
+pub(crate) fn task_timeout() -> Option<std::time::Duration> {
     let s = std::env::var("CORRODE_TASK_TIMEOUT_S")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -2037,7 +2037,7 @@ impl Drop for TurnEnd {
 }
 
 /// `CORRODE_PLAN_REVIEW`: the plan-level review pass, on unless set off.
-fn plan_review_enabled() -> bool {
+pub(crate) fn plan_review_enabled() -> bool {
     crate::knobs::flag("CORRODE_PLAN_REVIEW", true)
 }
 

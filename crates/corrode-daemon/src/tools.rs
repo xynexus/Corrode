@@ -885,7 +885,7 @@ pub(crate) fn arg_text<'a>(call: &'a ToolCall, key: &str) -> Option<std::borrow:
 /// `CORRODE_COMMAND_TIMEOUT_S`, default 1800. A swarm runs unattended, so a
 /// command that never ends (a server, a deadlocked test, `cargo run` on a
 /// binary that waits) must end the call, not the turn.
-fn command_timeout() -> std::time::Duration {
+pub(crate) fn command_timeout() -> std::time::Duration {
     let s = std::env::var("CORRODE_COMMAND_TIMEOUT_S")
         .ok()
         .and_then(|v| v.parse().ok())
