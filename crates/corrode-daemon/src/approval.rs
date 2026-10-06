@@ -46,6 +46,12 @@ pub struct ApprovalGate {
 impl ApprovalGate {
     /// A gate whose auto-approve is read from `CORRODE_AUTO_APPROVE`. Off unless set
     /// on — the human-in-the-loop default.
+    /// A gate that approves everything, for tests (no process env involved).
+    #[cfg(test)]
+    pub fn auto_approving() -> Self {
+        Self { auto_approve: true, ..Default::default() }
+    }
+
     pub fn from_env() -> Self {
         let auto_approve = crate::knobs::flag("CORRODE_AUTO_APPROVE", false);
         Self {

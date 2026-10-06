@@ -352,7 +352,12 @@ The gate and its `CORRODE_SMALL_MODELS` / `CORRODE_SMALL_MODEL_MAX_B` knobs are 
 *selection* sharpens with the planned finetune. `Daemon`'s `vfs` is `Arc<dyn Vfs>` so the
 loop's `'static` future owns a clone.
 
-Observation memory is **turn-wide** (`SeenCalls`, one per Prompt turn, shared by all
+`write_file` is **optimistically concurrent**: each task's `ToolBox` records the version
+(content hash) of every file it reads or writes — a read the turn's cache answered
+included — and a whole-file write is refused when the file on disk is no longer that
+version ("changed since you last read it ... read it again"), instead of silently
+reverting a sibling's or a command's change. A file the task never read is not
+checked (creating one). Observation memory is **turn-wide** (`SeenCalls`, one per Prompt turn, shared by all
 tasks): a sibling's identical call is served from cache, a mutating call is
 approval-gated once per turn, a successful mutation invalidates everything, and each
 launching task's tail carries a digest of the swarm's activity so far (the shared

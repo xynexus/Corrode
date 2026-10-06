@@ -204,6 +204,26 @@ pub struct ToolBox {
     /// hipfire client + model for cross-encoder reranking of graph hits. `None` unless
     /// `CORRODE_RERANK_MODEL` names a served reranker, so search is unchanged by default.
     reranker: Option<(Arc<crate::hipfire::Client>, String)>,
+    /// The version (content hash) of each file this task last read or wrote, for
+    /// `write_file`'s check (see [`ToolBox::stale_write`]).
+    versions: Arc<std::sync::Mutex<HashMap<String, Option<u64>>>>,
+}
+
+/// A path's key in `ToolBox::versions`: `./src/lib.rs` and `src/lib.rs` are one file.
+fn version_key(path: &str) -> String {
+    Path::new(path.trim())
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn content_version(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }
 
 impl ToolBox {
@@ -221,7 +241,34 @@ impl ToolBox {
             graph: None,
             reranker: None,
             plan: None,
+            versions: Default::default(),
         }
+    }
+
+    /// Record the file's current version as what this task has seen. For a read the
+    /// turn's cache answered: the cache is cleared by every write in the turn, so what
+    /// it returned is what is on disk now.
+    pub async fn note_read(&self, path: &str) {
+        let version = self.vfs.read(path).await.ok().map(|b| content_version(&b));
+        self.versions.lock().unwrap().insert(version_key(path), version);
+    }
+
+    /// Why a whole-file write of `path` would discard someone else's change, if it
+    /// would: the file is not what this task last read or wrote. Two coders
+    /// registering modules in one `lib.rs`, or a task rewriting from text a sibling
+    /// had since changed, otherwise lost each other's work silently -- and the
+    /// result usually still compiled. A file the task never read is not checked
+    /// (creating one, or a deliberate full rewrite).
+    async fn stale_write(&self, path: &str) -> Option<String> {
+        let seen = *self.versions.lock().unwrap().get(&version_key(path))?;
+        let now = self.vfs.read(path).await.ok().map(|b| content_version(&b));
+        (now != seen).then(|| {
+            format!(
+                "error: {path} changed since you last read it -- another task or a command \
+                 wrote it. Writing now would discard that change. Read it again and apply \
+                 your edit to its current contents."
+            )
+        })
     }
 
     /// Confine spawned processes with this sandbox (builder; default is disabled).
@@ -595,8 +642,15 @@ impl ToolBox {
     }
 
     async fn write_file(&self, path: &str, contents: &str) -> String {
+        if let Some(refused) = self.stale_write(path).await {
+            return refused;
+        }
         match self.vfs.write(path, contents.as_bytes()).await {
-            Ok(()) => format!("wrote {} bytes to {path}", contents.len()),
+            Ok(()) => {
+                let version = Some(content_version(contents.as_bytes()));
+                self.versions.lock().unwrap().insert(version_key(path), version);
+                format!("wrote {} bytes to {path}", contents.len())
+            }
             Err(e) => format!("error: could not write {path}: {e}"),
         }
     }
@@ -665,6 +719,8 @@ impl ToolBox {
     async fn read_file(&self, path: &str) -> String {
         match self.vfs.read(path).await {
             Ok(bytes) => {
+                let version = Some(content_version(&bytes));
+                self.versions.lock().unwrap().insert(version_key(path), version);
                 let text = String::from_utf8_lossy(&bytes);
                 let (shown, truncated) = if text.len() > MAX_READ_BYTES {
                     (&text[..floor_char_boundary(&text, MAX_READ_BYTES)], true)
@@ -1085,6 +1141,42 @@ mod tests {
             "survivor: {}",
             String::from_utf8_lossy(&left.stdout)
         );
+    }
+
+    // Two tasks edit one file: the one that writes second, from text the first had
+    // since changed, is refused instead of silently reverting that change -- and goes
+    // through once it has read the current text. Creating a file needs no read.
+    #[tokio::test]
+    async fn a_write_from_stale_text_is_refused() {
+        let dir = std::env::temp_dir().join(format!("corrode-occ-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), "mod a;\n").unwrap();
+        let task = || {
+            ToolBox::new(
+                Arc::new(crate::vfs::PassthroughVfs::new(&dir)),
+                dir.clone(),
+                Arc::new(HashMap::new()),
+            )
+        };
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            name: name.to_string(),
+            arguments: args,
+        };
+        let (a, b) = (task(), task());
+        let read = call("read_file", serde_json::json!({"path": "lib.rs"}));
+        a.execute(&read).await;
+        b.execute(&read).await;
+        let b_write = call("write_file", serde_json::json!({"path": "./lib.rs", "contents": "mod a;\nmod b;\n"}));
+        assert!(b.execute(&b_write).await.starts_with("wrote"));
+        let a_write = call("write_file", serde_json::json!({"path": "lib.rs", "contents": "mod a;\nmod c;\n"}));
+        let refused = a.execute(&a_write).await;
+        assert!(refused.contains("changed since you last read it"), "{refused}");
+        assert_eq!(std::fs::read_to_string(dir.join("lib.rs")).unwrap(), "mod a;\nmod b;\n");
+        a.execute(&read).await;
+        assert!(a.execute(&a_write).await.starts_with("wrote"), "after re-reading");
+        let fresh = call("write_file", serde_json::json!({"path": "new.rs", "contents": "x"}));
+        assert!(b.execute(&fresh).await.starts_with("wrote"), "a new file needs no read");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // Unbounded output is drained but not kept: head and tail survive, the middle
