@@ -174,6 +174,13 @@ impl Sandbox {
         push(&["--bind", &repo, &repo]);
         let corrode = format!("{repo}/.corrode");
         push(&["--ro-bind-try", &corrode, &corrode]);
+        // .git read-only too (the user's call, 2026-10-06): a writable one let a
+        // sandboxed command set `core.hooksPath` or `core.fsmonitor` -- code that runs
+        // at the human's next `git status`, outside any sandbox. The file tools
+        // already refuse .git (`vfs::confine_write`); this closes the shell route.
+        // Commands can still read history (status, diff, log) but not commit.
+        let git = format!("{repo}/.git");
+        push(&["--ro-bind-try", &git, &git]);
         // After the repo bind, so a repo at `~` cannot hide them (a later bind of a
         // parent covers the mounts beneath it).
         let toolchain_dir = |var: &str, dir: &str| {
@@ -219,6 +226,9 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.contains("--bind /home/u/proj /home/u/proj"), "{joined}");
         assert!(joined.contains("--ro-bind-try /home/u/proj/.corrode /home/u/proj/.corrode"), "{joined}");
+        // .git re-bound read-only after the repo bind (a later bind wins).
+        let git = joined.find("--ro-bind-try /home/u/proj/.git /home/u/proj/.git").expect(&joined);
+        assert!(joined.find("--bind /home/u/proj /home/u/proj").unwrap() < git, "{joined}");
         assert!(joined.contains("--unshare-all"), "{joined}");
         assert!(!joined.contains("--share-net"), "net denied by default: {joined}");
         // --new-session is intentionally never emitted (breaks job control).
@@ -279,5 +289,37 @@ mod tests {
         let sb = Sandbox { enabled: true, share_net: true };
         let (_, args) = sb.wrap(&PathBuf::from("/r"), &["/bin/bash", "-i"]);
         assert!(args.join(" ").contains("--share-net"));
+    }
+
+    // For real, where bwrap can run: inside the sandbox git can read the repo but
+    // cannot write its config (a hooksPath would run at the human's next `git status`).
+    #[test]
+    fn git_metadata_is_read_only_inside_the_sandbox() {
+        let repo = std::env::temp_dir().join(format!("corrode-sbgit-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).unwrap();
+        let ok = |cmd: &mut std::process::Command| cmd.output().is_ok_and(|o| o.status.success());
+        if !ok(std::process::Command::new("git").arg("init").arg("-q").arg(&repo)) {
+            eprintln!("skipped: no git");
+            return;
+        }
+        let sb = Sandbox { enabled: true, share_net: false };
+        let run = |script: &str| {
+            let (prog, args) = sb.wrap(&repo, &["sh", "-c", script]);
+            std::process::Command::new(prog).args(args).output()
+        };
+        if !run("true").is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: bwrap cannot run here");
+            std::fs::remove_dir_all(&repo).ok();
+            return;
+        }
+        let out = run("git status --short >/dev/null && echo READ_OK; \
+                       git config core.hooksPath /tmp/x 2>/dev/null && echo WROTE || echo REFUSED")
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("READ_OK"), "git must still read: {text}");
+        assert!(text.contains("REFUSED") && !text.contains("WROTE"), "{text}");
+        let config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+        assert!(!config.contains("hooksPath"), "{config}");
+        std::fs::remove_dir_all(&repo).ok();
     }
 }
