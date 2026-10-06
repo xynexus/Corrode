@@ -222,6 +222,10 @@ pub async fn run() -> bool {
         .map(|&r| format!("{}={}", r.as_str(), roles::effort_for(r)))
         .collect();
     println!("  reasoning effort: {}", efforts.join(", "));
+    println!(
+        "  planner runs alone on hipfire (deterministic): {}",
+        on(flag("CORRODE_PLANNER_DETERMINISTIC", true))
+    );
 
     // --- env echo (where things are, not how they behave) ---
     println!("\nenv:");

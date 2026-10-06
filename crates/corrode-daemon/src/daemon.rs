@@ -509,7 +509,16 @@ impl Daemon {
                     cancel: Some(cancel_rx),
                     ..Default::default()
                 };
-                let planner_calls = crate::hipfire::CallScope::new(format!("{plan_id}/plan"));
+                // The planner's calls run alone on hipfire (CORRODE_PLANNER_DETERMINISTIC,
+                // default on): its plan shapes the whole turn, and at temperature 0 the
+                // same planning prompt otherwise plans differently on a busy server than
+                // on an idle one. Off trades that for the planner batching with other work.
+                let planner_scope = format!("{plan_id}/plan");
+                let planner_calls = if crate::knobs::flag("CORRODE_PLANNER_DETERMINISTIC", true) {
+                    crate::hipfire::CallScope::deterministic(planner_scope)
+                } else {
+                    crate::hipfire::CallScope::new(planner_scope)
+                };
                 let planned = bounds
                     .run(crate::hipfire::CALLS.scope(
                         Arc::clone(&planner_calls),

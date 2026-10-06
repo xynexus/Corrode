@@ -117,7 +117,10 @@ prompt that cannot fit at all fails its task with a clear error), `CORRODE_STREA
 the UI as tokens generate; off unless set on — the non-streaming path is
 unchanged when off), `CORRODE_FANOUT` (coder-task ensemble size — K read-only proposal
 attempts judged by the review model before one writable execution; default 1 = off,
-clamped to 8), `CORRODE_PLAN_REVIEW` (plan-level review pass after the plan settles;
+clamped to 8), `CORRODE_PLANNER_DETERMINISTIC` (the planner's hipfire calls run alone --
+`metadata.hipfire_deterministic` -- so a temperature-0 plan is the same on a busy server as
+on an idle one; batch composition otherwise flips near-ties; on unless set off, off lets the
+planner batch with other work), `CORRODE_PLAN_REVIEW` (plan-level review pass after the plan settles;
 on unless set off), `CORRODE_TURN_BUDGET_S` (wall-clock ceiling for one Prompt
 turn, planning included — past it no new task launches and no emission is folded in,
 and work still running `plan_graph::TURN_GRACE` (120 s) later is dropped and marked
