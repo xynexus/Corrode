@@ -941,6 +941,7 @@ impl Daemon {
             priority,
             model: orch_model,
             owner_token: session.owner_token.clone(),
+            effort: Some(crate::roles::effort_for(Role::Orchestration)),
         };
         let plan_prompt = plan_task.prompt.clone();
         let first = self
@@ -951,13 +952,13 @@ impl Daemon {
             .map(|(_, r)| r)
             .transpose();
         // A planner cut off mid-thought returned its raw reasoning as the plan. Retry
-        // once with a bounded thinking budget ("medium": still thinking, which
-        // planning needs, but within the output cap) before giving up on structure.
+        // once on a smaller thinking budget ("low": still thinking, which planning
+        // needs; it already ran at its role's effort) before giving up on structure.
         let plan_text = match first {
             Ok(t) => t.unwrap_or_default(),
             Err(e) => match e.downcast::<crate::hipfire::Truncated>() {
                 Ok(t) => {
-                    eprintln!("planner: {t}; retrying with reasoning effort medium");
+                    eprintln!("planner: {t}; retrying with reasoning effort low");
                     let model = self.roles.model_for(Role::Orchestration).unwrap_or_default();
                     match self
                         .swarm
@@ -968,7 +969,7 @@ impl Daemon {
                             priority,
                             session.owner_token.as_deref(),
                             None,
-                            Some("medium"),
+                            Some("low"),
                         )
                         .await
                     {
@@ -1195,6 +1196,7 @@ impl Daemon {
                         &prompt,
                         Priority::Default,
                         session.owner_token.as_deref(),
+                        None,
                     )
                     .await
                 {
@@ -1935,7 +1937,7 @@ async fn run_native_tool_loop(
     // fanout attempts blind to each other's era instead.
     let values = toolbox.param_values().await;
     let tools = dialect.request_tools(crate::tools::role_tools(role), Some(&values));
-    let effort = std::env::var("CORRODE_REASONING_EFFORT").unwrap_or_else(|_| "none".to_string());
+    let effort = crate::roles::effort_for(role);
     // The first user turn stays fixed; each step appends its call and result as
     // turns after it (see `Client::respond_turns`).
     let prompt = planner::native_tool_prompt(prefix, role, task);
@@ -2238,6 +2240,7 @@ async fn run_tool_loop(
     seen: &std::sync::Mutex<SeenCalls>,
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<String> {
+    let effort = crate::roles::effort_for(role);
     // Render the exec toolset in the tool-call model's dialect once; parse each reply
     // with the same dialect (which maps its tool names back to canonical).
     let dialect = dialects.resolve(caller.model_id());
@@ -2270,7 +2273,7 @@ async fn run_tool_loop(
         }
         let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
         let text = client
-            .respond(model, &prompt, band, toolbox.owner_token())
+            .respond(model, &prompt, band, toolbox.owner_token(), Some(&effort))
             .await?;
         let _ = events
             .send(AgentEvent::SubagentOutput {
@@ -2331,7 +2334,7 @@ async fn run_tool_loop(
     scratchpad.push_str(&format!("\n{FINAL_ANSWER_NUDGE}\n"));
     let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
     let text = client
-        .respond(model, &prompt, band, toolbox.owner_token())
+        .respond(model, &prompt, band, toolbox.owner_token(), Some(&effort))
         .await?;
     let _ = events
         .send(AgentEvent::SubagentOutput {
@@ -2481,6 +2484,7 @@ async fn run_task(
     seen: &std::sync::Mutex<SeenCalls>,
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<String> {
+    let effort = crate::roles::effort_for(role);
     let role_dialect = dialects.resolve(model);
     if role_dialect.emits_own_calls() {
         let outcome = run_native_tool_loop(
@@ -2551,7 +2555,7 @@ async fn run_task(
             // under backpressure, the final SubagentOutput below reconciles).
             let ev = events.clone();
             let (text, _reasoning) = client
-                .respond_streaming(model, &full, band, toolbox.owner_token(), |delta| {
+                .respond_streaming(model, &full, band, toolbox.owner_token(), Some(&effort), |delta| {
                     let _ = ev.try_send(AgentEvent::SubagentDelta {
                         id,
                         text: delta.to_string(),
@@ -2561,7 +2565,7 @@ async fn run_task(
             Ok(text)
         } else {
             client
-                .respond(model, &full, band, toolbox.owner_token())
+                .respond(model, &full, band, toolbox.owner_token(), Some(&effort))
                 .await
         };
         if let Ok(text) = &out {
@@ -2701,6 +2705,7 @@ async fn run_fanout(
                 &judge_prompt,
                 planner::band_for(Role::Review),
                 toolbox.owner_token(),
+                Some(&crate::roles::effort_for(Role::Review)),
             )
             .await
         {

@@ -183,7 +183,7 @@ async fn structure_versus_description_on_near_identical_siblings() -> anyhow::Re
         // Fail loudly. An `unwrap_or_default()` here silently embedded four empty
         // strings and reported them as a result.
         let summary = match client
-            .respond(SUMMARY_MODEL, &prompt, corrode_core::Priority::Default, None)
+            .respond(SUMMARY_MODEL, &prompt, corrode_core::Priority::Default, None, None)
             .await
         {
             Ok(t) => t,
@@ -203,7 +203,7 @@ async fn structure_versus_description_on_near_identical_siblings() -> anyhow::Re
             siblings.join(", ")
         );
         let cs = match client
-            .respond(SUMMARY_MODEL, &cprompt, corrode_core::Priority::Default, None)
+            .respond(SUMMARY_MODEL, &cprompt, corrode_core::Priority::Default, None, None)
             .await
         {
             Ok(t) => t,
