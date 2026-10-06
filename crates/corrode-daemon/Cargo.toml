@@ -54,15 +54,14 @@ version = "0.9"
 features = ["tokio-runtime", "unprivileged"]
 optional = true
 
-# Pulled in only by the `fuse` feature: `bytes` for ReplyData, `libc` for errno
-# constants and getuid/getgid on the mount owner.
+# `bytes` is pulled in only by the `fuse` feature (ReplyData). `libc` is always on:
+# the VFS opens with O_NOFOLLOW, and fuse uses its errno constants and getuid/getgid.
 [dependencies.bytes]
 version = "1"
 optional = true
 
 [dependencies.libc]
 version = "0.2"
-optional = true
 
 # Needle tool-call shim: a tiny CPU/candle encoder-decoder that turns `query + tools
 # JSON` into structurally-valid tool calls, so the swarm's small models don't have to
@@ -89,7 +88,7 @@ optional = true
 [features]
 default = []
 helix = ["dep:helix-db", "dep:bumpalo", "dep:heed3"]
-fuse = ["dep:fuse3", "dep:bytes", "dep:libc"]
+fuse = ["dep:fuse3", "dep:bytes"]
 needle = ["dep:needle-toolcall-shim"]
 docling = ["dep:docling"]
 
