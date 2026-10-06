@@ -506,7 +506,7 @@ impl Daemon {
                 let planned = bounds
                     .run(crate::hipfire::CALLS.scope(
                         Arc::clone(&planner_calls),
-                        self.plan(session, &text, priority),
+                        self.plan(session, &text, priority, &events),
                     ))
                     .await
                     .unwrap_or_else(|| {
@@ -1126,6 +1126,7 @@ impl Daemon {
         session: &Session,
         text: &str,
         priority: Priority,
+        events: &mpsc::Sender<AgentEvent>,
     ) -> anyhow::Result<(Vec<planner::PlannedSubtask>, String)> {
         // Built once and shared, byte-identical, by the planning call and every
         // subagent, so hipfire batches them prefix-shared and reuses KV.
@@ -1208,10 +1209,14 @@ impl Daemon {
 
         let mut plan = planner::parse_plan(&plan_text);
         if plan.is_empty() {
-            eprintln!(
-                "planner: no usable plan in {} bytes; falling back to one coder task",
+            // Said on the turn, not only in the daemon log: an unattended run that
+            // quietly lost its decomposition reads like one that planned a single task.
+            let message = format!(
+                "planner: no usable plan in {} bytes; running the request as one coder task",
                 plan_text.len()
             );
+            eprintln!("{message}");
+            let _ = events.send(AgentEvent::Error { message }).await;
             // Degrade to one coder task on the raw prompt (still behind the shared
             // prefix) so a plan the model couldn't structure still gets attempted
             // rather than dropped.
@@ -3114,10 +3119,14 @@ async fn emit_followups(
         None => Role::Coder, // no classifier: queue it as a coder task
     };
 
+    // The follow-up depends on its emitter, so it launches with the emitter's output
+    // appended (`with_dep_outputs`) -- the plan review's fix used to get one `NEXT:`
+    // sentence and none of the reviewer's evidence. The emitter is already Done when
+    // this is folded in, so the follow-up is still ready at once.
     vec![plan_graph::Emit {
         role,
         prompt: instruction,
-        after_emitter: false,
+        after_emitter: true,
     }]
 }
 
@@ -4161,6 +4170,19 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A follow-up depends on its emitter, so it is handed the emitter's output.
+    #[tokio::test]
+    async fn a_follow_up_depends_on_its_emitter() {
+        let emits = emit_followups(
+            None,
+            &Dialects::default(),
+            "src/lib.rs has an off-by-one in clamp.\nNEXT: fix the off-by-one in clamp",
+        )
+        .await;
+        assert_eq!(emits.len(), 1);
+        assert!(emits[0].after_emitter, "the fixer must get the reviewer's evidence");
     }
 
     // No NEXT: line -> no emission (and Needle isn't even called).
@@ -5280,6 +5302,53 @@ mod tests {
             mentions(&remote_bodies, "DOOMED") > 0
                 && mentions(&local_bodies, "Review the work this plan") > 0
         );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // A plan the model could not structure still runs -- as one coder task -- and the
+    // turn says so instead of only the daemon log.
+    #[tokio::test]
+    async fn an_unusable_plan_is_reported_on_the_turn() {
+        let repo = two_file_repo("plan-fallback");
+        let (url, _bodies) = recording_hipfire(|body, _| {
+            if body["input"].to_string().contains("You are the orchestrator") {
+                text_reply("I would start by reading the code.")
+            } else {
+                text_reply("done")
+            }
+        })
+        .await;
+        let daemon = Arc::new(Daemon::new(
+            Swarm::new(Client::new(url, None), 1),
+            RoleModels::uniform("Qwen3.5-9B--oq4.25++"),
+            None,
+            Arc::new(PassthroughVfs::new(&repo)),
+            SkillContext::default(),
+            None,
+            None,
+            repo.clone(),
+            Project::load(&repo),
+            Arc::new(Dialects::default()),
+        ));
+        let (ctx, crx) = mpsc::channel(8);
+        let (etx, mut erx) = mpsc::channel(256);
+        tokio::spawn(Arc::clone(&daemon).run(crx, etx));
+        ctx.send(AgentCommand::Prompt { text: "Tidy a.txt.".into(), priority: Priority::Default })
+            .await
+            .unwrap();
+        let mut errors = Vec::new();
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), erx.recv())
+                .await
+                .expect("the turn ends within 30s")
+                .expect("daemon alive");
+            match unturn(ev) {
+                AgentEvent::Error { message } => errors.push(message),
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(errors.iter().any(|e| e.contains("as one coder task")), "{errors:?}");
         std::fs::remove_dir_all(&repo).ok();
     }
 }
