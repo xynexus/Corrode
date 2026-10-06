@@ -147,7 +147,7 @@ repo-scoped command).
 
 ## Environment knobs `doctor` should echo
 
-`CORRODE_SANDBOX` (off), `CORRODE_SANDBOX_NET` (off), `CORRODE_USERS` (unset =
+`CORRODE_SANDBOX` (on), `CORRODE_SANDBOX_NET` (off), `CORRODE_USERS` (unset =
 auth off), `HIPFIRE_BASE_URL`, `CORRODE_MODEL`, `CORRODE_REPO`,
 `CORRODE_GRAPH_DIR`, `CORRODE_DOC_ROOTS`, `CORRODE_DAEMON_ADDR`, `CORRODE_WEB_ADDR`,
 `CORRODE_DAEMON_URL`. Full list and defaults in `CLAUDE.md` § Commands.

@@ -8,11 +8,11 @@
 //! repo bound read-write, the graph store read-only, the rest of the filesystem
 //! read-only, and (by default) no network.
 //!
-//! Off by default (`CORRODE_SANDBOX` unset) so existing behaviour is unchanged —
-//! `wrap` returns the argv untouched. Turn it on in a real deployment (the service
-//! unit). When on but `bwrap` can't run (absent, or an unprivileged-userns
-//! restriction like Ubuntu's AppArmor default), the spawn fails and the command
-//! never runs — fail closed, never a silent drop to unsandboxed.
+//! On by default (the user's call, 2026-10-06, once builds worked inside it);
+//! `CORRODE_SANDBOX=off` opts out and `wrap` then returns the argv untouched. When on
+//! but `bwrap` can't run (absent, or an unprivileged-userns restriction like Ubuntu's
+//! AppArmor default), the spawn fails and the command never runs — fail closed, never
+//! a silent drop to unsandboxed; `doctor` reports it.
 //!
 //! Phase 1 (see docs/sessions-and-sandbox.md): one process-wide `Sandbox` from
 //! env. When sessions land, it becomes a per-session `SandboxProfile` bound to the
@@ -106,11 +106,13 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
-    /// `CORRODE_SANDBOX` on enables; `CORRODE_SANDBOX_NET` on shares the host network
-    /// (both through [`crate::knobs::flag`]).
+    /// On unless `CORRODE_SANDBOX` is set off; `CORRODE_SANDBOX_NET` on shares the host
+    /// network (both through [`crate::knobs::flag`]).
     pub fn from_env() -> Self {
-        let on = |k: &str| crate::knobs::flag(k, false);
-        let s = Self { enabled: on("CORRODE_SANDBOX"), share_net: on("CORRODE_SANDBOX_NET") };
+        let s = Self {
+            enabled: crate::knobs::flag("CORRODE_SANDBOX", true),
+            share_net: crate::knobs::flag("CORRODE_SANDBOX_NET", false),
+        };
         if s.enabled {
             eprintln!(
                 "sandbox: bubblewrap confinement ON (network {})",
@@ -260,6 +262,16 @@ mod tests {
         assert!(!a.contains("--bind "), "nothing writable through to the host: {a}");
         assert!(toolchain_binds(Some(d.join("absent")), None).is_empty());
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    // On unless set off: the default the user chose once builds worked inside it.
+    #[test]
+    fn the_sandbox_is_on_unless_set_off() {
+        std::env::remove_var("CORRODE_SANDBOX");
+        assert!(Sandbox::from_env().enabled);
+        std::env::set_var("CORRODE_SANDBOX", "off");
+        assert!(!Sandbox::from_env().enabled);
+        std::env::remove_var("CORRODE_SANDBOX");
     }
 
     #[test]

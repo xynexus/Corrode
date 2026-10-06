@@ -230,9 +230,9 @@ bwrap \
 
 ### Configuration & failure mode
 
-- `CORRODE_SANDBOX` = `off` (default) | `on`, plus a per-session profile (extra
-  binds, net policy). Default off preserves current behavior; a real deployment
-  sets it on in the service unit.
+- `CORRODE_SANDBOX` = `on` (default since 2026-10-06) | `off`, plus a per-session
+  profile (extra binds, net policy). On by default once builds worked inside it;
+  `off` opts out.
 - **Network is deny-by-default.** That breaks tools that fetch — `cargo`, `pip`,
   `git clone`. Make `--share-net` an explicit per-session opt-in, or gate it
   through the approval prompt.

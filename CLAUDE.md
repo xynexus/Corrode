@@ -113,7 +113,7 @@ Failed; absent/0 -> unbounded), `CORRODE_TASK_TIMEOUT_S` (ceiling on one task, i
 retries and tool steps included, and on planning; default 3600, 0 disables; past it the
 task fails alone and what it was running is dropped — a command's process group
 killed), `CORRODE_SANDBOX` (bubblewrap-confine every spawned process
-— `run_command`/`run_skill_script` and the web terminal — off unless set on;
+— `run_command`/`run_skill_script` and the web terminal — on unless set off;
 see `sandbox.rs` + `docs/sessions-and-sandbox.md`; it gets the Rust toolchain -- `RUSTUP_HOME`
 read-only, `CARGO_HOME` under a throwaway overlay -- so builds and tests run, and `doctor`
 checks cargo through the real `wrap()`; home's credential stores -- `~/.ssh`, `~/.gnupg`, `~/.aws`,
