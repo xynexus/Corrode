@@ -71,7 +71,9 @@ failing open (`TURN_BUDGET_S=2h` used to mean unbounded).
 
 Env: `HIPFIRE_BASE_URL` (default `http://127.0.0.1:11435`), `HIPFIRE_API_KEY`,
 `CORRODE_MODEL` (offline fallback model for all roles), `CORRODE_ROLES` (path to a
-JSON `role -> model-id` override map), `CORRODE_REPO` (VFS root, default `.`), `CORRODE_REPO_ALLOW` (`:`-separated directories a
+JSON `role -> model-id` override map), `CORRODE_EFFORT_<ROLE>` / `CORRODE_REASONING_EFFORT`
+(reasoning effort for one role / for every role without its own; default orchestration
+`medium`, every other role `none` — see `roles::effort_for`), `CORRODE_REPO` (VFS root, default `.`), `CORRODE_REPO_ALLOW` (`:`-separated directories a
 client's `SelectRepo` may bind under; every selected repo must also be an existing directory
 inside the daemon user's `$HOME` (home itself included) -- entries outside it are ignored, and an unset list
 allows anything inside home; the operator's own `CORRODE_REPO` is exempt),
@@ -183,7 +185,11 @@ vfs commands no-op cleanly to an empty reply when no store is configured.
 models. At startup the daemon calls `list_models` on hipfire and resolves
 assignments: a `CORRODE_ROLES` override wins if it names a served model, else a
 default pick (first served non-embedding/non-image model). If hipfire is
-unreachable, all roles fall back to `CORRODE_MODEL`.
+unreachable, all roles fall back to `CORRODE_MODEL`. `effort_for(role)` is the
+reasoning effort every generation sends — always sent, because hipfire's default for
+a request naming none is a per-model config (`reasoning_effort` in `model_overrides`),
+not what a swarm role wants: the planner thinks within a bounded budget (`medium`,
+1024 tokens), every other role does not. A truncated plan is retried once at `low`.
 
 ## Planner
 

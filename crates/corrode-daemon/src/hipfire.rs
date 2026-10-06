@@ -480,9 +480,10 @@ impl Client {
         input: &str,
         priority: Priority,
         owner_token: Option<&str>,
+        effort: Option<&str>,
     ) -> anyhow::Result<String> {
         Ok(self
-            .respond_full(model, input, priority, owner_token, None, None)
+            .respond_full(model, input, priority, owner_token, None, effort)
             .await?
             .0)
     }
@@ -649,6 +650,7 @@ impl Client {
         input: &str,
         priority: Priority,
         owner_token: Option<&str>,
+        effort: Option<&str>,
         mut on_delta: impl FnMut(&str),
     ) -> anyhow::Result<(String, String)> {
         use futures_util::StreamExt;
@@ -659,7 +661,7 @@ impl Client {
             max_output_tokens: self.max_output_tokens,
             metadata: serde_json::json!({ "hipfire_priority": priority.as_u8() }),
             tools: None,
-            reasoning_effort: None,
+            reasoning_effort: effort,
         };
         // `stream` is a top-level field on the responses request; ResponsesRequest
         // doesn't carry it, so merge it into the serialized object.
@@ -985,7 +987,7 @@ mod tests {
         const OK: &str = r#"{"status":"completed","output_text":"fine","output":[]}"#;
         let ctx = r#"{"error":{"message":"the prompt is 40000 tokens","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
         let (url, n) = scripted(vec![(400, None, ctx)]).await;
-        let err = Client::new(url, None).respond("m", "p", Priority::Default, None).await.unwrap_err();
+        let err = Client::new(url, None).respond("m", "p", Priority::Default, None, None).await.unwrap_err();
         let r = err.downcast_ref::<Rejected>().expect("typed rejection");
         assert_eq!(r.code.as_deref(), Some("context_length_exceeded"));
         assert!(r.message.contains("40000"));
@@ -994,12 +996,12 @@ mod tests {
 
         let busy = r#"{"error":{"message":"worker respawning","type":"service_unavailable"}}"#;
         let (url, n) = scripted(vec![(503, Some("0"), busy), (503, Some("0"), busy), (200, None, OK)]).await;
-        let out = Client::new(url, None).respond("m", "p", Priority::Default, None).await.unwrap();
+        let out = Client::new(url, None).respond("m", "p", Priority::Default, None, None).await.unwrap();
         assert_eq!(out, "fine");
         assert_eq!(n.load(Ordering::SeqCst), 3, "retried through the 503s");
 
         let (url, n) = scripted(vec![(500, None, r#"{"error":{"message":"boom"}}"#), (200, None, OK)]).await;
-        let err = Client::new(url, None).respond("m", "p", Priority::Default, None).await.unwrap_err();
+        let err = Client::new(url, None).respond("m", "p", Priority::Default, None, None).await.unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
         assert!(is_retryable(&err), "a 500 is worth one task-level retry");
         assert_eq!(n.load(Ordering::SeqCst), 1, "not retried by the client");
@@ -1014,7 +1016,7 @@ mod tests {
         let model = std::env::var("CORRODE_LIVE_MODEL").unwrap_or("Qwen3.6-35B-A3B--oq4.25++".into());
         let c = Client::new("http://127.0.0.1:11435", None);
         let t0 = std::time::Instant::now();
-        let err = c.respond(&model, &"word ".repeat(60_000), Priority::Default, None).await.unwrap_err();
+        let err = c.respond(&model, &"word ".repeat(60_000), Priority::Default, None, None).await.unwrap_err();
         let r = err.downcast_ref::<Rejected>().expect("typed rejection");
         assert_eq!(r.code.as_deref(), Some("context_length_exceeded"), "{err}");
         assert!(t0.elapsed() < std::time::Duration::from_secs(10), "refused, not retried");
@@ -1027,7 +1029,7 @@ mod tests {
         });
         let t0 = std::time::Instant::now();
         let out = c
-            .respond(&model, "Write a 300-word essay about prime numbers.", Priority::Default, None)
+            .respond(&model, "Write a 300-word essay about prime numbers.", Priority::Default, None, None)
             .await
             .expect("retried through the restart");
         eprintln!("answered {} bytes after {:.1}s", out.len(), t0.elapsed().as_secs_f32());

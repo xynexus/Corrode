@@ -55,6 +55,26 @@ impl Role {
     }
 }
 
+/// Reasoning effort a role's generations run at: `CORRODE_EFFORT_<ROLE>` (e.g.
+/// `CORRODE_EFFORT_ORCHESTRATION`), else `CORRODE_REASONING_EFFORT`, else the role's
+/// default -- the planner thinks within a bounded budget (`medium`, 1024 tokens: it
+/// must keep thinking, and an unbounded think ran out its output cap), every other
+/// role does not (`none`). Always sent: hipfire's own default for a request that
+/// names none (a per-model `reasoning_effort`, else unbudgeted thinking) is not what
+/// a swarm role wants. Values are validated at startup (`knobs::check`).
+pub fn effort_for(role: Role) -> String {
+    let var = format!("CORRODE_EFFORT_{}", role.as_str().to_ascii_uppercase());
+    std::env::var(&var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var("CORRODE_REASONING_EFFORT").ok().filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| match role {
+            Role::Orchestration => "medium",
+            _ => "none",
+        }
+        .to_string())
+}
+
 /// Resolved `role -> model id`. Every role is populated after [`RoleModels::resolve`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RoleModels(pub BTreeMap<Role, String>);
@@ -141,6 +161,23 @@ fn default_pick(available: &[String]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The planner thinks within a bounded budget and nothing else thinks, unless
+    // the environment says otherwise -- per role first, then for every role.
+    #[test]
+    fn effort_is_bounded_thinking_for_the_planner_and_none_elsewhere() {
+        for k in ["CORRODE_EFFORT_REVIEW", "CORRODE_EFFORT_ORCHESTRATION", "CORRODE_REASONING_EFFORT"] {
+            std::env::remove_var(k);
+        }
+        assert_eq!(effort_for(Role::Orchestration), "medium");
+        for r in [Role::Research, Role::Architect, Role::Coder, Role::Review] {
+            assert_eq!(effort_for(r), "none", "{}", r.as_str());
+        }
+        std::env::set_var("CORRODE_EFFORT_REVIEW", "low");
+        assert_eq!(effort_for(Role::Review), "low");
+        assert_eq!(effort_for(Role::Coder), "none", "a per-role knob is that role's only");
+        std::env::remove_var("CORRODE_EFFORT_REVIEW");
+    }
 
     #[test]
     fn resolve_honors_valid_overrides_and_fills_the_rest() {

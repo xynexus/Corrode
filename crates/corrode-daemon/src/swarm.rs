@@ -32,6 +32,8 @@ pub struct Task {
     pub model: String,
     /// Per-user hipfire bearer for fairness attribution (`None` = shared key).
     pub owner_token: Option<String>,
+    /// Reasoning effort (`roles::effort_for`); `None` leaves it to hipfire.
+    pub effort: Option<String>,
 }
 
 pub struct Swarm {
@@ -70,7 +72,13 @@ impl Swarm {
                 (
                     i,
                     client
-                        .respond(&task.model, &task.prompt, task.priority, task.owner_token.as_deref())
+                        .respond(
+                            &task.model,
+                            &task.prompt,
+                            task.priority,
+                            task.owner_token.as_deref(),
+                            task.effort.as_deref(),
+                        )
                         .await,
                 )
             });

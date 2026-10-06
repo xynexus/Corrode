@@ -79,9 +79,12 @@ fn check_with(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
             bad.push(format!("{k}={v:?}: expected a number"));
         }
     }
-    let k = "CORRODE_REASONING_EFFORT";
-    if let Some(v) = set(k).filter(|v| !EFFORTS.contains(&v.as_str())) {
-        bad.push(format!("{k}={v:?}: expected one of {}", EFFORTS.join("/")));
+    let per_role = crate::roles::Role::ALL
+        .map(|r| format!("CORRODE_EFFORT_{}", r.as_str().to_ascii_uppercase()));
+    for k in per_role.iter().map(String::as_str).chain(["CORRODE_REASONING_EFFORT"]) {
+        if let Some(v) = set(k).filter(|v| !EFFORTS.contains(&v.as_str())) {
+            bad.push(format!("{k}={v:?}: expected one of {}", EFFORTS.join("/")));
+        }
     }
     bad
 }
@@ -116,9 +119,17 @@ mod tests {
             ("CORRODE_MAX_CONCURRENCY", "8 "),
             ("CORRODE_SKILL_LIST_MIN", "high"),
             ("CORRODE_REASONING_EFFORT", "off"),
+            ("CORRODE_EFFORT_ORCHESTRATION", "max-ish"),
         ]);
-        assert_eq!(bad.len(), 5, "{bad:?}");
-        for k in ["AUTO_APPROVE", "TURN_BUDGET_S", "MAX_CONCURRENCY", "SKILL_LIST_MIN", "REASONING_EFFORT"] {
+        assert_eq!(bad.len(), 6, "{bad:?}");
+        for k in [
+            "AUTO_APPROVE",
+            "TURN_BUDGET_S",
+            "MAX_CONCURRENCY",
+            "SKILL_LIST_MIN",
+            "REASONING_EFFORT",
+            "EFFORT_ORCHESTRATION",
+        ] {
             assert!(bad.iter().any(|b| b.contains(k)), "{k} not refused: {bad:?}");
         }
     }
