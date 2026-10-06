@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-fn approval_timeout() -> std::time::Duration {
+pub(crate) fn approval_timeout() -> std::time::Duration {
     let s = std::env::var("CORRODE_APPROVAL_TIMEOUT_S")
         .ok()
         .and_then(|v| v.parse().ok())

@@ -41,7 +41,7 @@ impl GraphVfs {
         Self {
             store,
             inner,
-            verify: env_on("CORRODE_VFS_VERIFY"),
+            verify: crate::knobs::flag("CORRODE_VFS_VERIFY", false),
             served: AtomicUsize::new(0),
             fell_through: AtomicUsize::new(0),
             diverged: AtomicUsize::new(0),
@@ -73,16 +73,10 @@ impl GraphVfs {
     }
 }
 
-fn env_on(key: &str) -> bool {
-    matches!(
-        std::env::var(key).unwrap_or_default().to_ascii_lowercase().as_str(),
-        "1" | "true" | "on"
-    )
-}
 
 /// Is the graph-backed VFS enabled?
 pub fn enabled() -> bool {
-    env_on("CORRODE_VFS_GRAPH")
+    crate::knobs::flag("CORRODE_VFS_GRAPH", false)
 }
 
 #[async_trait]

@@ -108,7 +108,7 @@ pub fn is_retryable(e: &anyhow::Error) -> bool {
 /// How long transient failures (503/429, an unreachable server) are retried for:
 /// `CORRODE_RETRY_WINDOW_S`, default 180 -- longer than hipfire takes to respawn
 /// a worker and reload its model. Past it the call fails.
-fn retry_window() -> std::time::Duration {
+pub(crate) fn retry_window() -> std::time::Duration {
     std::time::Duration::from_secs(
         std::env::var("CORRODE_RETRY_WINDOW_S")
             .ok()
@@ -180,6 +180,19 @@ impl std::error::Error for Truncated {}
 /// Per-call output cap, `CORRODE_MAX_TOKENS` (default 8192). Shared with the tool
 /// loop's context guard, which must keep this much of the context free: hipfire clamps
 /// a reply to the KV capacity left, so a smaller reserve cut long answers short.
+/// Every call is bounded. Nothing else was: no timeout here or in hipfire, so one
+/// wedged generation hung its turn forever. The bound covers the whole generation (a
+/// non-streamed reply arrives only when it is done), so it is sized for a full
+/// max_output_tokens at a busy server's per-session rate, not for a typical call.
+/// `CORRODE_REQUEST_TIMEOUT_S`, default 3600.
+pub(crate) fn request_timeout_s() -> u64 {
+    std::env::var("CORRODE_REQUEST_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s: &u64| s > 0)
+        .unwrap_or(3600)
+}
+
 pub fn max_output_tokens() -> u32 {
     std::env::var("CORRODE_MAX_TOKENS")
         .ok()
@@ -554,16 +567,7 @@ impl Client {
         // than a research skim) once we tune it.
         let max_output_tokens = max_output_tokens();
         let stream = crate::knobs::flag("CORRODE_STREAM", false);
-        // Every call is bounded. Nothing else was: no timeout here or in hipfire,
-        // so one wedged generation hung its turn forever. The bound covers the
-        // whole generation (a non-streamed reply arrives only when it is done), so
-        // it is sized for a full max_output_tokens at a busy server's per-session
-        // rate, not for a typical call. `CORRODE_REQUEST_TIMEOUT_S`, default 3600.
-        let timeout = std::env::var("CORRODE_REQUEST_TIMEOUT_S")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&s: &u64| s > 0)
-            .unwrap_or(3600);
+        let timeout = request_timeout_s();
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(timeout))
