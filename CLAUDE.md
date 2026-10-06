@@ -130,7 +130,9 @@ see `sandbox.rs` + `docs/sessions-and-sandbox.md`; it gets the Rust toolchain --
 read-only, `CARGO_HOME` under a throwaway overlay -- so builds and tests run, and `doctor`
 checks cargo through the real `wrap()`; home's credential stores -- `~/.ssh`, `~/.gnupg`, `~/.aws`,
 `~/.config/gh`, `~/.netrc`, … (`sandbox::PROTECTED_HOME_PATHS`) -- are masked when the repo
-contains them, and the file tools refuse them whether or not the sandbox is on), `CORRODE_SANDBOX_NET` (share the
+contains them, and the file tools refuse them whether or not the sandbox is on; the repo's
+`.git` and `.corrode` are read-only inside it -- a sandboxed command can read history but not
+commit, nor plant a `core.hooksPath`/`fsmonitor` that runs at the human's next `git status`), `CORRODE_SANDBOX_NET` (share the
 host network into the sandbox; off by default — needed for tools that fetch),
 `CORRODE_COMMAND_TIMEOUT_S` (wall-clock limit for one `run_command`/`run_skill_script`,
 default 1800; past it the command's whole process group is killed and the call returns
