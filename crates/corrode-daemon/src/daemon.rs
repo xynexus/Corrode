@@ -592,6 +592,7 @@ impl Daemon {
                         .as_ref()
                         .map_or(0.0, |r| r.cost(planner_calls.remote_usage())),
                 ));
+                let request = planner::request_note(&text);
                 let execute = |task: plan_graph::PlanTask| {
                     let client = self.swarm.client();
                     let model = self
@@ -628,10 +629,15 @@ impl Daemon {
                     let turn_spend = Arc::clone(&turn_spend);
                     let remote = self.remote.clone();
                     let plan_for_task = plan_id.clone();
-                    let prompt = match seen.lock().unwrap().digest(TURN_DIGEST_LINES) {
-                        Some(d) => format!("{}\n\n{d}", task.prompt),
-                        None => task.prompt.clone(),
+                    // Unless the task is the request itself (the no-plan fallback).
+                    let mut prompt = if task.prompt.trim() == text.trim() {
+                        task.prompt.clone()
+                    } else {
+                        format!("{request}\n{}", task.prompt)
                     };
+                    if let Some(d) = seen.lock().unwrap().digest(TURN_DIGEST_LINES) {
+                        prompt = format!("{prompt}\n\n{d}");
+                    }
                     async move {
                         // `artifacts` collects the files a tool-loop task wrote (its code
                         // nodes in provenance). Coder tasks fan out K read-only proposal
@@ -5135,6 +5141,74 @@ mod tests {
                 "request {k} opens with a different system turn"
             );
         }
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // A constraint in the user's request reaches every task, an emitted follow-up
+    // included: live, "do not change any file" reached only the planner, a research task
+    // proposed an edit, and the coder it emitted made it. A declined `NEXT:` queues
+    // nothing.
+    #[tokio::test]
+    async fn every_task_sees_the_users_request_and_a_declined_next_queues_nothing() {
+        let repo = two_file_repo("request");
+        let (url, bodies) = recording_hipfire(|body, _| {
+            let input = body["input"].to_string();
+            if input.contains("You are the orchestrator") {
+                text_reply(r#"[{"role": "research", "task": "Say what a.txt contains."}]"#)
+            } else if input.contains("[role: coder]") {
+                text_reply("Declined: the user said not to change files.\nNEXT: none — complete.")
+            } else if input.contains("[role: review]") {
+                text_reply("The work holds.")
+            } else {
+                text_reply("It contains alpha.\nNEXT: Rewrite a.txt to say gamma.")
+            }
+        })
+        .await;
+        let daemon = Arc::new(Daemon::new(
+            Swarm::new(Client::new(url, None), 1),
+            RoleModels::uniform("Qwen3.5-9B--oq4.25++"),
+            None,
+            Arc::new(PassthroughVfs::new(&repo)),
+            SkillContext::default(),
+            None,
+            None,
+            repo.clone(),
+            Project::load(&repo),
+            Arc::new(Dialects::default()),
+        ));
+        let (ctx, crx) = mpsc::channel(8);
+        let (etx, mut erx) = mpsc::channel(256);
+        tokio::spawn(Arc::clone(&daemon).run(crx, etx));
+        let ask = "What is in a.txt? Do not change any file.";
+        ctx.send(AgentCommand::Prompt { text: ask.into(), priority: Priority::Default })
+            .await
+            .unwrap();
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), erx.recv())
+                .await
+                .expect("the turn ends within 30s")
+                .expect("daemon alive");
+            if let AgentEvent::TurnComplete { .. } = unturn(ev) {
+                break;
+            }
+        }
+        let tasks: Vec<String> = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| b["input"].to_string())
+            .filter(|i| !i.contains("You are the orchestrator"))
+            .collect();
+        let emitted: Vec<&String> = tasks.iter().filter(|i| i.contains("[role: coder]")).collect();
+        assert!(!emitted.is_empty(), "the research task's NEXT: was emitted");
+        for t in &tasks {
+            assert!(t.contains(ask), "a task never saw the request: {t}");
+        }
+        // The coder's `NEXT: none` queued no task whose instruction is "none".
+        assert!(
+            !tasks.iter().any(|i| i.contains(r"Your task:\nnone")),
+            "a declined NEXT: became a task"
+        );
         std::fs::remove_dir_all(&repo).ok();
     }
 

@@ -632,11 +632,18 @@ pub struct RunSummary {
 /// Extract the single follow-up instruction an agent proposed, from a `NEXT:` line
 /// (see [`crate::planner::subagent_prompt`]). Plain English — a small model can write
 /// this even though it can't hand-write a tool call. Returns the first such line's
-/// text, trimmed; `None` (no follow-up) if absent or empty.
+/// text, trimmed; `None` (no follow-up) if absent, empty, or a decline: told to omit
+/// the line, models still write `NEXT: none — the task is complete`, and each one
+/// queued a coder task to do "none".
 pub fn parse_next_instruction(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let rest = line.trim().strip_prefix("NEXT:")?.trim();
-        (!rest.is_empty()).then(|| rest.to_string())
+        let lower = rest.to_lowercase();
+        let lower = lower.trim_start_matches(|c: char| !c.is_alphanumeric());
+        let first = lower.split(|c: char| !c.is_alphanumeric() && c != '/').next().unwrap_or("");
+        let declined = matches!(first, "" | "none" | "nothing" | "n/a")
+            || ["no follow", "no further", "no next"].iter().any(|p| lower.starts_with(p));
+        (!declined).then(|| rest.to_string())
     })
 }
 
@@ -736,6 +743,20 @@ mod tests {
         // no line -> None; empty NEXT -> None
         assert_eq!(parse_next_instruction("all done, nothing to do"), None);
         assert_eq!(parse_next_instruction("NEXT:   "), None);
+        // A decline is not a task -- seen live as three junk coder tasks.
+        for declined in [
+            "NEXT: none — the task is complete and verified.",
+            "NEXT: None.",
+            "NEXT: N/A",
+            "NEXT: nothing further",
+            "NEXT: No follow-up needed.",
+            "NEXT: (none)",
+        ] {
+            assert_eq!(parse_next_instruction(declined), None, "{declined}");
+        }
+        for task in ["nonexistent paths in build.rs should error", "`cargo test` the parser crate"] {
+            assert_eq!(parse_next_instruction(&format!("NEXT: {task}")), Some(task.into()));
+        }
     }
 
     #[test]

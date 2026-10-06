@@ -39,6 +39,22 @@ at once. Use at most {MAX_SUBTASKS} subtasks.\n\nUser request:\n{user_prompt}"
     )
 }
 
+/// The user's request as a task's tail opens with it, capped at 4 KB. A task saw only
+/// its planned slice, so a constraint such as "do not change any file" reached the
+/// planner and no task: a research task proposed an edit the user had ruled out, and the
+/// coder it emitted made it. Rides the tail, not the shared prefix, so the prefix stays
+/// identical across turns.
+pub fn request_note(request: &str) -> String {
+    const CAP: usize = 4096;
+    let end = crate::tools::floor_char_boundary(request, CAP.min(request.len()));
+    let more = if end < request.len() { " ..." } else { "" };
+    format!(
+        "The user's request this turn (your task is one part of it: do only your task, and \
+nothing the request rules out):\n{}{more}\n\nYour task:",
+        request[..end].trim()
+    )
+}
+
 /// Compose one subagent prompt: the shared prefix, then the divergent role+task
 /// tail. The prefix must be byte-identical across the whole swarm for KV reuse, so
 /// nothing role-specific goes before it. The tail also invites the agent to propose a
@@ -49,7 +65,8 @@ at once. Use at most {MAX_SUBTASKS} subtasks.\n\nUser request:\n{user_prompt}"
 pub fn subagent_prompt(context_prefix: &str, role: Role, task: &str) -> String {
     format!(
         "{context_prefix}\n\n[role: {}]\n{task}\n\n\
-(Optional) If one clear follow-up is warranted, end your reply with a single line:\n\
+(Optional) If the user's request needs one clear follow-up your task did not cover, end \
+your reply with a single line:\n\
 NEXT: <one plain-English instruction for the next task>\n\
 Write plain English, not JSON. Omit the line if no follow-up is needed.",
         role.as_str()
@@ -69,7 +86,8 @@ pub fn native_tool_prompt(context_prefix: &str, role: Role, task: &str) -> Strin
 You have tools available. Call one when you need it — you will get the result and can \
 continue. Independent calls can go in one step: to read several files, call read_file for \
 each of them at once rather than one per reply. Never guess a file's contents: read it first. When you have enough to answer, \
-reply with your final answer and no tool call. Optionally end with:\n\
+reply with your final answer and no tool call. If the user's request needs a follow-up \
+your task did not cover, end with:\n\
 NEXT: <one plain-English follow-up task>",
         role.as_str()
     )
@@ -89,7 +107,7 @@ You can use tools. To use one, write a line:\n\
 TOOL: <one plain-English request> (e.g. TOOL: read the file crates/corrode-core/src/lib.rs)\n\
 Write plain English, not JSON — the tool call is constructed for you. You will get the \
 result and can continue. When you have enough to answer, reply with your final answer and \
-NO TOOL: line. Optionally end with:\n\
+NO TOOL: line. If the user's request needs a follow-up your task did not cover, end with:\n\
 NEXT: <one plain-English follow-up task>\n{scratchpad}",
         role.as_str()
     )
