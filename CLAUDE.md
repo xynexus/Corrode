@@ -174,9 +174,22 @@ ingest / list ingested docs), `ListNeighbors`→session graph (expand a provenan
 node's one-hop neighborhood for the interactive graph explorer),
 `TerminalInput`→session pty (client id is per browser tab), `ApprovalResponse`→
 resolves a pending approval on the connection's session gate, `CancelTurn{plan_id}`→
-flips that turn's cancel switch (`Session::turns`; a tenant cancels only its own). A
-Prompt turn opens with `TurnStarted{plan_id}` and always ends with `TurnComplete` —
-sent by a drop guard (`TurnEnd`), so a failed plan, a cancel or a panic still ends it. The read-only graph/
+flips that turn's cancel switch (`Session::turns`; a tenant cancels only its own),
+`ListTurns`→`TurnList` (the session's running turns, then its recent ones from the
+journal). A Prompt turn opens with `TurnStarted{plan_id}` and always ends with
+`TurnComplete` — sent by a drop guard (`TurnEnd`), so a failed plan, a cancel or a
+panic still ends it.
+
+**Turns outlive their socket (`session::TurnFeed`).** Everything a turn emits goes
+through its session's feed, wrapped as `AgentEvent::Turn{plan_id, event}` (per-task ids
+restart every turn, so clients key them by `(plan_id, id)`): every connection bound to
+the session receives it live, and one that binds later is first replayed the recent
+events (a 4096-event ring, streamed deltas excluded) — publish and attach share a lock,
+so each event arrives exactly once, in order. A re-auth keeps the bound repo. Each
+finished turn is appended to `<repo>/.corrode/turns.jsonl` (prompt, outcome, every
+task's output and written files). corrode-web ends both pumps when either side closes
+and pings the browser every 30 s; the webui reconnects, resends its Authenticate /
+SelectRepo, and rebuilds the console from the replay. The read-only graph/
 vfs commands no-op cleanly to an empty reply when no store is configured.
 
 ## Roles

@@ -318,13 +318,42 @@ impl Daemon {
     ) {
         let mut user: Option<String> = None;
         let mut session: Option<Arc<Session>> = None;
+        // Relays the bound session's turn feed to this connection (see `attach_feed`).
+        let mut feed: Option<tokio::task::JoinHandle<()>> = None;
         while let Some(cmd) = commands.recv().await {
             match cmd {
                 AgentCommand::Authenticate { user: u, token } => {
                     if self.authenticate(&u, &token) {
                         user = Some(u.clone());
-                        session = None; // re-auth drops the old binding
                         let _ = events.send(AgentEvent::AuthOk { user: u }).await;
+                        // A re-auth keeps the repo: dropping the binding made the next
+                        // command silently bind CORRODE_REPO, so a long prompt sent after
+                        // a token refresh ran against the wrong repository.
+                        let repo = session
+                            .take()
+                            .map(|s| s.repo_root.to_string_lossy().into_owned());
+                        if let Some(f) = feed.take() {
+                            f.abort();
+                        }
+                        if let Some(path) = repo {
+                            match self.bind_session(user.clone(), &path).await {
+                                Ok(s) => {
+                                    feed = Some(attach_feed(&s, &events).await);
+                                    let (p, u) = (path, s.key.user.clone());
+                                    session = Some(s);
+                                    let _ = events
+                                        .send(AgentEvent::RepoSelected { path: p, user: u })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let _ = events
+                                        .send(AgentEvent::Error {
+                                            message: format!("select repo: {e}"),
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
                     } else {
                         let _ = events.send(AgentEvent::AuthRequired).await;
                     }
@@ -340,6 +369,9 @@ impl Daemon {
                                 s.repo_root.to_string_lossy().into_owned(),
                                 s.key.user.clone(),
                             );
+                            if let Some(f) = feed.replace(attach_feed(&s, &events).await) {
+                                f.abort();
+                            }
                             session = Some(s);
                             let _ = events
                                 .send(AgentEvent::RepoSelected { path: p, user: u })
@@ -368,7 +400,12 @@ impl Daemon {
                     }
                     if session.is_none() {
                         match self.bind_session(user.clone(), "").await {
-                            Ok(s) => session = Some(s),
+                            Ok(s) => {
+                                if let Some(f) = feed.replace(attach_feed(&s, &events).await) {
+                                    f.abort();
+                                }
+                                session = Some(s);
+                            }
                             Err(e) => {
                                 let _ = events
                                     .send(AgentEvent::Error {
@@ -395,6 +432,9 @@ impl Daemon {
                 }
             }
         }
+        if let Some(f) = feed {
+            f.abort();
+        }
     }
 
     async fn handle(
@@ -415,8 +455,21 @@ impl Daemon {
                     self.next_plan_id
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 ));
+                // Everything the turn emits goes through the session's feed, to every
+                // connection bound to it and to one that reattaches later -- not to the
+                // socket that happened to send the Prompt.
+                let turn_events = session.feed.turn_sender(&plan_id);
+                let events = &turn_events;
+                let started = crate::telemetry::now_secs();
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-                session.turns.lock().unwrap().insert(plan_id.clone(), cancel_tx);
+                session.turns.lock().unwrap().insert(
+                    plan_id.clone(),
+                    crate::session::TurnHandle {
+                        cancel: cancel_tx,
+                        prompt: text.chars().take(200).collect(),
+                        started,
+                    },
+                );
                 let _end = TurnEnd {
                     events: events.clone(),
                     plan_id: plan_id.clone(),
@@ -450,6 +503,9 @@ impl Daemon {
                                 message: format!("planning failed: {e}"),
                             })
                             .await;
+                        let mut record = journal_record(session, &plan_id, &text, started, "planning failed");
+                        record["error"] = serde_json::json!(e.to_string());
+                        crate::session::journal_append(&session.repo_root, &record);
                         return;
                     }
                 };
@@ -746,10 +802,51 @@ impl Daemon {
                         nodes,
                     })
                     .await;
+                let status = if budget.cancelled {
+                    "cancelled"
+                } else if budget.expired {
+                    "budget exhausted"
+                } else {
+                    "complete"
+                };
+                let mut record = journal_record(session, &plan_id, &text, started, status);
+                record["tasks"] = graph.journal_tasks(JOURNAL_OUTPUT_CAP);
+                crate::session::journal_append(&session.repo_root, &record);
                 // `_end` sends TurnComplete as it drops, here or on any earlier exit.
             }
+            AgentCommand::ListTurns => {
+                let mut turns: Vec<corrode_core::TurnSummary> = session
+                    .turns
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(id, t)| corrode_core::TurnSummary {
+                        plan_id: id.clone(),
+                        status: "running".into(),
+                        prompt: t.prompt.clone(),
+                        started: t.started,
+                        ended: None,
+                    })
+                    .collect();
+                turns.sort_by_key(|t| std::cmp::Reverse(t.started));
+                // The journal is the repo's; a tenant sees only its own turns.
+                turns.extend(
+                    crate::session::journal_tail(&session.repo_root, 200)
+                        .into_iter()
+                        .filter(|r| r["user"].as_str() == Some(session.key.user.as_str()))
+                        .take(20)
+                        .map(|r| corrode_core::TurnSummary {
+                            plan_id: r["plan_id"].as_str().unwrap_or_default().to_string(),
+                            status: r["status"].as_str().unwrap_or_default().to_string(),
+                            prompt: r["prompt"].as_str().unwrap_or_default().chars().take(200).collect(),
+                            started: r["started"].as_u64().unwrap_or(0),
+                            ended: r["ended"].as_u64(),
+                        }),
+                );
+                let _ = events.send(AgentEvent::TurnList { turns }).await;
+            }
             AgentCommand::CancelTurn { plan_id } => {
-                let switch = session.turns.lock().unwrap().get(&plan_id).cloned();
+                let switch = session.turns.lock().unwrap().get(&plan_id).map(|t| t.cancel.clone());
                 match switch {
                     Some(tx) => {
                         let _ = tx.send(true);
@@ -1647,6 +1744,56 @@ fn task_timeout() -> Option<std::time::Duration> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(3600);
     (s > 0).then(|| std::time::Duration::from_secs(s))
+}
+
+/// Task output kept per task in the turn journal.
+const JOURNAL_OUTPUT_CAP: usize = 16 * 1024;
+
+/// The common fields of a turn-journal record.
+fn journal_record(
+    session: &Session,
+    plan_id: &str,
+    prompt: &str,
+    started: u64,
+    status: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "plan_id": plan_id,
+        "user": session.key.user,
+        "prompt": prompt,
+        "started": started,
+        "ended": crate::telemetry::now_secs(),
+        "status": status,
+    })
+}
+
+/// Relay `session`'s turn feed to one connection: the recent events now, before
+/// the command that bound the session is answered, then the live ones from a task.
+/// A slow connection that falls behind the live channel is told how many it missed
+/// rather than stalling the turn.
+async fn attach_feed(
+    session: &Session,
+    events: &mpsc::Sender<AgentEvent>,
+) -> tokio::task::JoinHandle<()> {
+    let (recent, mut live) = session.feed.attach();
+    for ev in recent {
+        let _ = events.send(ev).await;
+    }
+    let events = events.clone();
+    tokio::spawn(async move {
+        loop {
+            let ev = match live.recv().await {
+                Ok(ev) => ev,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => AgentEvent::Error {
+                    message: format!("this connection fell behind and missed {n} turn event(s)"),
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            if events.send(ev).await.is_err() {
+                return;
+            }
+        }
+    })
 }
 
 /// Ends a Prompt turn when dropped: unregisters its cancel switch and sends
@@ -2823,6 +2970,14 @@ mod tests {
     use crate::project::GlobalSkills;
     use crate::vfs::PassthroughVfs;
 
+    /// A turn's events arrive wrapped in `AgentEvent::Turn`; tests read the inside.
+    fn unturn(ev: AgentEvent) -> AgentEvent {
+        match ev {
+            AgentEvent::Turn { event, .. } => *event,
+            other => other,
+        }
+    }
+
     fn test_daemon() -> Daemon {
         Daemon::new(
             Swarm::new(Client::new("http://127.0.0.1:1", None), 1),
@@ -3936,6 +4091,7 @@ mod tests {
         .await
         .unwrap();
         while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(180), erx.recv()).await {
+            let ev = unturn(ev);
             if let AgentEvent::ApprovalRequest { id, .. } = ev {
                 let _ = ctx
                     .send(AgentCommand::ApprovalResponse { id, approved: true })
@@ -4062,7 +4218,7 @@ mod tests {
         let (mut outputs, mut approvals, mut errors) = (Vec::new(), Vec::new(), Vec::new());
         let mut tool_results: Vec<(String, String)> = Vec::new();
         while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(120), erx.recv()).await {
-            match ev {
+            match unturn(ev) {
                 AgentEvent::SubagentOutput { id, text } => {
                     eprintln!("--- subagent {id} ---\n{text}\n");
                     outputs.push(text);
@@ -4251,10 +4407,12 @@ mod tests {
         let (etx, mut erx) = mpsc::channel(64);
         tokio::spawn(Arc::new(test_daemon()).run(crx, etx));
         async fn next(rx: &mut mpsc::Receiver<AgentEvent>) -> AgentEvent {
-            tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
-                .await
-                .expect("an event within 20s")
-                .expect("daemon alive")
+            unturn(
+                tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+                    .await
+                    .expect("an event within 20s")
+                    .expect("daemon alive"),
+            )
         }
         ctx.send(AgentCommand::Prompt { text: "anything".into(), priority: Priority::Default })
             .await
@@ -4277,6 +4435,86 @@ mod tests {
             AgentEvent::Error { message } => assert!(message.contains("no running turn"), "{message}"),
             other => panic!("expected no running turn, got {other:?}"),
         }
+    }
+
+    // A turn outlives the connection that started it. A second connection on the same
+    // session is replayed what the turn already emitted, lists it as running, cancels
+    // it and receives the end live -- and the turn's record lands in the repo's
+    // journal. (Planning hangs: this client's hipfire port is closed and connection
+    // failures are retried for minutes.)
+    #[tokio::test]
+    async fn a_turn_outlives_the_connection_that_started_it() {
+        async fn next(rx: &mut mpsc::Receiver<AgentEvent>) -> AgentEvent {
+            tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+                .await
+                .expect("an event within 20s")
+                .expect("daemon alive")
+        }
+        let repo = std::env::temp_dir().join(format!("corrode-reattach-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).unwrap();
+        let daemon = Arc::new(Daemon::new(
+            Swarm::new(Client::new("http://127.0.0.1:1", None), 1),
+            RoleModels::uniform("test-model"),
+            None,
+            Arc::new(PassthroughVfs::new(&repo)),
+            SkillContext::default(),
+            None,
+            None,
+            repo.clone(),
+            Project::load(&repo),
+            Arc::new(Dialects::default()),
+        ));
+
+        // A starts the turn, then goes away.
+        let (atx, arx) = mpsc::channel(8);
+        let (aetx, mut aerx) = mpsc::channel(64);
+        let a = tokio::spawn(Arc::clone(&daemon).run(arx, aetx));
+        atx.send(AgentCommand::Prompt { text: "anything".into(), priority: Priority::Default })
+            .await
+            .unwrap();
+        let plan_id = match unturn(next(&mut aerx).await) {
+            AgentEvent::TurnStarted { plan_id } => plan_id,
+            other => panic!("expected TurnStarted, got {other:?}"),
+        };
+        drop(atx);
+        a.await.unwrap();
+        drop(aerx);
+
+        // B attaches to the same session: replay plus the listing.
+        let (btx, brx) = mpsc::channel(8);
+        let (betx, mut berx) = mpsc::channel(64);
+        tokio::spawn(Arc::clone(&daemon).run(brx, betx));
+        btx.send(AgentCommand::ListTurns).await.unwrap();
+        // The replay comes first, before the answer to the command that attached.
+        match next(&mut berx).await {
+            AgentEvent::Turn { plan_id: p, event } => {
+                assert_eq!(p, plan_id);
+                assert!(matches!(*event, AgentEvent::TurnStarted { .. }), "{event:?}");
+            }
+            other => panic!("expected the replayed TurnStarted, got {other:?}"),
+        }
+        match next(&mut berx).await {
+            AgentEvent::TurnList { turns } => assert!(
+                turns.iter().any(|t| t.plan_id == plan_id && t.status == "running"),
+                "{turns:?}"
+            ),
+            other => panic!("expected TurnList, got {other:?}"),
+        }
+
+        // B cancels it and sees it end, live.
+        btx.send(AgentCommand::CancelTurn { plan_id: plan_id.clone() }).await.unwrap();
+        loop {
+            if let AgentEvent::Turn { plan_id: p, event } = next(&mut berx).await {
+                assert_eq!(p, plan_id);
+                if matches!(*event, AgentEvent::TurnComplete { .. }) {
+                    break;
+                }
+            }
+        }
+        let journal = crate::session::journal_tail(&repo, 10);
+        let record = journal.iter().find(|r| r["plan_id"] == plan_id.as_str()).expect("journaled");
+        assert_eq!(record["status"], "planning failed");
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     // The hipfire-free dispatch path: DocQuery without a graph store reports itself
