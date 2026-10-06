@@ -22,6 +22,21 @@ pub struct Param {
     pub required: bool,
 }
 
+/// What running a tool does. The approval gate, the turn's observation cache and the
+/// read-only fan-out pass all read it from here, so a new tool cannot be declared
+/// without saying whether it is safe -- a name list kept beside the tools let a
+/// forgotten entry run unapproved, for real in a "read-only" pass, without
+/// invalidating cached reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effect {
+    /// Observes the repository; never changes it.
+    Read,
+    /// Changes files.
+    Mutate,
+    /// Runs a process, which may do anything.
+    Exec,
+}
+
 /// A canonical, model-agnostic tool. Rendered per model by [`ToolDialect::render`];
 /// executed by name (its canonical name) after [`ToolDialect::parse`] maps a model's
 /// exposed name back.
@@ -29,6 +44,7 @@ pub struct Tool {
     pub name: &'static str,
     pub description: &'static str,
     pub params: &'static [Param],
+    pub effect: Effect,
 }
 
 /// Per-request value sets for params with a closed, known set: `(tool, param) ->
@@ -359,6 +375,7 @@ mod tests {
     use super::*;
 
     const TOOLS: &[Tool] = &[Tool {
+        effect: Effect::Exec,
         name: "run_command",
         description: "Run a shell command.",
         params: &[Param {
