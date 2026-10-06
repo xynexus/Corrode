@@ -11,7 +11,7 @@
 //! still execute unsandboxed on the host — sandboxing is the remaining gap before
 //! approvals can be relaxed for unattended swarms.
 
-use crate::dialect::{Param, Tool};
+use crate::dialect::{Effect, Param, Tool};
 use crate::toolcall::ToolCall;
 use crate::vfs::Vfs;
 use std::collections::HashMap;
@@ -20,12 +20,13 @@ use std::sync::Arc;
 
 /// The tool-execution toolset, as canonical (model-agnostic) [`Tool`] data. A model's
 /// [`crate::dialect::ToolDialect`] renders these into the schema it expects and maps its
-/// call names back to these canonical names. `write_file`/`run_command`/`run_skill_script`
-/// are *mutating* — [`is_mutating`] gates them behind human approval before
-/// [`ToolBox::execute`] runs.
+/// call names back to these canonical names. A tool's [`Effect`] decides how it is
+/// treated: anything but `Read` is gated behind human approval ([`is_mutating`])
+/// before [`ToolBox::execute`] runs it.
 pub const EXEC_TOOLS: &[Tool] = &[
     Tool {
         name: "read_file",
+        effect: Effect::Read,
         description: "Read the contents of a file in the repository.",
         params: &[Param {
             name: "path",
@@ -36,6 +37,7 @@ pub const EXEC_TOOLS: &[Tool] = &[
     },
     Tool {
         name: "list_dir",
+        effect: Effect::Read,
         description: "List the entries of a directory in the repository.",
         params: &[Param {
             name: "path",
@@ -49,6 +51,7 @@ pub const EXEC_TOOLS: &[Tool] = &[
     // sharp mutating pair.
     Tool {
         name: "search_files",
+        effect: Effect::Read,
         description: "Find lines matching a substring across repository files. Use this \
 to locate code without reading whole files.",
         params: &[
@@ -68,6 +71,7 @@ to locate code without reading whole files.",
     },
     Tool {
         name: "run_skill_script",
+        effect: Effect::Exec,
         description: "Run a script bundled with an installed skill.",
         params: &[Param {
             name: "target",
@@ -78,6 +82,7 @@ to locate code without reading whole files.",
     },
     Tool {
         name: "write_file",
+        effect: Effect::Mutate,
         description: "Create or overwrite a file with the given contents.",
         params: &[
             Param {
@@ -96,6 +101,7 @@ to locate code without reading whole files.",
     },
     Tool {
         name: "run_command",
+        effect: Effect::Exec,
         description: "Run a shell command in the repository and return its output.",
         params: &[Param {
             name: "command",
@@ -135,12 +141,13 @@ const MAX_PATH_VALUES: usize = 64;
 const MAX_READ_BYTES: usize = 4096;
 
 /// Whether a tool call mutates or executes and so must clear the human approval gate
-/// before it runs. Read-only tools (read_file, list_dir) return false.
+/// before it runs: its tool's [`Effect`] is not `Read`. An unknown name counts as
+/// mutating -- fail closed.
 pub fn is_mutating(call: &ToolCall) -> bool {
-    matches!(
-        call.name.as_str(),
-        "write_file" | "run_command" | "run_skill_script"
-    )
+    EXEC_TOOLS
+        .iter()
+        .find(|t| t.name == call.name)
+        .is_none_or(|t| t.effect != Effect::Read)
 }
 
 /// A one-line, human-readable description of what a call will do — shown in the approval
@@ -834,10 +841,9 @@ pub(crate) fn missing_required_error(call: &ToolCall, missing: &[&'static str]) 
 /// live: a native emitter produced `write_file` with `path` and no `contents`, which
 /// reached execution and came back as a hand-written per-tool error.
 ///
-/// An argument counts as missing when the key is absent or is not a string — the schema
-/// says string, and a number arrives at `arg_str` as `None` either way, so a call that
-/// sends `{"path": 3}` gets told what is wrong instead of "needs a path argument".
-/// A present-but-EMPTY string is NOT missing: `write_file` with `contents: ""` is a
+/// An argument counts as missing when the key is absent or null. A non-string value is
+/// present: free text (`contents`, `command`) takes it back as its JSON text (see
+/// [`arg_text`]). A present-but-EMPTY string is NOT missing: `write_file` with `contents: ""` is a
 /// truncation, and rejecting it here would break a legitimate call to protect against
 /// a malformed one.
 pub(crate) fn missing_required(call: &ToolCall) -> Vec<&'static str> {
@@ -1489,6 +1495,18 @@ mod tests {
         );
         // Read-only roles get the observation trio (incl. search) and nothing mutating.
         assert_eq!(names(Role::Research), vec!["read_file", "list_dir", "search_files"]);
+        // The sets are array slices, so a tool's position is its privilege. Pin the
+        // slices to the tools' effects: a Mutate/Exec tool placed among the leading
+        // reads would hand it to every observing role.
+        let reads: Vec<&str> =
+            EXEC_TOOLS.iter().filter(|t| t.effect == Effect::Read).map(|t| t.name).collect();
+        for role in [Role::Research, Role::Architect, Role::Orchestration] {
+            assert_eq!(names(role), reads, "{role:?} observes, and observes everything");
+        }
+        assert!(
+            role_tools(Role::Review).iter().all(|t| t.effect != Effect::Mutate),
+            "review verifies; it never writes"
+        );
         for role in [Role::Research, Role::Architect, Role::Orchestration] {
             assert!(
                 role_tools(role).iter().all(|t| {
@@ -1512,6 +1530,9 @@ mod tests {
         assert!(is_mutating(&call("run_command")));
         assert!(!is_mutating(&call("read_file")));
         assert!(!is_mutating(&call("list_dir")));
+        assert!(!is_mutating(&call("search_files")));
+        // A name no tool declares is gated, not waved through.
+        assert!(is_mutating(&call("delete_everything")));
     }
 
     #[tokio::test]

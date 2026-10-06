@@ -639,6 +639,7 @@ pub fn parse_next_instruction(output: &str) -> Option<String> {
 /// from the model's (often-truncated) `task` argument. Paired with [`role_from_tool_calls`].
 pub const ROLE_TOOLS: &[Tool] = &[
     Tool {
+        effect: crate::dialect::Effect::Read,
         name: "research_task",
         description: "Investigate, read specs or docs, or survey prior art.",
         params: &[Param {
@@ -649,6 +650,7 @@ pub const ROLE_TOOLS: &[Tool] = &[
         }],
     },
     Tool {
+        effect: crate::dialect::Effect::Read,
         name: "coding_task",
         description: "Write or modify code or tests.",
         params: &[Param {
@@ -659,6 +661,7 @@ pub const ROLE_TOOLS: &[Tool] = &[
         }],
     },
     Tool {
+        effect: crate::dialect::Effect::Read,
         name: "architecture_task",
         description: "Make a design or structural decision.",
         params: &[Param {
@@ -669,6 +672,7 @@ pub const ROLE_TOOLS: &[Tool] = &[
         }],
     },
     Tool {
+        effect: crate::dialect::Effect::Read,
         name: "review_task",
         description: "Check the correctness or quality of existing code.",
         params: &[Param {
