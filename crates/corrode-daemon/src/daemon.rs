@@ -621,63 +621,47 @@ impl Daemon {
                         let mut attempt = 0;
                         let calls = crate::hipfire::CallScope::new(format!("{plan_for_task}/{id}"));
                         let output = crate::hipfire::CALLS.scope(Arc::clone(&calls), async { loop {
-                            let toolbox = ToolBox::new(vfs.clone(), root.clone(), skill_scripts.clone())
-                                .with_sandbox(sandbox.clone())
-                                .with_graph(graph.clone())
-                                .with_reranker(reranker.clone())
-                                .with_owner_token(owner_token.clone())
-                                .with_plan(&plan_for_task);
+                            let toolbox =
+                                ToolBox::new(vfs.clone(), root.clone(), skill_scripts.clone())
+                                    .with_sandbox(sandbox.clone())
+                                    .with_graph(graph.clone())
+                                    .with_reranker(reranker.clone())
+                                    .with_owner_token(owner_token.clone())
+                                    .with_plan(&plan_for_task);
+                            let ctx = TaskCtx {
+                                client: &client,
+                                model: &model,
+                                band,
+                                dialects: &dialects,
+                                tool_caller: tool_caller.clone(),
+                                toolbox,
+                                approvals: &approvals,
+                                prefix: &prefix,
+                                role,
+                                events: &events,
+                                id,
+                                read_only: false,
+                                seen: &seen,
+                                deadline,
+                            };
                             let output = if role == Role::Coder && fanout > 1 {
-                                run_fanout(
-                                    fanout,
-                                    &client,
-                                    &model,
-                                    &review_model,
-                                    band,
-                                    &dialects,
-                                    tool_caller.clone(),
-                                    toolbox,
-                                    &approvals,
-                                    &prefix,
-                                    role,
-                                    &prompt,
-                                    &events,
-                                    id,
-                                    &mut artifacts,
-                                    &seen,
-                                    deadline,
-                                )
-                                .await
+                                run_fanout(&ctx, fanout, &review_model, &prompt, &mut artifacts)
+                                    .await
                             } else {
-                                run_task(
-                                    &client,
-                                    &model,
-                                    band,
-                                    &dialects,
-                                    tool_caller.clone(),
-                                    toolbox,
-                                    &approvals,
-                                    &prefix,
-                                    role,
-                                    &prompt,
-                                    &events,
-                                    id,
-                                    &mut artifacts,
-                                    false,
-                                    &seen,
-                                    deadline,
-                                )
-                                .await
+                                run_task(&ctx, &prompt, &mut artifacts).await
                             };
                             match &output {
                                 Err(e)
                                     if attempt == 0
                                         && crate::hipfire::is_retryable(e)
-                                        && !deadline.is_some_and(|d| std::time::Instant::now() >= d) =>
+                                        && !deadline
+                                            .is_some_and(|d| std::time::Instant::now() >= d) =>
                                 {
                                     let _ = events
                                         .send(AgentEvent::Error {
-                                            message: format!("task {id}: {e}; running it once more"),
+                                            message: format!(
+                                                "task {id}: {e}; running it once more"
+                                            ),
                                         })
                                         .await;
                                     attempt += 1;
@@ -2162,15 +2146,134 @@ async fn gate_and_execute(
     observation
 }
 
-/// The tool loop for models that emit their own calls.
-///
-/// The tools are declared on the request, so hipfire's chat template renders the block
-/// the model was trained to read and it answers in its own syntax — which the dialect
-/// parses directly. No Needle: nothing has to reconstruct the call from prose, so the
-/// multi-param and truncation failures that motivated the Needle finetune cannot occur.
-///
-/// Thinking defaults to off (`CORRODE_REASONING_EFFORT` overrides): with reasoning on,
-/// these models talk themselves out of calling — measured on MiniCPM5-1B, which
+/// What one task's run needs, whichever path runs it. One value instead of fifteen
+/// positional arguments threaded through every loop: a cross-cutting concern (cancel,
+/// a second backend, cost) becomes a field, not an edit to every signature.
+#[derive(Clone)]
+struct TaskCtx<'a> {
+    client: &'a Client,
+    model: &'a str,
+    band: Priority,
+    dialects: &'a Dialects,
+    tool_caller: Option<Arc<dyn ToolCaller>>,
+    toolbox: ToolBox,
+    approvals: &'a ApprovalGate,
+    prefix: &'a str,
+    role: Role,
+    events: &'a mpsc::Sender<AgentEvent>,
+    id: u64,
+    /// A fan-out proposal pass: mutating calls become no-op observations (see
+    /// [`gate_and_execute`]).
+    read_only: bool,
+    seen: &'a std::sync::Mutex<SeenCalls>,
+    deadline: Option<std::time::Instant>,
+}
+
+impl TaskCtx<'_> {
+    /// Stream a reply to the UI.
+    async fn say(&self, text: &str) {
+        let _ = self
+            .events
+            .send(AgentEvent::SubagentOutput {
+                id: self.id,
+                text: text.to_string(),
+            })
+            .await;
+    }
+
+    /// One plain generation: the Needle loop and the single-shot path.
+    async fn respond(&self, prompt: &str) -> anyhow::Result<String> {
+        let effort = crate::roles::effort_for(self.role);
+        self.client
+            .respond(
+                self.model,
+                prompt,
+                self.band,
+                self.toolbox.owner_token(),
+                Some(&effort),
+            )
+            .await
+    }
+
+    /// One step of a native conversation (see `Client::respond_turns`).
+    async fn respond_turns(
+        &self,
+        prompt: &str,
+        turns: &[serde_json::Value],
+        tools: &serde_json::Value,
+    ) -> anyhow::Result<(String, String, Vec<crate::toolcall::ToolCall>)> {
+        let effort = crate::roles::effort_for(self.role);
+        self.client
+            .respond_turns(
+                self.model,
+                prompt,
+                turns,
+                self.band,
+                self.toolbox.owner_token(),
+                Some(tools),
+                Some(&effort),
+            )
+            .await
+    }
+
+    /// The deadline check both loops make before every generation. Cooperative
+    /// cancellation at a STEP boundary -- never mid-call: a half-applied mutating call
+    /// is worse than a turn that runs long, and there is no un-running one. Reported,
+    /// not silent: a truncated answer that looks complete is how a budget turns into a
+    /// wrong result. `Some` is the task's answer.
+    async fn out_of_time(&self, last: &str) -> Option<String> {
+        if self.deadline.is_none_or(|d| std::time::Instant::now() < d) {
+            return None;
+        }
+        let _ = self
+            .events
+            .send(AgentEvent::Error {
+                message: format!(
+                    "task {}: stopped at a tool-step boundary (turn budget)",
+                    self.id
+                ),
+            })
+            .await;
+        Some(format!("{last}\n[stopped: turn budget reached]"))
+    }
+
+    async fn gate(&self, call: &crate::toolcall::ToolCall, written: &mut Vec<String>) -> String {
+        gate_and_execute(
+            call,
+            &self.toolbox,
+            self.approvals,
+            self.events,
+            self.id,
+            written,
+            self.seen,
+            self.read_only,
+            self.role,
+        )
+        .await
+    }
+}
+
+/// Note the path a call names, once, for the task's trace -- from the STRUCTURED call,
+/// never the model's prose: a note bound to a path guessed from English would attach
+/// real findings to the wrong file.
+fn note_touched(touched: &mut Vec<String>, call: &crate::toolcall::ToolCall) {
+    if let Some(p) = crate::tools::arg_str(call, "path") {
+        if !touched.iter().any(|t| t == p) {
+            touched.push(p.to_string());
+        }
+    }
+}
+
+/// Warn while there is still room to act on it: a CAE writer spent its whole budget
+/// re-reading files and ended on "Let me write the document" with no call left to
+/// write it. Rides the newest observation, not a new turn, so the prompt still extends
+/// the last step's.
+fn warn_steps_left(observation: &mut String, left: usize) {
+    if left == STEPS_LEFT_WARNING {
+        *observation = format!("{observation}\n\n{}", steps_left_note(left));
+    }
+}
+
 /// What the native loop produced.
 ///
 /// The distinction exists because "no tool call this turn" is how the native loop ENDS —
@@ -2186,28 +2289,22 @@ enum NativeOutcome {
     NoCallsEmitted(String),
 }
 
-/// deliberated past its budget instead of emitting a call it had already chosen.
+/// The tool loop for models that emit their own calls.
+///
+/// The tools are declared on the request, so hipfire's chat template renders the block
+/// the model was trained to read and it answers in its own syntax — which the dialect
+/// parses directly. No Needle: nothing has to reconstruct the call from prose, so the
+/// multi-param and truncation failures that motivated the Needle finetune cannot occur.
 ///
 /// Reports whether the model emitted ANY call, so [`run_task`] can tell a genuine
 /// tool-free answer from a model that was routed native and cannot emit calls at all.
-#[allow(clippy::too_many_arguments)]
 async fn run_native_tool_loop(
-    client: &Client,
-    model: &str,
-    band: Priority,
+    ctx: &TaskCtx<'_>,
     dialect: &crate::dialect::ToolDialect,
-    toolbox: ToolBox,
-    approvals: &ApprovalGate,
-    prefix: &str,
-    role: Role,
     task: &str,
-    events: &mpsc::Sender<AgentEvent>,
-    id: u64,
     written: &mut Vec<String>,
-    read_only: bool,
-    seen: &std::sync::Mutex<SeenCalls>,
-    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<NativeOutcome> {
+    let (role, id) = (ctx.role, ctx.id);
     // Per-task values overlay: params with a closed, known set (read/list paths,
     // skill targets) carry a JSON-Schema `enum`, which hipfire's grammar turns into
     // a hard constraint — an invented path becomes unreachable, not merely corrected
@@ -2218,12 +2315,11 @@ async fn run_native_tool_loop(
     // later tasks' tools bytes diverge and KV prefix-sharing splits for the rest of
     // the turn (CLAUDE.md constraint 2) — accepted; a per-turn overlay would make
     // fanout attempts blind to each other's era instead.
-    let values = toolbox.param_values().await;
+    let values = ctx.toolbox.param_values().await;
     let tools = dialect.request_tools(crate::tools::role_tools(role), Some(&values));
-    let effort = crate::roles::effort_for(role);
     // The first user turn stays fixed; each step appends its call and result as
     // turns after it (see `Client::respond_turns`).
-    let prompt = planner::native_tool_prompt(prefix, role, task);
+    let prompt = planner::native_tool_prompt(ctx.prefix, role, task);
     let mut turns: Vec<serde_json::Value> = Vec::new();
     let mut last = String::new();
     // Whether this model ever produced a parsed call. The loop's own exit condition
@@ -2244,32 +2340,13 @@ async fn run_native_tool_loop(
         if !fit_context(&prompt, &mut turns, Some(&tools)) {
             break;
         }
-        // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
-        // tool call that is half-applied is worse than a turn that runs long, and
-        // there is no way to un-run one. Reported, not silent: a truncated answer
-        // that looks complete is how a budget turns into a wrong result.
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            let _ = events
-                .send(AgentEvent::Error {
-                    message: format!("task {id}: stopped at a tool-step boundary (turn budget)"),
-                })
-                .await;
-            return Ok(NativeOutcome::Answered(format!(
-                "{last}\n[stopped: turn budget reached]"
-            )));
+        if let Some(stopped) = ctx.out_of_time(&last).await {
+            return Ok(NativeOutcome::Answered(stopped));
         }
-        let reply = client
-            .respond_turns(
-                model,
-                &prompt,
-                &turns,
-                band,
-                toolbox.owner_token(),
-                Some(&tools),
-                Some(&effort),
-            )
-            .await;
-        let (text, _reasoning, server_calls) = match reply {
+        let (text, _reasoning, server_calls) = match ctx
+            .respond_turns(&prompt, &turns, &tools)
+            .await
+        {
             Ok(r) => r,
             // Cut off at the output limit: neither an answer nor a usable call (a
             // write_file cut off mid-`contents` is no call at all). Say so, spend the
@@ -2277,7 +2354,8 @@ async fn run_native_tool_loop(
             // full output cap of tokens the next step would carry for nothing.
             Err(e) => match e.downcast::<crate::hipfire::Truncated>() {
                 Ok(t) => {
-                    let _ = events
+                    let _ = ctx
+                        .events
                         .send(AgentEvent::Error {
                             message: format!("task {id}: {t}; asked for a shorter reply"),
                         })
@@ -2288,12 +2366,7 @@ async fn run_native_tool_loop(
                 Err(e) => return Err(e),
             },
         };
-        let _ = events
-            .send(AgentEvent::SubagentOutput {
-                id,
-                text: text.clone(),
-            })
-            .await;
+        ctx.say(&text).await;
         last = text.clone();
 
         // Prefer what the server parsed. A `function_call` output item is hipfire's own
@@ -2313,7 +2386,7 @@ async fn run_native_tool_loop(
             // fallback -- which wrote a 17-byte placeholder file. The reminder is a
             // new user turn, which is fine here: there are no earlier assistant
             // turns for it to re-render.
-            if calls_made == 0 && !reminded && !read_only {
+            if calls_made == 0 && !reminded && !ctx.read_only {
                 reminded = true;
                 if !text.trim().is_empty() {
                     turns.push(serde_json::json!({"type": "message", "role": "assistant", "content": text}));
@@ -2327,7 +2400,7 @@ async fn run_native_tool_loop(
                 tool: None,
                 observation: None,
             });
-            record_trace(&toolbox, id, task, &steps, &touched);
+            record_trace(&ctx.toolbox, id, task, &steps, &touched);
             // No call THIS turn is the normal end of the loop. No call in the WHOLE
             // task is the thing worth reporting.
             return Ok(if calls_made == 0 {
@@ -2345,15 +2418,8 @@ async fn run_native_tool_loop(
         let mut observations = Vec::with_capacity(batch.len());
         for call in batch {
             calls_made += 1;
-            if let Some(p) = crate::tools::arg_str(call, "path") {
-                if !touched.iter().any(|t| t == p) {
-                    touched.push(p.to_string());
-                }
-            }
-            let observation = gate_and_execute(
-                call, &toolbox, approvals, events, id, written, seen, read_only, role,
-            )
-            .await;
+            note_touched(&mut touched, call);
+            let observation = ctx.gate(call, written).await;
             steps.push(crate::trace::Step {
                 said: text.clone(),
                 intent: Some(crate::tools::describe(call)),
@@ -2362,15 +2428,8 @@ async fn run_native_tool_loop(
             });
             observations.push(observation);
         }
-        // Warn while there is still room to act on it: a CAE writer spent its whole
-        // budget re-reading files and ended on "Let me write the document" with no
-        // call left to write it. Rides the newest tool result (not a new turn), so
-        // the prompt still extends the last step's checkpoint.
-        let left = max_steps - step - 1;
-        if left == STEPS_LEFT_WARNING {
-            if let Some(last) = observations.last_mut() {
-                *last = format!("{last}\n\n{}", steps_left_note(left));
-            }
+        if let Some(newest) = observations.last_mut() {
+            warn_steps_left(newest, max_steps - step - 1);
         }
         // Only the calls that ran are replayed, so every call in the history has its
         // result — a model shown a call with no output would wait on it or redo it.
@@ -2396,7 +2455,7 @@ async fn run_native_tool_loop(
             }));
         }
     }
-    record_trace(&toolbox, id, task, &steps, &touched);
+    record_trace(&ctx.toolbox, id, task, &steps, &touched);
     // Step budget spent. Calls were made to spend it, so what follows is an answer —
     // asked for explicitly. Both choices here keep the prompt a byte-extension of the
     // last step's, so it forks that step's checkpoint instead of re-prefilling:
@@ -2411,25 +2470,12 @@ async fn run_native_tool_loop(
         }
     }
     if !fit_context(&prompt, &mut turns, Some(&tools)) {
-        return Err(too_big_for_context(&format!("task {id}'s prompt with its tools")));
+        return Err(too_big_for_context(&format!(
+            "task {id}'s prompt with its tools"
+        )));
     }
-    let (mut text, _reasoning, calls) = client
-        .respond_turns(
-            model,
-            &prompt,
-            &turns,
-            band,
-            toolbox.owner_token(),
-            Some(&tools),
-            Some(&effort),
-        )
-        .await?;
-    let _ = events
-        .send(AgentEvent::SubagentOutput {
-            id,
-            text: text.clone(),
-        })
-        .await;
+    let (mut text, _reasoning, calls) = ctx.respond_turns(&prompt, &turns, &tools).await?;
+    ctx.say(&text).await;
     // A reply that still calls tools is not an answer: a CAE research task asked
     // for "one more" read on its final call, and its report became the preamble in
     // front of the call ("Let me start by reading..."). Give it the one step it
@@ -2439,12 +2485,7 @@ async fn run_native_tool_loop(
         let batch = &calls[..calls.len().min(MAX_CALLS_PER_STEP)];
         let mut observations = Vec::with_capacity(batch.len());
         for call in batch {
-            observations.push(
-                gate_and_execute(
-                    call, &toolbox, approvals, events, id, written, seen, read_only, role,
-                )
-                .await,
-            );
+            observations.push(ctx.gate(call, written).await);
         }
         if !text.trim().is_empty() {
             turns
@@ -2472,25 +2513,12 @@ async fn run_native_tool_loop(
             }));
         }
         if !fit_context(&prompt, &mut turns, Some(&tools)) {
-            return Err(too_big_for_context(&format!("task {id}'s prompt with its tools")));
+            return Err(too_big_for_context(&format!(
+                "task {id}'s prompt with its tools"
+            )));
         }
-        let (again, _reasoning, _calls) = client
-            .respond_turns(
-                model,
-                &prompt,
-                &turns,
-                band,
-                toolbox.owner_token(),
-                Some(&tools),
-                Some(&effort),
-            )
-            .await?;
-        let _ = events
-            .send(AgentEvent::SubagentOutput {
-                id,
-                text: again.clone(),
-            })
-            .await;
+        let (again, _reasoning, _calls) = ctx.respond_turns(&prompt, &turns, &tools).await?;
+        ctx.say(&again).await;
         if !again.trim().is_empty() {
             text = again;
         }
@@ -2502,77 +2530,50 @@ async fn run_native_tool_loop(
     }))
 }
 
-/// The Needle-mediated tool-execution loop for a small model.
+/// The Needle-mediated tool-execution loop, for a model whose own call syntax is not
+/// read.
 ///
 /// Each turn the model responds (streamed as `SubagentOutput`). If it wrote a `TOOL:`
-/// line, Needle structures that plain-English intent into a call — the small model
-/// never writes JSON — `toolbox` executes it against the repo, and the observation is
-/// appended to the scratchpad for the next turn. The loop ends when a turn has no
-/// `TOOL:` line (that text is the final answer) or the step budget is spent. Tool and
-/// Needle errors come back as observations (the model can recover), not hard failures;
-/// only a model-generation error aborts the loop.
+/// line, Needle structures that plain-English intent into a call — the model never
+/// writes JSON — the call goes through the same gate as the native loop's, and the
+/// observation is appended to the scratchpad for the next turn. The loop ends when a
+/// turn has no `TOOL:` line (that text is the final answer) or the step budget is
+/// spent. Tool and Needle errors come back as observations (the model can recover),
+/// not hard failures; only a model-generation error aborts the loop. One call per
+/// turn: Needle picks one tool per query, by design.
 async fn run_tool_loop(
-    client: &Client,
-    model: &str,
-    band: Priority,
-    caller: Arc<dyn ToolCaller>,
-    toolbox: ToolBox,
-    approvals: &ApprovalGate,
-    dialects: &Dialects,
-    prefix: &str,
-    role: Role,
+    ctx: &TaskCtx<'_>,
+    caller: &Arc<dyn ToolCaller>,
     task: &str,
-    events: &mpsc::Sender<AgentEvent>,
-    id: u64,
     written: &mut Vec<String>,
-    read_only: bool,
-    seen: &std::sync::Mutex<SeenCalls>,
-    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<String> {
-    let effort = crate::roles::effort_for(role);
+    let (prefix, role, id) = (ctx.prefix, ctx.role, ctx.id);
     // Render the exec toolset in the tool-call model's dialect once; parse each reply
     // with the same dialect (which maps its tool names back to canonical).
-    let dialect = dialects.resolve(caller.model_id());
+    let dialect = ctx.dialects.resolve(caller.model_id());
     let schema = dialect.render(crate::tools::role_tools(role), None);
     let mut scratchpad = String::new();
     // The trace, kept as the loop already separates it: what the model said, and what a
     // tool returned. `trace::extract` needs no parsing of the scratchpad because the two
     // are never merged here in the first place.
     let mut steps: Vec<crate::trace::Step> = Vec::new();
-    // Paths the task touched, taken from the STRUCTURED call rather than parsed out of
-    // the model's prose — a note bound to a path guessed from English would attach real
-    // findings to the wrong file.
     let mut touched: Vec<String> = Vec::new();
-    // Canonical tool name of the turn's call, so extraction can tell an outcome from
-    // content without re-reading the model's prose.
-    let mut called: Option<String> = None;
     let mut last = String::new();
-    for _ in 0..max_tool_steps_for(role) {
-        // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
-        // tool call that is half-applied is worse than a turn that runs long, and
-        // there is no way to un-run one. Reported, not silent: a truncated answer
-        // that looks complete is how a budget turns into a wrong result.
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            let _ = events
-                .send(AgentEvent::Error {
-                    message: format!("task {id}: stopped at a tool-step boundary (turn budget)"),
-                })
-                .await;
-            return Ok(format!("{last}\n[stopped: turn budget reached]"));
+    let max_steps = max_tool_steps_for(role);
+    for step in 0..max_steps {
+        if let Some(stopped) = ctx.out_of_time(&last).await {
+            return Ok(stopped);
         }
-        if !fit_scratchpad(|s| planner::tool_loop_prompt(prefix, role, task, s), &mut scratchpad) {
+        if !fit_scratchpad(
+            |s| planner::tool_loop_prompt(prefix, role, task, s),
+            &mut scratchpad,
+        ) {
             return Err(too_big_for_context(&format!("task {id}'s prompt")));
         }
-        let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
-        let text = client
-            .respond(model, &prompt, band, toolbox.owner_token(), Some(&effort))
+        let text = ctx
+            .respond(&planner::tool_loop_prompt(prefix, role, task, &scratchpad))
             .await?;
-        let _ = events
-            .send(AgentEvent::SubagentOutput {
-                id,
-                text: text.clone(),
-            })
-            .await;
+        ctx.say(&text).await;
         last = text.clone();
 
         let Some(intent) = crate::tools::parse_tool_intent(&text) else {
@@ -2583,7 +2584,7 @@ async fn run_tool_loop(
                 tool: None,
                 observation: None,
             });
-            record_trace(&toolbox, id, task, &steps, &touched);
+            record_trace(&ctx.toolbox, id, task, &steps, &touched);
             return Ok(text); // no TOOL: line -> this turn is the final answer
         };
 
@@ -2594,19 +2595,15 @@ async fn run_tool_loop(
         let toolcaller = caller.clone();
         let schema = schema.clone();
         let raw = tokio::task::spawn_blocking(move || toolcaller.generate(&query, &schema)).await;
-        let observation = match raw.map(|r| r.and_then(|raw| dialect.parse(&raw))) {
+        // Canonical tool name of this turn's call, so extraction can tell an outcome
+        // from content without re-reading the model's prose.
+        let mut called = None;
+        let mut observation = match raw.map(|r| r.and_then(|raw| dialect.parse(&raw))) {
             Ok(Ok(calls)) => match calls.first() {
                 Some(c) => {
                     called = Some(c.name.clone());
-                    if let Some(p) = crate::tools::arg_str(c, "path") {
-                        if !touched.iter().any(|t| t == p) {
-                            touched.push(p.to_string());
-                        }
-                    }
-                    gate_and_execute(
-                        c, &toolbox, approvals, events, id, written, seen, read_only, role,
-                    )
-                    .await
+                    note_touched(&mut touched, c);
+                    ctx.gate(c, written).await
                 }
                 None => "error: no tool call produced".to_string(),
             },
@@ -2616,27 +2613,25 @@ async fn run_tool_loop(
         steps.push(crate::trace::Step {
             said: text.clone(),
             intent: Some(intent.clone()),
-            tool: called.clone(),
+            tool: called,
             observation: Some(observation.clone()),
         });
+        warn_steps_left(&mut observation, max_steps - step - 1);
         scratchpad.push_str(&format!("\nTOOL: {intent}\nRESULT: {observation}\n"));
     }
     // Step budget spent: ask once more, for the answer (see FINAL_ANSWER_NUDGE).
-    record_trace(&toolbox, id, task, &steps, &touched);
-    if !fit_scratchpad(|s| planner::tool_loop_prompt(prefix, role, task, s), &mut scratchpad) {
+    record_trace(&ctx.toolbox, id, task, &steps, &touched);
+    if !fit_scratchpad(
+        |s| planner::tool_loop_prompt(prefix, role, task, s),
+        &mut scratchpad,
+    ) {
         return Err(too_big_for_context(&format!("task {id}'s prompt")));
     }
     scratchpad.push_str(&format!("\n{FINAL_ANSWER_NUDGE}\n"));
-    let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
-    let text = client
-        .respond(model, &prompt, band, toolbox.owner_token(), Some(&effort))
+    let text = ctx
+        .respond(&planner::tool_loop_prompt(prefix, role, task, &scratchpad))
         .await?;
-    let _ = events
-        .send(AgentEvent::SubagentOutput {
-            id,
-            text: text.clone(),
-        })
-        .await;
+    ctx.say(&text).await;
     Ok(if text.trim().is_empty() { last } else { text })
 }
 
@@ -2758,49 +2753,15 @@ fn record_trace(
 /// capability is unknown is the wrong default — an agent that can read is
 /// recoverable, one that must guess is not — and the gate was a substring match on
 /// the model id anyway (`is_small_model("Gemma-3-27B") == true`).
-/// `read_only` marks a fan-out proposal pass: mutating tool calls become no-op
-/// observations (see [`gate_and_execute`]) without touching the paths themselves.
-#[allow(clippy::too_many_arguments)]
 async fn run_task(
-    client: &Client,
-    model: &str,
-    band: Priority,
-    dialects: &Dialects,
-    tool_caller: Option<Arc<dyn ToolCaller>>,
-    toolbox: ToolBox,
-    approvals: &ApprovalGate,
-    prefix: &str,
-    role: Role,
+    ctx: &TaskCtx<'_>,
     task: &str,
-    events: &mpsc::Sender<AgentEvent>,
-    id: u64,
     written: &mut Vec<String>,
-    read_only: bool,
-    seen: &std::sync::Mutex<SeenCalls>,
-    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<String> {
-    let effort = crate::roles::effort_for(role);
-    let role_dialect = dialects.resolve(model);
+    let (model, id) = (ctx.model, ctx.id);
+    let role_dialect = ctx.dialects.resolve(model);
     if role_dialect.emits_own_calls() {
-        let outcome = run_native_tool_loop(
-            client,
-            model,
-            band,
-            role_dialect,
-            toolbox.clone(),
-            approvals,
-            prefix,
-            role,
-            task,
-            events,
-            id,
-            written,
-            read_only,
-            seen,
-            deadline,
-        )
-        .await?;
-        let text = match outcome {
+        let text = match run_native_tool_loop(ctx, role_dialect, task, written).await? {
             NativeOutcome::Answered(text) => return Ok(text),
             NativeOutcome::NoCallsEmitted(text) => text,
         };
@@ -2824,58 +2785,52 @@ async fn run_task(
                 ""
             }
         );
-        // Degrade rather than hand back a toolless answer: Needle builds calls from a
-        // plain-English line, so it works for a model whose own call syntax we cannot
-        // read. Without a caller there is nothing to fall back TO, so the text stands.
-        let Some(caller) = tool_caller else {
+        // Degrade rather than hand back a toolless answer -- but only when the reply
+        // shows a call nobody could read. Needle builds calls from a plain-English line,
+        // so it works for a model whose own syntax we cannot parse. A reply with no
+        // call markup is a tool-free answer the model already confirmed when reminded;
+        // rerunning it cost a whole second task, and once wrote a 17-byte placeholder
+        // file in place of the deliverable the model had pasted as prose.
+        let (true, Some(caller)) = (looks_like_a_botched_call, &ctx.tool_caller) else {
             return Ok(text);
         };
         eprintln!("warning: retrying task {id} through the Needle tool loop");
-        return run_tool_loop(
-            client, model, band, caller, toolbox, approvals, dialects, prefix, role, task, events,
-            id, written, read_only, seen, deadline,
-        )
-        .await;
+        return run_tool_loop(ctx, caller, task, written).await;
     }
-    if let Some(caller) = tool_caller {
-        run_tool_loop(
-            client, model, band, caller, toolbox, approvals, dialects, prefix, role, task, events,
-            id, written, read_only, seen, deadline,
-        )
-        .await
-    } else {
-        let full = planner::subagent_prompt(prefix, role, task);
-        if over_context_budget(&full, &[], None) {
-            return Err(too_big_for_context(&format!("task {id}'s prompt")));
-        }
-        let out = if client.streaming() {
-            // Relay each delta to the UI as it arrives (best-effort: try_send drops
-            // under backpressure, the final SubagentOutput below reconciles).
-            let ev = events.clone();
-            let (text, _reasoning) = client
-                .respond_streaming(model, &full, band, toolbox.owner_token(), Some(&effort), |delta| {
+    if let Some(caller) = &ctx.tool_caller {
+        return run_tool_loop(ctx, caller, task, written).await;
+    }
+    let full = planner::subagent_prompt(ctx.prefix, ctx.role, task);
+    if over_context_budget(&full, &[], None) {
+        return Err(too_big_for_context(&format!("task {id}'s prompt")));
+    }
+    let text = if ctx.client.streaming() {
+        // Relay each delta to the UI as it arrives (best-effort: try_send drops
+        // under backpressure, the final SubagentOutput below reconciles).
+        let ev = ctx.events.clone();
+        let effort = crate::roles::effort_for(ctx.role);
+        let (text, _reasoning) = ctx
+            .client
+            .respond_streaming(
+                model,
+                &full,
+                ctx.band,
+                ctx.toolbox.owner_token(),
+                Some(&effort),
+                |delta| {
                     let _ = ev.try_send(AgentEvent::SubagentDelta {
                         id,
                         text: delta.to_string(),
                     });
-                })
-                .await?;
-            Ok(text)
-        } else {
-            client
-                .respond(model, &full, band, toolbox.owner_token(), Some(&effort))
-                .await
-        };
-        if let Ok(text) = &out {
-            let _ = events
-                .send(AgentEvent::SubagentOutput {
-                    id,
-                    text: text.clone(),
-                })
-                .await;
-        }
-        out
-    }
+                },
+            )
+            .await?;
+        text
+    } else {
+        ctx.respond(&full).await?
+    };
+    ctx.say(&text).await;
+    Ok(text)
 }
 
 /// Fan a coder task out as `k` read-only proposal attempts, judge them, execute once.
@@ -2886,25 +2841,12 @@ async fn run_task(
 /// judges the surviving proposals into one directive, and the task executes once,
 /// writable, steered by it. Scaffolding failures degrade to plain execution: the
 /// ensemble may improve the task, never fail it.
-#[allow(clippy::too_many_arguments)]
 async fn run_fanout(
+    ctx: &TaskCtx<'_>,
     k: usize,
-    client: &Client,
-    model: &str,
     review_model: &str,
-    band: Priority,
-    dialects: &Dialects,
-    tool_caller: Option<Arc<dyn ToolCaller>>,
-    toolbox: ToolBox,
-    approvals: &ApprovalGate,
-    prefix: &str,
-    role: Role,
     task: &str,
-    events: &mpsc::Sender<AgentEvent>,
-    id: u64,
     written: &mut Vec<String>,
-    seen: &std::sync::Mutex<SeenCalls>,
-    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<String> {
     // How long attempt 1 took, published the moment it finishes so the extras can be
     // timed against it rather than against a constant guessed ahead of the run.
@@ -2912,13 +2854,12 @@ async fn run_fanout(
     let baseline_took = Arc::new(std::sync::Mutex::new(None::<std::time::Duration>));
     let attempts = (0..k).map(|i| {
         let attempt_task = planner::fanout_attempt_task(task, i + 1, k);
-        let attempt_band = if i == 0 {
-            band
+        let band = if i == 0 {
+            ctx.band
         } else {
             Priority::Opportunistic
         };
-        let toolbox = toolbox.clone();
-        let tool_caller = tool_caller.clone();
+        let ctx = ctx.clone();
         let baseline = Arc::clone(&baseline);
         let baseline_took = Arc::clone(&baseline_took);
         async move {
@@ -2926,25 +2867,14 @@ async fn run_fanout(
                                        // Attempts get a PRIVATE map: their "read-only pass" notes must never
                                        // suppress the turn map's real, writable execution of the same call.
             let attempt_seen = std::sync::Mutex::new(SeenCalls::default());
+            let ctx = TaskCtx {
+                band,
+                read_only: true,
+                seen: &attempt_seen,
+                ..ctx
+            };
             let started = std::time::Instant::now();
-            let fut = run_task(
-                client,
-                model,
-                attempt_band,
-                dialects,
-                tool_caller,
-                toolbox,
-                approvals,
-                prefix,
-                role,
-                &attempt_task,
-                events,
-                id,
-                &mut sink,
-                true,
-                &attempt_seen,
-                deadline,
-            );
+            let fut = run_task(&ctx, &attempt_task, &mut sink);
             if i == 0 {
                 let res = fut.await;
                 *baseline_took.lock().unwrap() = Some(started.elapsed());
@@ -2996,29 +2926,24 @@ async fn run_fanout(
 
     let mut steered = task.to_string();
     if proposals.len() >= 2 {
-        let judge_prompt = planner::fanout_judge_prompt(prefix, task, &proposals);
+        let judge_prompt = planner::fanout_judge_prompt(ctx.prefix, task, &proposals);
         // A judge that cannot fit the context is skipped like one that failed.
         let judged = if over_context_budget(&judge_prompt, &[], None) {
             Err(too_big_for_context("the fan-out judge's prompt"))
         } else {
-            client
+            ctx.client
                 .respond(
                     review_model,
                     &judge_prompt,
                     planner::band_for(Role::Review),
-                    toolbox.owner_token(),
+                    ctx.toolbox.owner_token(),
                     Some(&crate::roles::effort_for(Role::Review)),
                 )
                 .await
         };
         match judged {
             Ok(directive) => {
-                let _ = events
-                    .send(AgentEvent::SubagentOutput {
-                        id,
-                        text: format!("[fanout judge] {directive}"),
-                    })
-                    .await;
+                ctx.say(&format!("[fanout judge] {directive}")).await;
                 steered = format!(
                     "{task}\n\nA reviewer judged {} independent proposals and synthesized \
                      this directive — follow it:\n{directive}",
@@ -3035,25 +2960,7 @@ async fn run_fanout(
              implementing:\n{only}"
         );
     }
-    run_task(
-        client,
-        model,
-        band,
-        dialects,
-        tool_caller,
-        toolbox,
-        approvals,
-        prefix,
-        role,
-        &steered,
-        events,
-        id,
-        written,
-        false,
-        seen,
-        deadline,
-    )
-    .await
+    run_task(ctx, &steered, written).await
 }
 
 /// Extract the follow-up task a subagent proposed in its reply.
@@ -3221,22 +3128,25 @@ mod tests {
         let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
 
         let out = run_tool_loop(
-            &client,
-            "test-model",
-            Priority::Default,
-            Arc::new(NeverCalled),
-            toolbox,
-            &approvals,
-            &dialects,
-            "prefix",
-            Role::Coder,
+            &TaskCtx {
+                client: &client,
+                model: "test-model",
+                band: Priority::Default,
+                dialects: &dialects,
+                tool_caller: None,
+                toolbox,
+                approvals: &approvals,
+                prefix: "prefix",
+                role: Role::Coder,
+                events: &tx,
+                id: 7,
+                read_only: false,
+                seen: &seen,
+                deadline: Some(expired),
+            },
+            &(Arc::new(NeverCalled) as Arc<dyn ToolCaller>),
             "task",
-            &tx,
-            7,
             &mut written,
-            false,
-            &seen,
-            Some(expired),
         )
         .await
         .expect("returns rather than erroring");
@@ -3615,22 +3525,24 @@ mod tests {
         let seen = std::sync::Mutex::new(SeenCalls::default());
         let mut written = Vec::new();
         let out = run_task(
-            &client,
-            "Qwen3.5-9B--oq4.25++",
-            Priority::Default,
-            &Dialects::default(),
-            None,
-            toolbox,
-            &ApprovalGate::default(),
-            "prefix",
-            Role::Research,
+            &TaskCtx {
+                client: &client,
+                model: "Qwen3.5-9B--oq4.25++",
+                band: Priority::Default,
+                dialects: &Dialects::default(),
+                tool_caller: None,
+                toolbox,
+                approvals: &ApprovalGate::default(),
+                prefix: "prefix",
+                role: Role::Research,
+                events: &etx,
+                id: 7,
+                read_only: true,
+                seen: &seen,
+                deadline: None,
+            },
             "summarize src/lib.rs",
-            &etx,
-            7,
             &mut written,
-            true,
-            &seen,
-            None,
         )
         .await
         .expect("the task recovers");
@@ -3692,22 +3604,24 @@ mod tests {
         let seen = std::sync::Mutex::new(SeenCalls::default());
         let mut written = Vec::new();
         let out = run_task(
-            &client,
-            "Qwen3.5-9B--oq4.25++",
-            Priority::Default,
-            &dialects,
-            None,
-            toolbox,
-            &ApprovalGate::default(),
-            "prefix",
-            Role::Coder,
+            &TaskCtx {
+                client: &client,
+                model: "Qwen3.5-9B--oq4.25++",
+                band: Priority::Default,
+                dialects: &dialects,
+                tool_caller: None,
+                toolbox,
+                approvals: &ApprovalGate::default(),
+                prefix: "prefix",
+                role: Role::Coder,
+                events: &etx,
+                id: 7,
+                read_only: false,
+                seen: &seen,
+                deadline: None,
+            },
             "read src/lib.rs and report what it defines",
-            &etx,
-            7,
             &mut written,
-            false,
-            &seen,
-            None,
         )
         .await
         .expect("the task completes rather than erroring");
@@ -3740,22 +3654,24 @@ mod tests {
         );
         let mut written = Vec::new();
         let _ = run_task(
-            &client,
-            "Qwen3.5-9B--oq4.25++",
-            Priority::Default,
-            &dialects,
-            Some(caller.clone()),
-            toolbox,
-            &ApprovalGate::default(),
-            "prefix",
-            Role::Coder,
+            &TaskCtx {
+                client: &client,
+                model: "Qwen3.5-9B--oq4.25++",
+                band: Priority::Default,
+                dialects: &dialects,
+                tool_caller: Some(caller.clone()),
+                toolbox,
+                approvals: &ApprovalGate::default(),
+                prefix: "prefix",
+                role: Role::Coder,
+                events: &etx,
+                id: 8,
+                read_only: false,
+                seen: &seen,
+                deadline: None,
+            },
             "read src/lib.rs and report what it defines",
-            &etx,
-            8,
             &mut written,
-            false,
-            &seen,
-            None,
         )
         .await
         .expect("the retry completes");
@@ -4765,5 +4681,316 @@ mod tests {
             erx.recv().await.unwrap(),
             AgentEvent::Error { .. }
         ));
+    }
+
+    /// A hipfire stand-in that records every `/v1/responses` body and answers through
+    /// `reply(body, n)`, `n` counting requests from 0 -- for asserting what the loops
+    /// actually send, not just what they return.
+    async fn recording_hipfire(
+        reply: impl Fn(&serde_json::Value, usize) -> serde_json::Value + Send + Sync + 'static,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        use axum::{routing::post, Json, Router};
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let (seen, reply) = (bodies.clone(), Arc::new(reply));
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Json<serde_json::Value>| {
+                let (seen, reply) = (seen.clone(), reply.clone());
+                async move {
+                    let n = {
+                        let mut b = seen.lock().unwrap();
+                        b.push(body.0.clone());
+                        b.len() - 1
+                    };
+                    Json(reply(&body.0, n))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), bodies)
+    }
+
+    fn text_reply(text: &str) -> serde_json::Value {
+        serde_json::json!({"status": "completed", "output_text": text, "output": []})
+    }
+
+    fn call_reply(name: &str, args: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"status": "completed", "output_text": "", "output": [
+            {"type": "function_call", "name": name, "arguments": args.to_string(), "call_id": "c"}
+        ]})
+    }
+
+    /// A repo with two small files, for loops that read.
+    fn two_file_repo(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("corrode-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "beta\n").unwrap();
+        dir
+    }
+
+    fn repo_toolbox(dir: &std::path::Path) -> ToolBox {
+        ToolBox::new(
+            Arc::new(PassthroughVfs::new(dir)),
+            dir.to_path_buf(),
+            Arc::new(std::collections::HashMap::new()),
+        )
+    }
+
+    // hipfire reuses prefill only by forking a checkpoint at the previous request's
+    // turn boundary, so every native step must send the last request's items
+    // unchanged plus new ones, with the same tools. A refactor that breaks this still
+    // returns the right answer -- it just re-prefills the whole conversation each step.
+    #[tokio::test]
+    async fn each_native_step_extends_the_previous_request() {
+        let dir = two_file_repo("extend-native");
+        let (url, bodies) = recording_hipfire(|_, n| match n {
+            0 => call_reply("read_file", serde_json::json!({"path": "a.txt"})),
+            1 => call_reply("read_file", serde_json::json!({"path": "b.txt"})),
+            _ => text_reply("alpha and beta"),
+        })
+        .await;
+        let client = Client::new(url, None);
+        let (etx, _erx) = mpsc::channel(64);
+        let seen = Mutex::new(SeenCalls::default());
+        let prefix = format!("repo context{}", crate::hipfire::PREFIX_END);
+        let mut written = Vec::new();
+        let out = run_task(
+            &TaskCtx {
+                client: &client,
+                model: "Qwen3.5-9B--oq4.25++",
+                band: Priority::Default,
+                dialects: &Dialects::default(),
+                tool_caller: None,
+                toolbox: repo_toolbox(&dir),
+                approvals: &ApprovalGate::default(),
+                prefix: &prefix,
+                role: Role::Research,
+                events: &etx,
+                id: 1,
+                read_only: false,
+                seen: &seen,
+                deadline: None,
+            },
+            "say what a.txt and b.txt contain",
+            &mut written,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "alpha and beta");
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3, "two tool steps and the answer");
+        for (k, w) in bodies.windows(2).enumerate() {
+            let (prev, next) = (
+                w[0]["input"].as_array().unwrap(),
+                w[1]["input"].as_array().unwrap(),
+            );
+            assert!(
+                next.len() > prev.len() && next[..prev.len()] == prev[..],
+                "request {} does not extend request {k}:\n{prev:?}\n{next:?}",
+                k + 1
+            );
+            assert_eq!(
+                w[0]["tools"],
+                w[1]["tools"],
+                "the declared tools changed at request {}",
+                k + 1
+            );
+        }
+        assert!(
+            bodies[2]["input"].to_string().contains("alpha"),
+            "the read's result was replayed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The same for the Needle loop: its scratchpad used to sit BEFORE the fixed
+    // instructions, so no step's prompt extended the last one's, and the final-answer
+    // nudge was followed by "You can use tools".
+    #[tokio::test]
+    async fn each_needle_step_extends_the_previous_prompt() {
+        struct ReadA;
+        impl crate::toolcall::ToolCaller for ReadA {
+            fn generate(&self, _q: &str, _t: &str) -> anyhow::Result<String> {
+                Ok(r#"[{"name": "read_file", "arguments": {"path": "a.txt"}}]"#.to_string())
+            }
+            fn model_id(&self) -> &str {
+                "needle"
+            }
+        }
+        let dir = two_file_repo("extend-needle");
+        let (url, bodies) = recording_hipfire(|_, n| {
+            text_reply(if n < 2 {
+                "TOOL: read the file a.txt"
+            } else {
+                "It says alpha."
+            })
+        })
+        .await;
+        let client = Client::new(url, None);
+        let (etx, _erx) = mpsc::channel(64);
+        let seen = Mutex::new(SeenCalls::default());
+        let prefix = format!("repo context{}", crate::hipfire::PREFIX_END);
+        let mut written = Vec::new();
+        let caller: Arc<dyn ToolCaller> = Arc::new(ReadA);
+        let out = run_tool_loop(
+            &TaskCtx {
+                client: &client,
+                model: "test-model",
+                band: Priority::Default,
+                dialects: &Dialects::default(),
+                tool_caller: None,
+                toolbox: repo_toolbox(&dir),
+                approvals: &ApprovalGate::default(),
+                prefix: &prefix,
+                role: Role::Research,
+                events: &etx,
+                id: 1,
+                read_only: false,
+                seen: &seen,
+                deadline: None,
+            },
+            &caller,
+            "what does a.txt say?",
+            &mut written,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "It says alpha.");
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3);
+        let user: Vec<String> = bodies
+            .iter()
+            .map(|b| b["input"][1]["content"].as_str().unwrap().to_string())
+            .collect();
+        for (k, w) in user.windows(2).enumerate() {
+            assert!(
+                w[1].starts_with(w[0].as_str()),
+                "prompt {} does not extend prompt {k}:\n---\n{}\n---\n{}",
+                k + 1,
+                w[0],
+                w[1]
+            );
+        }
+        assert!(
+            user[2].ends_with("alpha\n\n"),
+            "the newest result is read last: {:?}",
+            user[2]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A native model that answers without tools -- and repeats its answer when
+    // reminded -- has answered. It used to be rerun from scratch through the Needle
+    // loop: a whole second task for every tool-free answer.
+    #[tokio::test]
+    async fn a_tool_free_native_answer_is_not_rerun_through_needle() {
+        let (url, bodies) =
+            recording_hipfire(|_, n| text_reply(if n == 0 { "Four." } else { "Four, as I said." }))
+                .await;
+        let client = Client::new(url, None);
+        let (etx, _erx) = mpsc::channel(64);
+        let seen = Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let out = run_task(
+            &TaskCtx {
+                client: &client,
+                model: "Qwen3.5-9B--oq4.25++",
+                band: Priority::Default,
+                dialects: &Dialects::default(),
+                tool_caller: Some(Arc::new(NeverCalled)),
+                toolbox: repo_toolbox(std::path::Path::new(".")),
+                approvals: &ApprovalGate::default(),
+                prefix: "prefix",
+                role: Role::Coder,
+                events: &etx,
+                id: 1,
+                read_only: false,
+                seen: &seen,
+                deadline: None,
+            },
+            "what is 2 + 2?",
+            &mut written,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "Four, as I said.");
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            2,
+            "the reply and its reminder, no rerun"
+        );
+    }
+
+    // One Prompt through `Daemon::run`, hermetically: the plan becomes a task, the task
+    // answers, the plan review runs, the turn completes -- and every generation of the
+    // turn opens with the same system turn, the shape hipfire's prefix reuse needs.
+    #[tokio::test]
+    async fn a_prompt_runs_end_to_end_on_one_shared_prefix() {
+        let repo = two_file_repo("e2e");
+        let (url, bodies) = recording_hipfire(|body, _| {
+            if body["input"]
+                .to_string()
+                .contains("You are the orchestrator")
+            {
+                text_reply(r#"[{"role": "research", "task": "Say what a.txt contains."}]"#)
+            } else {
+                text_reply("It contains alpha.")
+            }
+        })
+        .await;
+        let daemon = Arc::new(Daemon::new(
+            Swarm::new(Client::new(url, None), 1),
+            RoleModels::uniform("Qwen3.5-9B--oq4.25++"),
+            None,
+            Arc::new(PassthroughVfs::new(&repo)),
+            SkillContext::default(),
+            None,
+            None,
+            repo.clone(),
+            Project::load(&repo),
+            Arc::new(Dialects::default()),
+        ));
+        let (ctx, crx) = mpsc::channel(8);
+        let (etx, mut erx) = mpsc::channel(256);
+        tokio::spawn(Arc::clone(&daemon).run(crx, etx));
+        ctx.send(AgentCommand::Prompt {
+            text: "What is in a.txt?".into(),
+            priority: Priority::Default,
+        })
+        .await
+        .unwrap();
+        let (mut outputs, mut errors) = (Vec::new(), Vec::new());
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), erx.recv())
+                .await
+                .expect("the turn ends within 30s")
+                .expect("daemon alive");
+            match unturn(ev) {
+                AgentEvent::SubagentOutput { text, .. } => outputs.push(text),
+                AgentEvent::Error { message } => errors.push(message),
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            outputs.iter().any(|o| o == "It contains alpha."),
+            "{outputs:?}"
+        );
+        let bodies = bodies.lock().unwrap().clone();
+        // The planner, the task and the plan review (each answer reminded once).
+        assert!(bodies.len() >= 3, "{} requests", bodies.len());
+        let system = &bodies[0]["input"][0];
+        assert_eq!(system["role"], "system", "{system}");
+        for (k, b) in bodies.iter().enumerate() {
+            assert_eq!(
+                &b["input"][0], system,
+                "request {k} opens with a different system turn"
+            );
+        }
+        std::fs::remove_dir_all(&repo).ok();
     }
 }

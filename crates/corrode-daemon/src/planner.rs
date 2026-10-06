@@ -75,21 +75,22 @@ NEXT: <one plain-English follow-up task>",
     )
 }
 
-/// Compose a tool-loop turn for a small model: the shared prefix, the role+task, the
-/// scratchpad of tool calls/results so far, then instructions. The model acts by writing
-/// a plain-English `TOOL:` line (Needle structures it — the small model never writes a
-/// tool call); it finishes with a turn that has no `TOOL:` line. The shared prefix stays
-/// byte-identical across turns and across the swarm, so hipfire reuses the KV prefill;
-/// only the scratchpad tail grows.
+/// Compose a tool-loop turn for the Needle loop: the shared prefix, the role+task, the
+/// instructions, then the scratchpad of tool calls/results so far. The model acts by
+/// writing a plain-English `TOOL:` line (Needle structures it — the model never writes a
+/// tool call); it finishes with a turn that has no `TOOL:` line. The scratchpad goes
+/// LAST, so each step's prompt extends the previous one (until old results are shed to
+/// fit) and the newest result -- or the final-answer nudge -- is the last thing read,
+/// not followed by "You can use tools".
 pub fn tool_loop_prompt(context_prefix: &str, role: Role, task: &str, scratchpad: &str) -> String {
     format!(
-        "{context_prefix}\n\n[role: {}]\n{task}\n{scratchpad}\n\
+        "{context_prefix}\n\n[role: {}]\n{task}\n\n\
 You can use tools. To use one, write a line:\n\
 TOOL: <one plain-English request> (e.g. TOOL: read the file crates/corrode-core/src/lib.rs)\n\
 Write plain English, not JSON — the tool call is constructed for you. You will get the \
 result and can continue. When you have enough to answer, reply with your final answer and \
 NO TOOL: line. Optionally end with:\n\
-NEXT: <one plain-English follow-up task>",
+NEXT: <one plain-English follow-up task>\n{scratchpad}",
         role.as_str()
     )
 }
