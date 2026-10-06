@@ -112,6 +112,14 @@ fn check_with(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
             ));
         }
     }
+    if let Some(v) = set("CORRODE_OPENAI_REASONING_EFFORT")
+        .filter(|v| v != "role" && !EFFORTS.contains(&v.as_str()))
+    {
+        bad.push(format!(
+            "CORRODE_OPENAI_REASONING_EFFORT={v:?}: expected `role` or one of {}",
+            EFFORTS.join("/")
+        ));
+    }
     if let Some(v) = set("CORRODE_OPENAI_BASE_URL")
         .filter(|v| !v.starts_with("http://") && !v.starts_with("https://"))
     {
@@ -125,6 +133,7 @@ fn check_with(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
             "CORRODE_OPENAI_ROLES",
             "CORRODE_OPENAI_BASE_URL",
             "CORRODE_OPENAI_BUDGET_USD",
+            "CORRODE_OPENAI_REASONING_EFFORT",
         ] {
             if set(k).is_some() {
                 bad.push(format!(
