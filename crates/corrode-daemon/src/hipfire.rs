@@ -643,6 +643,29 @@ impl Client {
         self.stream
     }
 
+    /// [`Self::list_models`], retried within `CORRODE_RETRY_WINDOW_S` while hipfire is
+    /// not answering -- at boot the daemon can start before hipfire does, and one
+    /// failed call used to put every role on the offline fallback model for the
+    /// daemon's whole life.
+    pub async fn list_models_patiently(&self) -> anyhow::Result<Vec<String>> {
+        let started = std::time::Instant::now();
+        let mut attempt = 0;
+        loop {
+            match self.list_models().await {
+                Ok(models) => return Ok(models),
+                Err(e) => {
+                    let wait = retry_delay(attempt, None);
+                    if started.elapsed() + wait > retry_window() {
+                        return Err(e);
+                    }
+                    eprintln!("hipfire model list unavailable ({e}); retrying in {:.0}s", wait.as_secs_f32());
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
     /// The models hipfire currently serves (`GET /v1/models`), by id. Role
     /// assignment resolves against this list.
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
