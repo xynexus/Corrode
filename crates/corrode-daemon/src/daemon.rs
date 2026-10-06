@@ -157,6 +157,9 @@ pub struct Daemon {
     default_repo: PathBuf,
     /// Embedding model id for building a repo's skill index (None if none served).
     embed_model: Option<String>,
+    /// An OpenAI-compatible endpoint for the hardest work (`CORRODE_OPENAI_MODEL`);
+    /// `None` keeps every call on hipfire. See `remote.rs`.
+    remote: Option<Arc<crate::remote::Remote>>,
 }
 
 impl Daemon {
@@ -177,6 +180,10 @@ impl Daemon {
             eprintln!("telemetry: recording to $CORRODE_TELEMETRY");
         }
         let sandbox = crate::sandbox::Sandbox::from_env();
+        let remote = crate::remote::Remote::from_env().map(Arc::new);
+        if let Some(r) = &remote {
+            eprintln!("{}", r.describe());
+        }
         let default_repo = canonical(&repo_root.to_string_lossy());
         // The default repo's resources come pre-built from `main` (or a test); seed
         // the registry so anonymous/default connections reuse them without reopening.
@@ -222,6 +229,7 @@ impl Daemon {
             users: load_users(),
             default_repo,
             embed_model,
+            remote,
         }
     }
 
@@ -524,6 +532,10 @@ impl Daemon {
                             duration_s: now.saturating_sub(started),
                             planner: planner_calls.usage(),
                             usage: Default::default(),
+                            remote_usd: self
+                                .remote
+                                .as_ref()
+                                .map_or(0.0, |r| r.cost(planner_calls.remote_usage())),
                         });
                         let mut record = journal_record(session, &plan_id, &text, started, "planning failed");
                         record["error"] = serde_json::json!(e.to_string());
@@ -557,6 +569,13 @@ impl Daemon {
                 // what the swarm already did.
                 let turn_seen = Arc::new(std::sync::Mutex::new(SeenCalls::default()));
                 let turn_usage = Arc::new(std::sync::Mutex::new(crate::hipfire::Usage::default()));
+                // What the turn has spent on the remote endpoint, the planner included;
+                // past its budget every task stays on hipfire.
+                let turn_spend = Arc::new(std::sync::Mutex::new(
+                    self.remote
+                        .as_ref()
+                        .map_or(0.0, |r| r.cost(planner_calls.remote_usage())),
+                ));
                 // Cap concurrent generations: a wide plan otherwise fires every ready
                 // task's request at once, and a memory-tight or fragile backend can
                 // CRASH (not just shed) under that burst — observed with a DeltaNet
@@ -598,6 +617,8 @@ impl Daemon {
                     // shared prefix stays byte-identical (KV reuse).
                     let seen = Arc::clone(&turn_seen);
                     let turn_usage = Arc::clone(&turn_usage);
+                    let turn_spend = Arc::clone(&turn_spend);
+                    let remote = self.remote.clone();
                     let plan_for_task = plan_id.clone();
                     let prompt = match seen.lock().unwrap().digest(TURN_DIGEST_LINES) {
                         Some(d) => format!("{}\n\n{d}", task.prompt),
@@ -619,6 +640,19 @@ impl Daemon {
                         // unschedulable. Not a rejected request, a cut-off reply or a
                         // timed-out call: those would only fail again.
                         let mut attempt = 0;
+                        // Where it runs: a role routed to the remote starts there and a
+                        // remote failure falls back to hipfire; any other task that fails
+                        // on hipfire (after that one retry) is escalated to the remote
+                        // once -- while the turn's remote budget lasts.
+                        let affordable = || {
+                            remote
+                                .as_ref()
+                                .is_some_and(|r| r.affordable(*turn_spend.lock().unwrap()))
+                        };
+                        let mut on_remote =
+                            affordable() && remote.as_ref().is_some_and(|r| r.routes(role));
+                        let mut escalated = on_remote;
+                        let mut ran_on = model.clone();
                         let calls = crate::hipfire::CallScope::new(format!("{plan_for_task}/{id}"));
                         let output = crate::hipfire::CALLS.scope(Arc::clone(&calls), async { loop {
                             let toolbox =
@@ -628,49 +662,77 @@ impl Daemon {
                                     .with_reranker(reranker.clone())
                                     .with_owner_token(owner_token.clone())
                                     .with_plan(&plan_for_task);
-                            let ctx = TaskCtx {
-                                client: &client,
-                                model: &model,
-                                band,
-                                dialects: &dialects,
-                                tool_caller: tool_caller.clone(),
-                                toolbox,
-                                approvals: &approvals,
-                                prefix: &prefix,
-                                role,
-                                events: &events,
-                                id,
-                                read_only: false,
-                                seen: &seen,
-                                deadline,
-                            };
-                            let output = if role == Role::Coder && fanout > 1 {
-                                run_fanout(&ctx, fanout, &review_model, &prompt, &mut artifacts)
-                                    .await
-                            } else {
-                                run_task(&ctx, &prompt, &mut artifacts).await
-                            };
-                            match &output {
-                                Err(e)
-                                    if attempt == 0
-                                        && crate::hipfire::is_retryable(e)
-                                        && !deadline
-                                            .is_some_and(|d| std::time::Instant::now() >= d) =>
-                                {
-                                    let _ = events
-                                        .send(AgentEvent::Error {
-                                            message: format!(
-                                                "task {id}: {e}; running it once more"
-                                            ),
-                                        })
-                                        .await;
-                                    attempt += 1;
+                                    let (backend, backend_model): (&crate::hipfire::Client, &str) =
+                                        match (&remote, on_remote) {
+                                            (Some(r), true) => (&r.client, &r.model),
+                                            _ => (&client, &model),
+                                        };
+                                    ran_on = backend_model.to_string();
+                                    // The fan-out judge follows the review role's routing.
+                                    let review = match &remote {
+                                        Some(r) if r.routes(Role::Review) && affordable() => {
+                                            (&r.client, r.model.as_str())
+                                        }
+                                        _ => (&*client, review_model.as_str()),
+                                    };
+                                    let ctx = TaskCtx {
+                                        client: backend,
+                                        model: backend_model,
+                                        band,
+                                        dialects: &dialects,
+                                        tool_caller: tool_caller.clone(),
+                                        toolbox,
+                                        approvals: &approvals,
+                                        prefix: &prefix,
+                                        role,
+                                        events: &events,
+                                        id,
+                                        read_only: false,
+                                        seen: &seen,
+                                        deadline,
+                                    };
+                                    let output = if role == Role::Coder && fanout > 1 {
+                                        run_fanout(&ctx, fanout, review, &prompt, &mut artifacts)
+                                            .await
+                                    } else {
+                                        run_task(&ctx, &prompt, &mut artifacts).await
+                                    };
+                                    let in_time =
+                                        deadline.is_none_or(|d| std::time::Instant::now() < d);
+                                    let next = match &output {
+                                        Err(e) if on_remote && in_time => {
+                                            on_remote = false;
+                                            format!(
+                                                "task {id}: {ran_on}: {e}; running it on hipfire"
+                                            )
+                                        }
+                                        Err(e)
+                                            if attempt == 0
+                                                && crate::hipfire::is_retryable(e)
+                                                && in_time =>
+                                        {
+                                            attempt += 1;
+                                            format!("task {id}: {e}; running it once more")
+                                        }
+                                        Err(e) if !escalated && affordable() && in_time => {
+                                            on_remote = true;
+                                            escalated = true;
+                                            let to =
+                                                remote.as_ref().map_or("", |r| r.model.as_str());
+                                            format!("task {id}: {e}; escalating it to {to}")
+                                        }
+                                        _ => break output,
+                                    };
+                                    let _ = events.send(AgentEvent::Error { message: next }).await;
                                 }
-                                _ => break output,
-                            }
-                        }}).await;
+                            })
+                            .await;
                         let usage = calls.usage();
                         turn_usage.lock().unwrap().add(usage);
+                        let remote_usd = remote.as_ref().map(|r| r.cost(calls.remote_usage()));
+                        if let Some(usd) = remote_usd {
+                            *turn_spend.lock().unwrap() += usd;
+                        }
 
                         // One line per execution, before follow-up emission so a task
                         // that fails is still recorded (see `telemetry.rs`).
@@ -679,7 +741,7 @@ impl Daemon {
                             plan: &telemetry_plan,
                             task: id,
                             role: role.as_str(),
-                            model: &model,
+                            model: &ran_on,
                             band: band.as_u8(),
                             fanout: if role == Role::Coder { fanout } else { 1 },
                             prefix_bytes: prefix.len(),
@@ -695,6 +757,7 @@ impl Daemon {
                                 .ok()
                                 .filter(|t| t.ends_with("[stopped: turn budget reached]"))
                                 .map(|_| "turn budget"),
+                            remote_usd: remote_usd.filter(|&usd| usd > 0.0),
                         });
 
                         let emitted = match &output {
@@ -842,6 +905,7 @@ impl Daemon {
                     duration_s: now.saturating_sub(started),
                     planner: planner_calls.usage(),
                     usage: *turn_usage.lock().unwrap(),
+                    remote_usd: *turn_spend.lock().unwrap(),
                 });
                 crate::session::journal_append(&session.repo_root, &record);
                 // `_end` sends TurnComplete as it drops, here or on any earlier exit.
@@ -1050,6 +1114,13 @@ impl Daemon {
     /// [`plan_graph::PlanGraph`] with the subtasks and prepends the prefix to every
     /// subagent prompt (KV reuse), and the reactive scheduler grows the graph as
     /// agents emit follow-up work.
+    /// Route work to `remote` (tests; the daemon reads `CORRODE_OPENAI_*`).
+    #[cfg(test)]
+    fn with_remote(mut self, remote: crate::remote::Remote) -> Self {
+        self.remote = Some(Arc::new(remote));
+        self
+    }
+
     async fn plan(
         &self,
         session: &Session,
@@ -1073,6 +1144,28 @@ impl Daemon {
             effort: Some(crate::roles::effort_for(Role::Orchestration)),
         };
         let plan_prompt = plan_task.prompt.clone();
+        // Plan on the remote when the orchestration role is routed there; any failure
+        // falls back to planning on hipfire as before.
+        if let Some(r) = self
+            .remote
+            .as_ref()
+            .filter(|r| r.routes(Role::Orchestration) && r.affordable(0.0))
+        {
+            match r
+                .client
+                .respond_full(&r.model, &plan_prompt, priority, None, None, None)
+                .await
+            {
+                Ok((text, _, _)) if !planner::parse_plan(&text).is_empty() => {
+                    return Ok((planner::parse_plan(&text), prefix));
+                }
+                Ok(_) => eprintln!(
+                    "planner: {} gave no usable plan; planning on hipfire",
+                    r.model
+                ),
+                Err(e) => eprintln!("planner: {} failed ({e}); planning on hipfire", r.model),
+            }
+        }
         let first = self
             .swarm
             .run(vec![plan_task])
@@ -2759,7 +2852,20 @@ async fn run_task(
     written: &mut Vec<String>,
 ) -> anyhow::Result<String> {
     let (model, id) = (ctx.model, ctx.id);
-    let role_dialect = ctx.dialects.resolve(model);
+    // A remote endpoint parses calls itself and hands back `tool_calls`, whatever the
+    // model's id says: it takes OpenAI-shaped tools and emits its own calls.
+    let remote_dialect;
+    let role_dialect = if ctx.client.is_remote() {
+        remote_dialect = crate::dialect::ToolDialect::new(
+            crate::dialect::SchemaFormat::OpenAiNested,
+            crate::dialect::ParseFormat::JsonArray,
+            HashMap::new(),
+        )
+        .native();
+        &remote_dialect
+    } else {
+        ctx.dialects.resolve(model)
+    };
     if role_dialect.emits_own_calls() {
         let text = match run_native_tool_loop(ctx, role_dialect, task, written).await? {
             NativeOutcome::Answered(text) => return Ok(text),
@@ -2844,7 +2950,7 @@ async fn run_task(
 async fn run_fanout(
     ctx: &TaskCtx<'_>,
     k: usize,
-    review_model: &str,
+    (review_client, review_model): (&Client, &str),
     task: &str,
     written: &mut Vec<String>,
 ) -> anyhow::Result<String> {
@@ -2931,7 +3037,7 @@ async fn run_fanout(
         let judged = if over_context_budget(&judge_prompt, &[], None) {
             Err(too_big_for_context("the fan-out judge's prompt"))
         } else {
-            ctx.client
+            review_client
                 .respond(
                     review_model,
                     &judge_prompt,
@@ -4689,11 +4795,19 @@ mod tests {
     async fn recording_hipfire(
         reply: impl Fn(&serde_json::Value, usize) -> serde_json::Value + Send + Sync + 'static,
     ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
-        use axum::{routing::post, Json, Router};
+        recording_server("/v1/responses", move |b, n| (200, reply(b, n))).await
+    }
+
+    /// Any recording stand-in: `reply` gives the status and body for each request.
+    async fn recording_server(
+        path: &'static str,
+        reply: impl Fn(&serde_json::Value, usize) -> (u16, serde_json::Value) + Send + Sync + 'static,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        use axum::{response::IntoResponse, routing::post, Json, Router};
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let (seen, reply) = (bodies.clone(), Arc::new(reply));
         let app = Router::new().route(
-            "/v1/responses",
+            path,
             post(move |body: Json<serde_json::Value>| {
                 let (seen, reply) = (seen.clone(), reply.clone());
                 async move {
@@ -4702,7 +4816,12 @@ mod tests {
                         b.push(body.0.clone());
                         b.len() - 1
                     };
-                    Json(reply(&body.0, n))
+                    let (status, json) = reply(&body.0, n);
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        Json(json),
+                    )
+                        .into_response()
                 }
             }),
         );
@@ -4991,6 +5110,176 @@ mod tests {
                 "request {k} opens with a different system turn"
             );
         }
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A Chat Completions answer that reports 1000 prompt tokens.
+    fn chat_reply(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": text}}],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 0},
+        })
+    }
+
+    /// Run one Prompt to completion on a daemon with a remote; the turn's
+    /// SubagentOutput texts and Error messages.
+    async fn run_turn_with_remote(
+        local: String,
+        remote: crate::remote::Remote,
+        repo: &std::path::Path,
+    ) -> (Vec<String>, Vec<String>) {
+        let daemon = Arc::new(
+            Daemon::new(
+                Swarm::new(Client::new(local, None), 1),
+                RoleModels::uniform("Qwen3.5-9B--oq4.25++"),
+                None,
+                Arc::new(PassthroughVfs::new(repo)),
+                SkillContext::default(),
+                None,
+                None,
+                repo.to_path_buf(),
+                Project::load(repo),
+                Arc::new(Dialects::default()),
+            )
+            .with_remote(remote),
+        );
+        let (ctx, crx) = mpsc::channel(8);
+        let (etx, mut erx) = mpsc::channel(256);
+        tokio::spawn(Arc::clone(&daemon).run(crx, etx));
+        ctx.send(AgentCommand::Prompt {
+            text: "Do the work.".into(),
+            priority: Priority::Default,
+        })
+        .await
+        .unwrap();
+        let (mut outputs, mut errors) = (Vec::new(), Vec::new());
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), erx.recv())
+                .await
+                .expect("the turn ends within 30s")
+                .expect("daemon alive");
+            match unturn(ev) {
+                AgentEvent::SubagentOutput { text, .. } => outputs.push(text),
+                AgentEvent::Error { message } => errors.push(message),
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+        (outputs, errors)
+    }
+
+    fn mentions(bodies: &Arc<Mutex<Vec<serde_json::Value>>>, needle: &str) -> usize {
+        bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.to_string().contains(needle))
+            .count()
+    }
+
+    // The planner and an opted-in role run on the remote while the turn's budget lasts
+    // (each remote request here costs $0.001 against $0.0025); once it is spent, the
+    // same role runs on hipfire.
+    #[tokio::test]
+    async fn routed_roles_run_remote_until_the_turn_budget_is_spent() {
+        let repo = two_file_repo("remote-route");
+        let (local, local_bodies) = recording_hipfire(|_, _| text_reply("local answer")).await;
+        let (remote_url, remote_bodies) = recording_server("/v1/chat/completions", |body, _| {
+            if body.to_string().contains("You are the orchestrator") {
+                let plan = r#"[{"role": "research", "task": "FIRST"}, {"role": "research", "task": "SECOND", "after": [0]}]"#;
+                (200, chat_reply(plan))
+            } else {
+                (200, chat_reply("remote answer"))
+            }
+        })
+        .await;
+        let remote = crate::remote::Remote::for_test(
+            Client::openai_compatible(&format!("{remote_url}/v1"), None, 4),
+            "remote-model",
+            &[Role::Orchestration, Role::Research],
+            0.0025,
+            1.0,
+        );
+        let (outputs, errors) = run_turn_with_remote(local, remote, &repo).await;
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            outputs.iter().any(|o| o == "remote answer")
+                && outputs.iter().any(|o| o == "local answer")
+        );
+        assert_eq!(
+            mentions(&remote_bodies, "You are the orchestrator"),
+            1,
+            "planned remotely"
+        );
+        assert_eq!(mentions(&local_bodies, "You are the orchestrator"), 0);
+        assert!(mentions(&remote_bodies, "FIRST") > 0, "FIRST ran remote");
+        assert_eq!(
+            mentions(&remote_bodies, "SECOND"),
+            0,
+            "SECOND ran past the budget"
+        );
+        assert!(mentions(&local_bodies, "SECOND") > 0, "...so on hipfire");
+        // The remote never sees hipfire's request shape.
+        assert!(remote_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|b| b.get("metadata").is_none()));
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // A task that fails on hipfire is escalated to the remote once; a routed task the
+    // remote fails falls back to hipfire.
+    #[tokio::test]
+    async fn local_failures_escalate_and_remote_failures_fall_back() {
+        let repo = two_file_repo("remote-escalate");
+        // hipfire refuses DOOMED for good (a 400); everything else answers.
+        let (local, local_bodies) = recording_server("/v1/responses", |body, _| {
+            let s = body.to_string();
+            if s.contains("You are the orchestrator") {
+                (200, text_reply(r#"[{"role": "research", "task": "DOOMED"}]"#))
+            } else if s.contains("DOOMED") && !s.contains("Review the work this plan") {
+                (400, serde_json::json!({"error": {"message": "too long", "code": "context_length_exceeded"}}))
+            } else {
+                (200, text_reply("local review"))
+            }
+        })
+        .await;
+        let (remote_url, remote_bodies) = recording_server("/v1/chat/completions", |body, _| {
+            if body.to_string().contains("Review the work this plan") {
+                (
+                    500,
+                    serde_json::json!({"error": {"message": "remote is down"}}),
+                )
+            } else {
+                (200, chat_reply("remote rescue"))
+            }
+        })
+        .await;
+        let remote = crate::remote::Remote::for_test(
+            Client::openai_compatible(&format!("{remote_url}/v1"), None, 4),
+            "remote-model",
+            &[Role::Review],
+            2.0,
+            0.0,
+        );
+        let (outputs, errors) = run_turn_with_remote(local, remote, &repo).await;
+        assert!(outputs.iter().any(|o| o == "remote rescue"), "{outputs:?}");
+        assert!(outputs.iter().any(|o| o == "local review"), "{outputs:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("escalating it to remote-model")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("running it on hipfire")),
+            "{errors:?}"
+        );
+        assert!(
+            mentions(&remote_bodies, "DOOMED") > 0
+                && mentions(&local_bodies, "Review the work this plan") > 0
+        );
         std::fs::remove_dir_all(&repo).ok();
     }
 }

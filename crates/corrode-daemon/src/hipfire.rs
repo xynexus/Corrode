@@ -25,6 +25,19 @@ pub struct Client {
     /// Stream `/v1/responses` (SSE) so subagent output reaches the UI as it's
     /// generated, not in one block at the end. Off by default (`CORRODE_STREAM`).
     stream: bool,
+    /// Set for an OpenAI-compatible Chat Completions endpoint (see
+    /// [`Self::openai_compatible`]) rather than hipfire.
+    chat: Option<ChatEndpoint>,
+}
+
+/// What differs about an OpenAI-compatible endpoint.
+struct ChatEndpoint {
+    /// Requests in flight at once: the remote's rate cap.
+    inflight: tokio::sync::Semaphore,
+    /// OpenAI's own API takes `max_completion_tokens` (its reasoning models refuse
+    /// `max_tokens`); vLLM, llama.cpp and the hosted GLM/DeepSeek APIs take
+    /// `max_tokens`.
+    max_tokens_field: &'static str,
 }
 
 /// One decoded SSE event from hipfire's `/v1/responses` stream. hipfire tags each
@@ -286,6 +299,9 @@ pub struct CallScope {
     id: String,
     seq: std::sync::atomic::AtomicU64,
     usage: std::sync::Mutex<Usage>,
+    /// The part of `usage` spent on the remote endpoint (`crate::remote`), which is
+    /// what costs money.
+    remote: std::sync::Mutex<Usage>,
 }
 
 impl CallScope {
@@ -294,11 +310,16 @@ impl CallScope {
             id: id.into(),
             seq: Default::default(),
             usage: Default::default(),
+            remote: Default::default(),
         })
     }
 
     pub fn usage(&self) -> Usage {
         *self.usage.lock().unwrap()
+    }
+
+    pub fn remote_usage(&self) -> Usage {
+        *self.remote.lock().unwrap()
     }
 }
 
@@ -316,22 +337,86 @@ fn next_call_id() -> Option<String> {
         .ok()
 }
 
-/// Count one completed request (and its tokens, when the reply reported them).
-fn record_usage(usage: Option<&WireUsage>) {
+/// One completed request, with the tokens its reply reported (zero when it reported
+/// none).
+fn responses_usage(usage: Option<&WireUsage>) -> Usage {
+    let mut u = Usage {
+        requests: 1,
+        ..Default::default()
+    };
+    if let Some(w) = usage {
+        u.input_tokens = w.input_tokens;
+        u.output_tokens = w.output_tokens;
+        u.cached_tokens = w
+            .input_tokens_details
+            .as_ref()
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+    }
+    u
+}
+
+/// A Chat Completions reply's usage. Cached prompt tokens are
+/// `prompt_tokens_details.cached_tokens` (OpenAI, vLLM) or `prompt_cache_hit_tokens`
+/// (DeepSeek).
+fn chat_usage(reply: &serde_json::Value) -> Usage {
+    let u = &reply["usage"];
+    Usage {
+        requests: 1,
+        input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+        output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+        cached_tokens: u["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .or(u["prompt_cache_hit_tokens"].as_u64())
+            .unwrap_or(0),
+    }
+}
+
+/// Add one request's usage to the running scope, if any.
+fn record_usage(u: Usage, remote: bool) {
     let _ = CALLS.try_with(|c| {
-        let mut t = c.usage.lock().unwrap();
-        t.requests += 1;
-        if let Some(u) = usage {
-            t.input_tokens += u.input_tokens;
-            t.output_tokens += u.output_tokens;
-            t.cached_tokens += u
-                .input_tokens_details
-                .as_ref()
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+        c.usage.lock().unwrap().add(u);
+        if remote {
+            c.remote.lock().unwrap().add(u);
         }
     });
+}
+
+/// Fold one Responses-style input item onto a Chat Completions message list. A call
+/// joins the assistant message it was emitted in (or opens one), so one step's calls
+/// share one message, as the model emitted them.
+fn push_chat_message(messages: &mut Vec<serde_json::Value>, item: &serde_json::Value) {
+    match item["type"].as_str() {
+        Some("function_call") => {
+            let call = serde_json::json!({
+                "id": item["call_id"],
+                "type": "function",
+                "function": {"name": item["name"], "arguments": item["arguments"]},
+            });
+            match messages.last_mut() {
+                Some(m) if m["role"] == "assistant" => {
+                    if !m["tool_calls"].is_array() {
+                        m["tool_calls"] = serde_json::json!([]);
+                    }
+                    if let Some(calls) = m["tool_calls"].as_array_mut() {
+                        calls.push(call);
+                    }
+                }
+                _ => messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [call],
+                })),
+            }
+        }
+        Some("function_call_output") => messages.push(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": item["call_id"],
+            "content": item["output"],
+        })),
+        _ => messages.push(serde_json::json!({"role": item["role"], "content": item["content"]})),
+    }
 }
 
 #[derive(Deserialize)]
@@ -490,7 +575,40 @@ impl Client {
             api_key,
             max_output_tokens,
             stream,
+            chat: None,
         }
+    }
+
+    /// A client for any OpenAI-compatible Chat Completions server -- OpenAI, vLLM,
+    /// llama.cpp, a hosted GLM or DeepSeek. `base_url` includes the API version
+    /// (`https://api.openai.com/v1`). The same calls work on it: [`Self::respond_turns`]
+    /// translates its Responses-style turns, and a reply's `tool_calls` are the
+    /// server-parsed calls. hipfire's priority band, owner token and reasoning effort
+    /// are not sent. Never streams.
+    pub fn openai_compatible(base_url: &str, api_key: Option<String>, max_inflight: usize) -> Self {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let max_tokens_field = if base_url.contains("api.openai.com") {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        Self {
+            stream: false,
+            chat: Some(ChatEndpoint {
+                inflight: tokio::sync::Semaphore::new(max_inflight.max(1)),
+                max_tokens_field,
+            }),
+            ..Self::new(base_url, api_key)
+        }
+    }
+
+    /// Whether this is an OpenAI-compatible endpoint rather than hipfire.
+    pub fn is_remote(&self) -> bool {
+        self.chat.is_some()
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// The `/v1/responses` `input` for a prompt. One that carries the shared context
@@ -528,7 +646,12 @@ impl Client {
     /// The models hipfire currently serves (`GET /v1/models`), by id. Role
     /// assignment resolves against this list.
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        let mut rb = self.http.get(format!("{}/v1/models", self.base_url));
+        let path = if self.chat.is_some() {
+            "/models"
+        } else {
+            "/v1/models"
+        };
+        let mut rb = self.http.get(format!("{}{path}", self.base_url));
         if let Some(key) = &self.api_key {
             rb = rb.bearer_auth(key);
         }
@@ -601,6 +724,9 @@ impl Client {
         tools: Option<&serde_json::Value>,
         effort: Option<&str>,
     ) -> anyhow::Result<(String, String, Vec<crate::toolcall::ToolCall>)> {
+        if let Some(chat) = &self.chat {
+            return self.chat_turns(chat, model, prompt, turns, tools).await;
+        }
         let mut input = self.input_items(prompt);
         if !turns.is_empty() {
             if let serde_json::Value::String(text) = &input {
@@ -620,6 +746,7 @@ impl Client {
         };
         let body = serde_json::to_value(&req)?;
         let reply = self.post_responses(&body, owner_token).await?;
+        record_usage(responses_usage(reply.usage.as_ref()), false);
         let reasoning = reply.reasoning().to_string();
         if reply.status == "incomplete" {
             let reason = reply
@@ -654,15 +781,29 @@ impl Client {
         body: &serde_json::Value,
         owner_token: Option<&str>,
     ) -> anyhow::Result<ResponsesReply> {
+        let url = format!("{}/v1/responses", self.base_url);
+        self.post(&url, body, owner_token.or(self.api_key.as_deref()))
+            .await
+    }
+
+    /// POST a JSON body, with the retry policy above.
+    async fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        bearer: Option<&str>,
+    ) -> anyhow::Result<T> {
+        let server = if self.chat.is_some() {
+            "remote endpoint"
+        } else {
+            "hipfire"
+        };
         let started = std::time::Instant::now();
         let window = retry_window();
         let mut attempt = 0u32;
         loop {
-            let mut rb = self
-                .http
-                .post(format!("{}/v1/responses", self.base_url))
-                .json(body);
-            if let Some(token) = owner_token.or(self.api_key.as_deref()) {
+            let mut rb = self.http.post(url).json(body);
+            if let Some(token) = bearer {
                 rb = rb.bearer_auth(token);
             }
             if let Some(id) = next_call_id() {
@@ -670,9 +811,7 @@ impl Client {
             }
             let (failure, retry_after) = match rb.send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    let reply: ResponsesReply = resp.json().await?;
-                    record_usage(reply.usage.as_ref());
-                    return Ok(reply);
+                    return Ok(resp.json().await?);
                 }
                 Ok(resp) => {
                     let status = resp.status();
@@ -685,7 +824,7 @@ impl Client {
                     if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
                         return Err(Rejected { status: status.as_u16(), code, message }.into());
                     }
-                    let err = anyhow::anyhow!("hipfire {status}: {message}");
+                    let err = anyhow::anyhow!("{server} {status}: {message}");
                     if !is_transient(status) {
                         return Err(err);
                     }
@@ -702,14 +841,79 @@ impl Client {
             let wait = retry_delay(attempt, retry_after);
             if started.elapsed() + wait > window {
                 return Err(failure.context(format!(
-                    "hipfire still unavailable after retrying for {}s (CORRODE_RETRY_WINDOW_S)",
+                    "{server} still unavailable after retrying for {}s (CORRODE_RETRY_WINDOW_S)",
                     started.elapsed().as_secs()
                 )));
             }
-            eprintln!("hipfire: {failure}; retrying in {:.1}s", wait.as_secs_f32());
+            eprintln!(
+                "{server}: {failure}; retrying in {:.1}s",
+                wait.as_secs_f32()
+            );
             tokio::time::sleep(wait).await;
             attempt += 1;
         }
+    }
+
+    /// [`Self::respond_turns`] on a Chat Completions endpoint. The prompt's system and
+    /// user turns become messages; each step's assistant text and the calls made in it
+    /// become one assistant message with `tool_calls`, each result a `tool` message.
+    async fn chat_turns(
+        &self,
+        chat: &ChatEndpoint,
+        model: &str,
+        prompt: &str,
+        turns: &[serde_json::Value],
+        tools: Option<&serde_json::Value>,
+    ) -> anyhow::Result<(String, String, Vec<crate::toolcall::ToolCall>)> {
+        let mut messages = match self.input_items(prompt) {
+            serde_json::Value::Array(items) => items,
+            text => vec![serde_json::json!({"role": "user", "content": text})],
+        };
+        for item in turns {
+            push_chat_message(&mut messages, item);
+        }
+        let mut body = serde_json::json!({"model": model, "messages": messages});
+        body[chat.max_tokens_field] = serde_json::json!(self.max_output_tokens);
+        if let Some(tools) = tools {
+            body["tools"] = tools.clone();
+        }
+        let _permit = chat.inflight.acquire().await?;
+        let url = format!("{}/chat/completions", self.base_url);
+        let reply: serde_json::Value = self.post(&url, &body, self.api_key.as_deref()).await?;
+        record_usage(chat_usage(&reply), true);
+        let choice = &reply["choices"][0];
+        let message = &choice["message"];
+        let text = message["content"].as_str().unwrap_or_default().to_string();
+        // vLLM and DeepSeek surface thinking as `reasoning_content`, some servers as
+        // `reasoning`.
+        let reasoning = message["reasoning_content"]
+            .as_str()
+            .or(message["reasoning"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        if choice["finish_reason"] == "length" {
+            let partial = answer_or_reasoning(text, &reasoning);
+            return Err(Truncated {
+                partial,
+                reason: "length".into(),
+            }
+            .into());
+        }
+        let calls = message["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                Some(crate::toolcall::ToolCall {
+                    name: c["function"]["name"].as_str()?.to_string(),
+                    arguments: c["function"]["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str(a).ok())
+                        .unwrap_or_else(|| serde_json::json!({})),
+                })
+            })
+            .collect();
+        Ok((answer_or_reasoning(text, &reasoning), reasoning, calls))
     }
 
     /// Like [`Self::respond`], but streams: `on_delta` is called with each incremental
@@ -756,7 +960,7 @@ impl Client {
         }
         // ponytail: counts the request only; read usage from `response.completed` if
         // streamed runs need their tokens too.
-        record_usage(None);
+        record_usage(responses_usage(None), false);
         let resp = rb.send().await?.error_for_status()?;
 
         let mut text = String::new();
@@ -1095,6 +1299,131 @@ mod tests {
             scope.usage(),
             Usage { requests: 2, input_tokens: 200, output_tokens: 14, cached_tokens: 128 }
         );
+    }
+
+    // An OpenAI-compatible endpoint gets Chat Completions: the prefix as a system
+    // message, a step's text and calls as ONE assistant message with `tool_calls`, each
+    // result a `tool` message, OpenAI-shaped tools, and the max-tokens field the server
+    // takes. Its `tool_calls` come back as calls, its usage counts as remote, and a
+    // `length` finish is a truncation.
+    #[tokio::test]
+    async fn an_openai_compatible_endpoint_speaks_chat_completions() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let seen = bodies.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    let n = {
+                        let mut b = seen.lock().unwrap();
+                        b.push(body.0);
+                        b.len()
+                    };
+                    Json(if n == 1 {
+                        serde_json::json!({
+                            "choices": [{"finish_reason": "tool_calls", "message": {"role": "assistant", "content": null,
+                                "tool_calls": [{"id": "x", "type": "function",
+                                    "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"}}]}}],
+                            "usage": {"prompt_tokens": 120, "completion_tokens": 9, "prompt_tokens_details": {"cached_tokens": 100}},
+                        })
+                    } else {
+                        serde_json::json!({
+                            "choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "cut"}}],
+                            "usage": {"prompt_tokens": 130, "completion_tokens": 50, "prompt_cache_hit_tokens": 120},
+                        })
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::openai_compatible(&url, Some("k".into()), 2);
+        assert!(client.is_remote() && !client.streaming());
+
+        let prompt = format!("repo context{PREFIX_END}read the files");
+        let turns = vec![
+            serde_json::json!({"type": "message", "role": "assistant", "content": "Reading both."}),
+            serde_json::json!({"type": "function_call", "call_id": "c0", "name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}),
+            serde_json::json!({"type": "function_call", "call_id": "c1", "name": "list_dir", "arguments": "{\"path\":\".\"}"}),
+            serde_json::json!({"type": "function_call_output", "call_id": "c0", "output": "alpha"}),
+            serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "a.txt b.txt"}),
+        ];
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]);
+        let scope = CallScope::new("p/1");
+        let (first, second) = CALLS
+            .scope(scope.clone(), async {
+                let first = client
+                    .respond_turns(
+                        "m",
+                        &prompt,
+                        &turns,
+                        Priority::Default,
+                        Some("owner"),
+                        Some(&tools),
+                        Some("none"),
+                    )
+                    .await;
+                let second = client
+                    .respond_turns("m", &prompt, &[], Priority::Default, None, None, None)
+                    .await;
+                (first, second)
+            })
+            .await;
+        let (_, _, calls) = first.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            (calls[0].name.as_str(), &calls[0].arguments["path"]),
+            ("read_file", &serde_json::json!("b.txt"))
+        );
+        let err = second.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<Truncated>().expect("typed").partial,
+            "cut"
+        );
+
+        let body = bodies.lock().unwrap()[0].clone();
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            ["system", "user", "assistant", "tool", "tool"],
+            "{body}"
+        );
+        let assistant = &body["messages"][2];
+        assert_eq!(assistant["content"], "Reading both.");
+        assert_eq!(
+            assistant["tool_calls"].as_array().unwrap().len(),
+            2,
+            "both calls in one turn"
+        );
+        assert_eq!(body["messages"][4]["tool_call_id"], "c1");
+        assert_eq!(body["tools"], tools);
+        assert_eq!(
+            body["max_tokens"],
+            max_output_tokens(),
+            "not api.openai.com: max_tokens"
+        );
+        for hipfire_only in ["metadata", "reasoning_effort", "input"] {
+            assert!(
+                body.get(hipfire_only).is_none(),
+                "{hipfire_only} sent: {body}"
+            );
+        }
+        let both = Usage {
+            requests: 2,
+            input_tokens: 250,
+            output_tokens: 59,
+            cached_tokens: 220,
+        };
+        assert_eq!((scope.usage(), scope.remote_usage()), (both, both));
     }
 
     // A prompt that cannot fit is refused once, typed, and never retried; a 503

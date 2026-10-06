@@ -143,7 +143,16 @@ also denied at once if the client disconnects), `CORRODE_AUTO_APPROVE` (auto-app
 a human — for unattended/headless swarms that would otherwise fail closed; off unless
 set on, and meant to be paired with `CORRODE_SANDBOX` so writes/commands stay
 confined — the daemon and `doctor` warn when it is not; each auto-approval is logged and the call still streams back as a
-`ToolResult`), `CORRODE_USERS` (path to a JSON `user -> {token, hipfire_token?}` table; present =
+`ToolResult`), `CORRODE_OPENAI_MODEL` (turns on a second backend: any OpenAI-compatible Chat
+Completions server — OpenAI, vLLM, llama.cpp, hosted GLM/DeepSeek — see `remote.rs`; no
+default model), `CORRODE_OPENAI_BASE_URL` (default `https://api.openai.com/v1`),
+`CORRODE_OPENAI_API_KEY` (else `OPENAI_API_KEY`; optional for a local server),
+`CORRODE_OPENAI_ROLES` (comma-separated roles that run there first, falling back to
+hipfire on failure; any other task that fails on hipfire escalates there once),
+`CORRODE_OPENAI_BUDGET_USD` (per-turn spend cap, default 2; past it everything stays on
+hipfire), `CORRODE_OPENAI_PRICE_IN`/`_OUT` (USD per 1M tokens; unset = unpriced, the cap
+cannot bind), `CORRODE_OPENAI_MAX_INFLIGHT` (concurrent remote requests, default 4),
+`CORRODE_USERS` (path to a JSON `user -> {token, hipfire_token?}` table; present =
 auth on, connections must `Authenticate` before repo-scoped commands, and each
 user's `hipfire_token` — if set — attributes their swarm to a distinct hipfire
 principal for per-user fairness; absent = auth off, connections anonymous; set but

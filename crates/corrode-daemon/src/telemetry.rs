@@ -51,6 +51,9 @@ pub struct TaskRecord<'a> {
     /// budget stop does not read like a clean finish.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<&'a str>,
+    /// What the task spent on the remote endpoint (`remote.rs`), when it spent any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_usd: Option<f64>,
 }
 
 /// One line per Prompt turn, written as it ends: with the task rows, enough to
@@ -69,6 +72,8 @@ pub struct TurnRecord<'a> {
     pub planner: crate::hipfire::Usage,
     /// Every task's calls, summed.
     pub usage: crate::hipfire::Usage,
+    /// Spent on the remote endpoint, the planner included.
+    pub remote_usd: f64,
 }
 
 /// Append-only sink. `None` path = disabled, and every method is then a no-op.
@@ -159,6 +164,7 @@ mod tests {
                 cached_tokens: 8100,
             },
             stop: None,
+            remote_usd: None,
         }
     }
 
@@ -213,12 +219,18 @@ mod tests {
             duration_s: 100,
             planner: Default::default(),
             usage: rec("", true).usage,
+            remote_usd: 0.25,
         });
         let body = std::fs::read_to_string(&path).unwrap();
         let turn: serde_json::Value = serde_json::from_str(body.lines().nth(2).unwrap()).unwrap();
         assert_eq!(turn["kind"], "turn");
         assert_eq!(turn["usage"]["input_tokens"], 9000);
         assert_eq!(turn["planner"]["requests"], 0);
+        assert_eq!(turn["remote_usd"], 0.25);
+        assert!(
+            first.get("remote_usd").is_none(),
+            "no remote spend, no key: {first}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
