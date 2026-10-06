@@ -90,7 +90,11 @@ least-irrelevant matches), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -
 `CORRODE_NEEDLE_MODEL_ID` (dialect key for the Needle caller, default `needle`),
 `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
 `CORRODE_WEB_ADDR` (web bind, default `0.0.0.0:8787`), `CORRODE_DAEMON_URL`
-(daemon ws the web proxies to), `CORRODE_TELEMETRY` (path to a JSONL
+(daemon ws the web proxies to), `CORRODE_WEB_ORIGINS` (comma-separated page origins,
+`scheme://host:port`, also allowed to open `/agent` -- by default only a page served
+from the same host:port the request names, or a client sending no `Origin`, may: other
+sites are refused 403, so a page the user visits cannot drive the swarm through their
+browser), `CORRODE_TELEMETRY` (path to a JSONL
 file recording one line per subagent execution — role, model, band, prefix/tail bytes,
 duration, artifacts, ok/error, requests and input/output/cached tokens — plus one
 `"kind":"turn"` line per Prompt turn with its status and the planner's and tasks' usage;
