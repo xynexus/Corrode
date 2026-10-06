@@ -138,6 +138,7 @@ excerpts don't contain the answer, say so plainly.\n\n",
     );
     s.push_str("Excerpts:\n");
     for (id, text) in chunks {
+        let text = crate::tools::neutralize(text);
         s.push_str(&format!("[{id}]\n{text}\n\n"));
     }
     s.push_str(&format!("Question: {question}\n\nAnswer:"));
