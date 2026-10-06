@@ -248,8 +248,96 @@ struct ResponsesRequest<'a> {
     reasoning_effort: Option<&'a str>,
 }
 
+/// What a run of calls cost: requests sent and tokens, from each reply's `usage`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct Usage {
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Prompt tokens a cached prefix covered: whether prefix reuse, the swarm's
+    /// central performance assumption, is actually happening.
+    pub cached_tokens: u64,
+}
+
+impl Usage {
+    pub fn add(&mut self, other: Usage) {
+        self.requests += other.requests;
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cached_tokens += other.cached_tokens;
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct WireUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: Option<serde_json::Value>,
+}
+
+/// The calls one unit of work (a task, the planner) makes, while it runs: the id they
+/// carry to hipfire (`X-Request-Id: <id>/<n>`, which hipfire echoes and names its
+/// session and log lines after) and what they cost. A task-local, so the tool loops
+/// need no extra plumbing: the client fills it in whenever it is set.
+pub struct CallScope {
+    id: String,
+    seq: std::sync::atomic::AtomicU64,
+    usage: std::sync::Mutex<Usage>,
+}
+
+impl CallScope {
+    pub fn new(id: impl Into<String>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            id: id.into(),
+            seq: Default::default(),
+            usage: Default::default(),
+        })
+    }
+
+    pub fn usage(&self) -> Usage {
+        *self.usage.lock().unwrap()
+    }
+}
+
+tokio::task_local! {
+    pub static CALLS: std::sync::Arc<CallScope>;
+}
+
+/// The next request id of the running scope, if one is set.
+fn next_call_id() -> Option<String> {
+    CALLS
+        .try_with(|c| {
+            let n = c.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("{}/{n}", c.id)
+        })
+        .ok()
+}
+
+/// Count one completed request (and its tokens, when the reply reported them).
+fn record_usage(usage: Option<&WireUsage>) {
+    let _ = CALLS.try_with(|c| {
+        let mut t = c.usage.lock().unwrap();
+        t.requests += 1;
+        if let Some(u) = usage {
+            t.input_tokens += u.input_tokens;
+            t.output_tokens += u.output_tokens;
+            t.cached_tokens += u
+                .input_tokens_details
+                .as_ref()
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+        }
+    });
+}
+
 #[derive(Deserialize)]
 pub struct ResponsesReply {
+    #[serde(default)]
+    pub usage: Option<WireUsage>,
     /// `completed`, or `incomplete` when hipfire cut the reply off (see [`Truncated`]).
     #[serde(default)]
     pub status: String,
@@ -577,8 +665,15 @@ impl Client {
             if let Some(token) = owner_token.or(self.api_key.as_deref()) {
                 rb = rb.bearer_auth(token);
             }
+            if let Some(id) = next_call_id() {
+                rb = rb.header("x-request-id", id);
+            }
             let (failure, retry_after) = match rb.send().await {
-                Ok(resp) if resp.status().is_success() => return Ok(resp.json().await?),
+                Ok(resp) if resp.status().is_success() => {
+                    let reply: ResponsesReply = resp.json().await?;
+                    record_usage(reply.usage.as_ref());
+                    return Ok(reply);
+                }
                 Ok(resp) => {
                     let status = resp.status();
                     let retry_after = resp
@@ -656,6 +751,12 @@ impl Client {
         if let Some(token) = owner_token.or(self.api_key.as_deref()) {
             rb = rb.bearer_auth(token);
         }
+        if let Some(id) = next_call_id() {
+            rb = rb.header("x-request-id", id);
+        }
+        // ponytail: counts the request only; read usage from `response.completed` if
+        // streamed runs need their tokens too.
+        record_usage(None);
         let resp = rb.send().await?.error_for_status()?;
 
         let mut text = String::new();
@@ -949,6 +1050,51 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), n)
+    }
+
+    // Calls made inside a scope carry `<scope>/<n>` as X-Request-Id and add their
+    // reply's usage to it; a call outside any scope sends no id and counts nowhere.
+    #[tokio::test]
+    async fn a_call_scope_names_each_request_and_sums_its_usage() {
+        use axum::{http::HeaderMap, routing::post, Router};
+        use std::sync::{Arc, Mutex};
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let seen = ids.clone();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |h: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    let id = h.get("x-request-id").map(|v| v.to_str().unwrap().to_string());
+                    seen.lock().unwrap().push(id);
+                    r#"{"status":"completed","output_text":"ok","output":[],
+                        "usage":{"input_tokens":100,"output_tokens":7,"input_tokens_details":{"cached_tokens":64}}}"#
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(url, None);
+
+        let scope = CallScope::new("plan-3/7");
+        CALLS
+            .scope(scope.clone(), async {
+                for _ in 0..2 {
+                    client.respond("m", "p", Priority::Default, None, None).await.unwrap();
+                }
+            })
+            .await;
+        client.respond("m", "p", Priority::Default, None, None).await.unwrap();
+
+        assert_eq!(
+            *ids.lock().unwrap(),
+            [Some("plan-3/7/0".to_string()), Some("plan-3/7/1".to_string()), None]
+        );
+        assert_eq!(
+            scope.usage(),
+            Usage { requests: 2, input_tokens: 200, output_tokens: 14, cached_tokens: 128 }
+        );
     }
 
     // A prompt that cannot fit is refused once, typed, and never retried; a 503

@@ -494,8 +494,12 @@ impl Daemon {
                     cancel: Some(cancel_rx),
                     ..Default::default()
                 };
+                let planner_calls = crate::hipfire::CallScope::new(format!("{plan_id}/plan"));
                 let planned = bounds
-                    .run(self.plan(session, &text, priority))
+                    .run(crate::hipfire::CALLS.scope(
+                        Arc::clone(&planner_calls),
+                        self.plan(session, &text, priority),
+                    ))
                     .await
                     .unwrap_or_else(|| {
                         Err(anyhow::anyhow!(
@@ -510,6 +514,17 @@ impl Daemon {
                                 message: format!("planning failed: {e}"),
                             })
                             .await;
+                        let now = crate::telemetry::now_secs();
+                        self.telemetry.record_turn(&crate::telemetry::TurnRecord {
+                            at: now,
+                            plan: &plan_id,
+                            status: "planning failed",
+                            tasks: 0,
+                            failed: 0,
+                            duration_s: now.saturating_sub(started),
+                            planner: planner_calls.usage(),
+                            usage: Default::default(),
+                        });
                         let mut record = journal_record(session, &plan_id, &text, started, "planning failed");
                         record["error"] = serde_json::json!(e.to_string());
                         crate::session::journal_append(&session.repo_root, &record);
@@ -541,6 +556,7 @@ impl Daemon {
                 // re-executing, and each launching task's tail carries a digest of
                 // what the swarm already did.
                 let turn_seen = Arc::new(std::sync::Mutex::new(SeenCalls::default()));
+                let turn_usage = Arc::new(std::sync::Mutex::new(crate::hipfire::Usage::default()));
                 // Cap concurrent generations: a wide plan otherwise fires every ready
                 // task's request at once, and a memory-tight or fragile backend can
                 // CRASH (not just shed) under that burst — observed with a DeltaNet
@@ -581,6 +597,7 @@ impl Daemon {
                     // The swarm-knowledge digest rides the divergent tail — the
                     // shared prefix stays byte-identical (KV reuse).
                     let seen = Arc::clone(&turn_seen);
+                    let turn_usage = Arc::clone(&turn_usage);
                     let plan_for_task = plan_id.clone();
                     let prompt = match seen.lock().unwrap().digest(TURN_DIGEST_LINES) {
                         Some(d) => format!("{}\n\n{d}", task.prompt),
@@ -602,7 +619,8 @@ impl Daemon {
                         // unschedulable. Not a rejected request, a cut-off reply or a
                         // timed-out call: those would only fail again.
                         let mut attempt = 0;
-                        let output = loop {
+                        let calls = crate::hipfire::CallScope::new(format!("{plan_for_task}/{id}"));
+                        let output = crate::hipfire::CALLS.scope(Arc::clone(&calls), async { loop {
                             let toolbox = ToolBox::new(vfs.clone(), root.clone(), skill_scripts.clone())
                                 .with_sandbox(sandbox.clone())
                                 .with_graph(graph.clone())
@@ -666,7 +684,9 @@ impl Daemon {
                                 }
                                 _ => break output,
                             }
-                        };
+                        }}).await;
+                        let usage = calls.usage();
+                        turn_usage.lock().unwrap().add(usage);
 
                         // One line per execution, before follow-up emission so a task
                         // that fails is still recorded (see `telemetry.rs`).
@@ -685,6 +705,12 @@ impl Daemon {
                             artifacts: artifacts.len(),
                             ok: output.is_ok(),
                             error: output.as_ref().err().map(|e| e.to_string()),
+                            usage,
+                            stop: output
+                                .as_ref()
+                                .ok()
+                                .filter(|t| t.ends_with("[stopped: turn budget reached]"))
+                                .map(|_| "turn budget"),
                         });
 
                         let emitted = match &output {
@@ -818,6 +844,21 @@ impl Daemon {
                 };
                 let mut record = journal_record(session, &plan_id, &text, started, status);
                 record["tasks"] = graph.journal_tasks(JOURNAL_OUTPUT_CAP);
+                let tasks = record["tasks"].as_array().map_or(0, Vec::len);
+                let failed = record["tasks"]
+                    .as_array()
+                    .map_or(0, |t| t.iter().filter(|t| t["status"] != "Done").count());
+                let now = crate::telemetry::now_secs();
+                self.telemetry.record_turn(&crate::telemetry::TurnRecord {
+                    at: now,
+                    plan: &plan_id,
+                    status,
+                    tasks,
+                    failed,
+                    duration_s: now.saturating_sub(started),
+                    planner: planner_calls.usage(),
+                    usage: *turn_usage.lock().unwrap(),
+                });
                 crate::session::journal_append(&session.repo_root, &record);
                 // `_end` sends TurnComplete as it drops, here or on any earlier exit.
             }

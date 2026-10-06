@@ -44,6 +44,31 @@ pub struct TaskRecord<'a> {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Requests and tokens the task's calls cost (retries included).
+    #[serde(flatten)]
+    pub usage: crate::hipfire::Usage,
+    /// How an `ok` task ended when it was not a plain answer (`turn budget`), so a
+    /// budget stop does not read like a clean finish.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<&'a str>,
+}
+
+/// One line per Prompt turn, written as it ends: with the task rows, enough to
+/// reconstruct an unattended run -- how it ended, what it cost, how much prefix reuse
+/// it got. Tagged `"kind":"turn"` to tell it from the task rows.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename = "turn")]
+pub struct TurnRecord<'a> {
+    pub at: u64,
+    pub plan: &'a str,
+    pub status: &'a str,
+    pub tasks: usize,
+    pub failed: usize,
+    pub duration_s: u64,
+    /// The planner's calls.
+    pub planner: crate::hipfire::Usage,
+    /// Every task's calls, summed.
+    pub usage: crate::hipfire::Usage,
 }
 
 /// Append-only sink. `None` path = disabled, and every method is then a no-op.
@@ -67,10 +92,18 @@ impl Telemetry {
         self.path.is_some()
     }
 
+    pub fn record_turn(&self, rec: &TurnRecord<'_>) {
+        self.append(rec);
+    }
+
+    pub fn record(&self, rec: &TaskRecord<'_>) {
+        self.append(rec);
+    }
+
     /// Append one record. Silently does nothing when disabled, and swallows IO and
     /// serialization errors — losing a telemetry line is always preferable to failing
     /// the work it describes.
-    pub fn record(&self, rec: &TaskRecord<'_>) {
+    fn append(&self, rec: &impl Serialize) {
         let Some(path) = &self.path else {
             return;
         };
@@ -119,6 +152,13 @@ mod tests {
             artifacts: 2,
             ok,
             error: (!ok).then(|| "boom".to_string()),
+            usage: crate::hipfire::Usage {
+                requests: 3,
+                input_tokens: 9000,
+                output_tokens: 400,
+                cached_tokens: 8100,
+            },
+            stop: None,
         }
     }
 
@@ -154,9 +194,31 @@ mod tests {
         // finds exactly the failures.
         assert!(first.get("error").is_none(), "{first}");
 
+        // Usage sits flat on the row, so `jq '.cached_tokens / .input_tokens'` works.
+        assert_eq!(first["requests"], 3);
+        assert_eq!(first["cached_tokens"], 8100);
+        assert!(first.get("stop").is_none(), "{first}");
+
         let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(second["ok"], false);
         assert_eq!(second["error"], "boom");
+
+        // A turn row is tagged, so it can be told from the task rows.
+        t.record_turn(&TurnRecord {
+            at: 1_700_000_100,
+            plan: "stitch/plan-1",
+            status: "complete",
+            tasks: 2,
+            failed: 1,
+            duration_s: 100,
+            planner: Default::default(),
+            usage: rec("", true).usage,
+        });
+        let body = std::fs::read_to_string(&path).unwrap();
+        let turn: serde_json::Value = serde_json::from_str(body.lines().nth(2).unwrap()).unwrap();
+        assert_eq!(turn["kind"], "turn");
+        assert_eq!(turn["usage"]["input_tokens"], 9000);
+        assert_eq!(turn["planner"]["requests"], 0);
 
         std::fs::remove_dir_all(&dir).ok();
     }
