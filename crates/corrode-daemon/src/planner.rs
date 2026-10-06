@@ -247,12 +247,28 @@ pub fn parse_plan(text: &str) -> Vec<PlannedSubtask> {
         after.dedup();
         kept.push(Some(plan.len()));
         plan.push(PlannedSubtask {
-            role: Role::from_str(&r.role).unwrap_or(Role::Coder),
+            // The planner is the orchestration role; a subtask that names it
+            // would run at its Realtime band, ahead of everything. Its work is
+            // design work: the architect's.
+            role: match Role::from_str(&r.role) {
+                Some(Role::Orchestration) => Role::Architect,
+                role => role.unwrap_or(Role::Coder),
+            },
             prompt: r.task,
             after,
         });
     }
     plan
+}
+
+/// The band a task runs at: its role's, raised to `Default` when other tasks
+/// wait on it. Research a dependent needs is on the plan's critical path; at
+/// `Opportunistic` it queued behind every speculative request of its band.
+pub fn band_for_task(role: Role, blocks_others: bool) -> Priority {
+    match band_for(role) {
+        Priority::Opportunistic if blocks_others => Priority::Default,
+        band => band,
+    }
 }
 
 /// Default priority band for a subagent role.
@@ -328,6 +344,13 @@ mod tests {
         // bands come from the role: build work Default, research fills idle GPU.
         assert_eq!(band_for(Role::Coder), Priority::Default);
         assert_eq!(band_for(Role::Research), Priority::Opportunistic);
+        // Research another task waits on is not speculative.
+        assert_eq!(band_for_task(Role::Research, true), Priority::Default);
+        assert_eq!(band_for_task(Role::Research, false), Priority::Opportunistic);
+        assert_eq!(band_for_task(Role::Coder, true), Priority::Default);
+        // A subtask naming the planner's own role would run at Realtime.
+        let plan = parse_plan(r#"[{"role":"orchestration","task":"lay out the modules"}]"#);
+        assert_eq!(plan[0].role, Role::Architect);
     }
 
     #[test]

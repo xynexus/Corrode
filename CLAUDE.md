@@ -470,11 +470,17 @@ Load-bearing, not stylistic. Read `~/hipfire/crates/hipfire-scheduler/src/lib.rs
 before changing swarm behavior.
 
 1. **Priority is the only steering wheel.** Scheduler is banded u8 (0 realtime /
-   64 default / 255 opportunistic), continuous batching with aging
-   (anti-starvation). The swarm expresses intent by *band*, never by throttling
-   locally. Speculative subagents go Opportunistic (idle GPU only). Bands are
-   pinned to hipfire's `SCHED_PRIORITY_*`; `priority_bands_match_hipfire` guards it.
-2. **Shared prompt prefix = shared KV cache** (`sessions_compatible_for_prefill`).
+   64 default / 255 opportunistic), continuous batching. The scheduler's own aging
+   is off; the batch runner's is what there is: work that has waited past
+   `HIPFIRE_SERVER_AGING_MS` (60 s) is admitted into a running cycle and runs before
+   a parked batch resumes. A cycle parks only for a strictly more urgent waiter, so
+   equal-band work queues. The swarm expresses intent by *band*, never by throttling
+   locally. Speculative subagents go Opportunistic (idle GPU only); a task another
+   task waits on runs at least Default (`planner::band_for_task`). Bands are pinned
+   to hipfire's `SCHED_PRIORITY_*`; `priority_bands_match_hipfire` guards it.
+2. **Shared prompt prefix = shared KV cache.** hipfire's batch runner checkpoints
+   prompt prefixes at chat-turn boundaries and forks them for later requests that
+   share them (its `PrefixIndex`).
    Build subagent prompts as `[common repo/context prefix] + [short task tail]` so
    a wide fan-out collapses into one batched, prefix-shared run.
 3. **Admission control is the daemon's**, against a VRAM/memory budget with

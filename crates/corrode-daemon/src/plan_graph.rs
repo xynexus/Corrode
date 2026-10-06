@@ -51,6 +51,9 @@ pub struct PlanTask {
     pub prompt: String,
     /// Tasks that must be `Done` before this one may run.
     pub deps: Vec<TaskId>,
+    /// Set when it launches: a pending task depends on it, so it is on the
+    /// plan's critical path (`planner::band_for_task`).
+    pub blocks_others: bool,
 }
 
 /// A new task a running task emits — a contract or a spun-off line of work.
@@ -186,6 +189,7 @@ impl PlanGraph {
                 role,
                 prompt: prompt.into(),
                 deps,
+                blocks_others: false,
             },
             status: Status::Pending,
             emitted_by: None,
@@ -382,7 +386,12 @@ impl PlanGraph {
                         .iter()
                         .all(|d| self.status(*d) == Some(&Status::Done))
             })
-            .map(|n| n.task.clone())
+            .map(|n| PlanTask {
+                blocks_others: self.nodes.iter().any(|m| {
+                    m.status == Status::Pending && m.task.deps.contains(&n.task.id)
+                }),
+                ..n.task.clone()
+            })
             .collect()
     }
 
@@ -700,6 +709,20 @@ pub fn role_from_tool_calls(calls: &[ToolCall]) -> Option<Role> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A task another pending task depends on launches marked as on the critical
+    // path; one nothing waits on does not.
+    #[test]
+    fn a_task_others_wait_on_launches_marked_blocking() {
+        let mut g = PlanGraph::new("plan-b");
+        let a = g.add(Role::Research, "survey", vec![]);
+        let _b = g.add(Role::Coder, "build on the survey", vec![a]);
+        let c = g.add(Role::Research, "side question", vec![]);
+        let ready = g.ready();
+        let blocks = |id| ready.iter().find(|t| t.id == id).unwrap().blocks_others;
+        assert!(blocks(a));
+        assert!(!blocks(c));
+    }
     use std::sync::{Arc, Mutex};
 
     #[test]

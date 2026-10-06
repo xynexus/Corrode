@@ -600,7 +600,7 @@ impl Daemon {
                         .unwrap_or_default()
                         .to_string();
                     let review_model = review_model.clone();
-                    let band = planner::band_for(task.role);
+                    let band = planner::band_for_task(task.role, task.blocks_others);
                     let prefix = prefix.clone();
                     let events = events.clone();
                     let tool_caller = self.tool_caller.clone();
