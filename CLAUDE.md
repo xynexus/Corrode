@@ -92,7 +92,10 @@ least-irrelevant matches), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -
 `CORRODE_WEB_ADDR` (web bind, default `0.0.0.0:8787`), `CORRODE_DAEMON_URL`
 (daemon ws the web proxies to), `CORRODE_TELEMETRY` (path to a JSONL
 file recording one line per subagent execution — role, model, band, prefix/tail bytes,
-duration, artifacts, ok/error; absent -> disabled), `CORRODE_MAX_FOLLOWUPS` (emitted follow-up tasks folded in per drive, default 3;
+duration, artifacts, ok/error, requests and input/output/cached tokens — plus one
+`"kind":"turn"` line per Prompt turn with its status and the planner's and tasks' usage;
+absent -> disabled. Every hipfire call carries `X-Request-Id: <plan>/<task|plan>/<n>`,
+which hipfire names its session and response after), `CORRODE_MAX_FOLLOWUPS` (emitted follow-up tasks folded in per drive, default 3;
 the plan-review round is its own drive; past it emissions are dropped and logged), `CORRODE_MAX_TOOL_STEPS` (tool calls a task may make before it must answer, default 16;
 a note on the tool result warns at 3 left; when spent, one more generation asks for the final answer
 — tools still declared, none run), `CORRODE_MAX_TOKENS` (per-call output cap,
