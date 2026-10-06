@@ -28,12 +28,30 @@ pub struct Client {
     /// Set for an OpenAI-compatible Chat Completions endpoint (see
     /// [`Self::openai_compatible`]) rather than hipfire.
     chat: Option<ChatEndpoint>,
+    /// Generations in flight at once, daemon-wide: a permit is held for one request
+    /// (and its streamed reply), never across a task's tool calls. It used to be one
+    /// semaphore per turn, held for a whole task -- through approval waits and
+    /// commands that generate nothing -- so a turn's cap counted idle tasks and two
+    /// turns doubled it. hipfire: `CORRODE_MAX_CONCURRENCY`; a remote endpoint: its
+    /// own `max_inflight`.
+    inflight: tokio::sync::Semaphore,
+}
+
+/// `CORRODE_MAX_CONCURRENCY`: cap on generations in flight at once. Default 1024
+/// (effectively unlimited -- hipfire's own admission control is the real bound). Set a
+/// small N to serialize on a backend that crashes under a concurrent burst (observed: a
+/// DeltaNet model on a 30 GiB APU). A parsed 0 is treated as 1 (never a zero-permit
+/// deadlock).
+pub(crate) fn max_concurrency() -> usize {
+    std::env::var("CORRODE_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(1024)
 }
 
 /// What differs about an OpenAI-compatible endpoint.
 struct ChatEndpoint {
-    /// Requests in flight at once: the remote's rate cap.
-    inflight: tokio::sync::Semaphore,
     /// OpenAI's own API takes `max_completion_tokens` (its reasoning models refuse
     /// `max_tokens`); vLLM, llama.cpp and the hosted GLM/DeepSeek APIs take
     /// `max_tokens`.
@@ -580,6 +598,7 @@ impl Client {
             max_output_tokens,
             stream,
             chat: None,
+            inflight: tokio::sync::Semaphore::new(max_concurrency()),
         }
     }
 
@@ -598,10 +617,8 @@ impl Client {
         };
         Self {
             stream: false,
-            chat: Some(ChatEndpoint {
-                inflight: tokio::sync::Semaphore::new(max_inflight.max(1)),
-                max_tokens_field,
-            }),
+            chat: Some(ChatEndpoint { max_tokens_field }),
+            inflight: tokio::sync::Semaphore::new(max_inflight.max(1)),
             ..Self::new(base_url, api_key)
         }
     }
@@ -772,7 +789,10 @@ impl Client {
             reasoning_effort: effort,
         };
         let body = serde_json::to_value(&req)?;
-        let reply = self.post_responses(&body, owner_token).await?;
+        let reply = {
+            let _permit = self.inflight.acquire().await?;
+            self.post_responses(&body, owner_token).await?
+        };
         record_usage(responses_usage(reply.usage.as_ref()), false);
         let reasoning = reply.reasoning().to_string();
         if reply.status == "incomplete" {
@@ -904,7 +924,7 @@ impl Client {
         if let Some(tools) = tools {
             body["tools"] = tools.clone();
         }
-        let _permit = chat.inflight.acquire().await?;
+        let _permit = self.inflight.acquire().await?;
         let url = format!("{}/chat/completions", self.base_url);
         let reply: serde_json::Value = self.post(&url, &body, self.api_key.as_deref()).await?;
         record_usage(chat_usage(&reply), true);
@@ -988,6 +1008,8 @@ impl Client {
         // ponytail: counts the request only; read usage from `response.completed` if
         // streamed runs need their tokens too.
         record_usage(responses_usage(None), false);
+        // Held until the stream ends: the generation runs as long as it streams.
+        let _permit = self.inflight.acquire().await?;
         let resp = rb.send().await?.error_for_status()?;
 
         let mut text = String::new();
@@ -1451,6 +1473,40 @@ mod tests {
             cached_tokens: 220,
         };
         assert_eq!((scope.usage(), scope.remote_usage()), (both, both));
+    }
+
+    // The generation cap bounds requests in flight, daemon-wide: three concurrent
+    // calls through a client capped at 1 never overlap at the server.
+    #[tokio::test]
+    async fn the_generation_cap_bounds_requests_in_flight() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let (now, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (n, p) = (now.clone(), peak.clone());
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let (n, p) = (n.clone(), p.clone());
+                async move {
+                    let in_flight = n.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(in_flight, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    n.fetch_sub(1, Ordering::SeqCst);
+                    r#"{"status":"completed","output_text":"ok","output":[]}"#
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut client = Client::new(url, None);
+        client.inflight = tokio::sync::Semaphore::new(1);
+        let calls = (0..3).map(|_| client.respond("m", "p", Priority::Default, None, None));
+        for r in futures_util::future::join_all(calls).await {
+            r.unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "a capped client overlapped requests");
     }
 
     // A prompt that cannot fit is refused once, typed, and never retried; a 503

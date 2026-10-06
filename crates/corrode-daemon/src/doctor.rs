@@ -208,7 +208,7 @@ pub async fn run() -> bool {
         crate::plan_graph::max_followups(),
         crate::daemon::fanout_k(),
         on(crate::daemon::plan_review_enabled()),
-        crate::daemon::max_concurrency()
+        crate::hipfire::max_concurrency()
     );
     println!(
         "  context {} tokens, output cap {} tokens, streaming {}, graph-backed vfs {}",
