@@ -233,6 +233,58 @@ fn content_version(bytes: &[u8]) -> u64 {
     h.finish()
 }
 
+/// Chat-template markup that file contents, tool output, rule files and skills
+/// may quote. A backend that matches these strings anywhere in a prompt (Hugging
+/// Face tokenizers do, and vLLM and llama.cpp with them) reads the quote as
+/// structure: a file quoting `<|im_end|>` ends the turn it is shown in, one
+/// quoting `<tool_call>` opens a call. hipfire encodes them literally; Corrode
+/// neutralizes them anyway, for the backends that do not.
+const PROTOCOL_MARKERS: &[&str] = &[
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<tool_call>",
+    "</tool_call>",
+    "<tool_response>",
+    "</tool_response>",
+    "<think>",
+    "</think>",
+    "<function=",
+    "</function>",
+    "<parameter=",
+    "</parameter>",
+];
+
+/// WORD JOINER: invisible, and no tokenizer folds it into the markup around it.
+const JOINER: char = '\u{2060}';
+
+/// `text` with each protocol marker broken by a [`JOINER`] after its `<`, so it
+/// reads as text to any backend. [`restore`] is its exact inverse.
+pub fn neutralize(text: &str) -> std::borrow::Cow<'_, str> {
+    if !PROTOCOL_MARKERS.iter().any(|m| text.contains(m)) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = text.to_string();
+    for m in PROTOCOL_MARKERS {
+        out = out.replace(m, &format!("<{JOINER}{}", &m[1..]));
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// `text` with the joiners [`neutralize`] put in protocol markers taken out, and
+/// no others: what a model copies back out of an observation (a file it rewrites,
+/// a command it reruns) gets the original bytes.
+pub fn restore(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(JOINER) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = text.to_string();
+    for m in PROTOCOL_MARKERS {
+        out = out.replace(&format!("<{JOINER}{}", &m[1..]), m);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 impl ToolBox {
     pub fn new(
         vfs: Arc<dyn Vfs>,
@@ -398,6 +450,12 @@ impl ToolBox {
     /// errors go back to the model as text so it can recover, never as a hard failure).
     /// Callers must already have cleared [`is_mutating`] calls through the approval gate.
     pub async fn execute(&self, call: &ToolCall) -> String {
+        neutralize(&self.execute_raw(call).await).into_owned()
+    }
+
+    /// [`Self::execute`] before its observation is neutralized; the inputs a model
+    /// copied out of an earlier observation get their markup restored.
+    async fn execute_raw(&self, call: &ToolCall) -> String {
         // Schema check before dispatch. Naming what is missing AND what did arrive gives
         // the model something to correct; the per-tool arms below stay as the
         // destructuring, but no longer carry the burden of being the only guard.
@@ -417,15 +475,15 @@ impl ToolBox {
                 None => "error: list_dir needs a `path` argument".to_string(),
             },
             "search_files" => match arg_str(call, "query") {
-                Some(query) => self.search_files(query, arg_str(call, "path")).await,
+                Some(query) => self.search_files(&restore(query), arg_str(call, "path")).await,
                 None => "error: search_files needs a `query` argument".to_string(),
             },
             "write_file" => match (arg_str(call, "path"), arg_text(call, "contents")) {
-                (Some(path), Some(contents)) => self.write_file(path, &contents).await,
+                (Some(path), Some(contents)) => self.write_file(path, &restore(&contents)).await,
                 _ => "error: write_file needs `path` and `contents` arguments".to_string(),
             },
             "run_command" => match arg_text(call, "command") {
-                Some(command) => self.run_command(command.trim()).await,
+                Some(command) => self.run_command(restore(&command).trim()).await,
                 None => "error: run_command needs a `command` argument".to_string(),
             },
             "run_skill_script" => match arg_str(call, "target") {
@@ -1269,6 +1327,35 @@ mod tests {
     // Contents arrive exactly as sent. Trimming stripped the trailing newline and the
     // first line's indentation from every file the swarm wrote, and contents a server
     // had JSON-coerced (a file that parses as JSON) were refused as missing.
+    // Through the tool seam: a file read shows its markup neutralized, and the
+    // model writing back what it was shown stores the original bytes.
+    #[tokio::test]
+    async fn a_file_read_shows_neutralized_markup_and_writing_it_back_restores_it() {
+        let dir = std::env::temp_dir().join(format!("corrode-markup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = "template ends with <|im_end|> and opens <tool_call>\n";
+        std::fs::write(dir.join("t.txt"), original).unwrap();
+        let toolbox = ToolBox::new(
+            Arc::new(crate::vfs::PassthroughVfs::new(&dir)),
+            dir.clone(),
+            Arc::new(HashMap::new()),
+        );
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            name: name.to_string(),
+            arguments: args,
+        };
+        let shown = toolbox.execute(&call("read_file", serde_json::json!({"path": "t.txt"}))).await;
+        assert!(!shown.contains("<|im_end|>") && !shown.contains("<tool_call>"), "{shown}");
+        assert!(shown.contains(&*neutralize(original)), "{shown}");
+        let copied = neutralize(original).into_owned();
+        let out = toolbox
+            .execute(&call("write_file", serde_json::json!({"path": "u.txt", "contents": copied})))
+            .await;
+        assert!(out.starts_with("wrote"), "{out}");
+        assert_eq!(std::fs::read_to_string(dir.join("u.txt")).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn write_file_contents_are_written_exactly_and_json_values_are_taken_as_text() {
         let dir = std::env::temp_dir().join(format!("corrode-exact-{}", std::process::id()));
@@ -1308,6 +1395,22 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
     use super::*;
+
+    // Markup quoted in an observation reads as text, and comes back out exactly:
+    // a model that rewrites a file it read writes the original bytes. A joiner
+    // anywhere else is the file's own and is left alone.
+    #[test]
+    fn neutralized_markup_restores_to_the_original_bytes() {
+        let file = "end: <|im_end|>\n<tool_call>{}</tool_call> <think>x</think>\n\
+                    <function=f><parameter=p>v</parameter></function> keep\u{2060}me";
+        let shown = neutralize(file);
+        for m in PROTOCOL_MARKERS {
+            assert!(!shown.contains(m), "{m} survived neutralize");
+        }
+        assert_eq!(restore(&shown), file);
+        assert!(matches!(neutralize("plain"), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(restore("plain"), std::borrow::Cow::Borrowed(_)));
+    }
     use crate::vfs::PassthroughVfs;
     use serde_json::json;
 

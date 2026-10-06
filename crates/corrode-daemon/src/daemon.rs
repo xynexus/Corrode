@@ -1654,7 +1654,9 @@ impl Daemon {
         // Every prompt of the turn starts with this; the marker is where the client
         // splits it off as its own system turn, so hipfire can checkpoint and reuse it.
         s.push_str(crate::hipfire::PREFIX_END);
-        s
+        // Rules, skills and the README are repository text: markup they quote must
+        // not read as the prompt's structure (`tools::neutralize`).
+        crate::tools::neutralize(&s).into_owned()
     }
 
     /// `README.md` (or a close variant), truncated to [`README_CAP`] on a line
@@ -2119,7 +2121,7 @@ impl SeenCalls {
             d.push_str(line);
             d.push('\n');
         }
-        Some(d)
+        Some(crate::tools::neutralize(&d).into_owned())
     }
 }
 
@@ -2494,6 +2496,14 @@ async fn run_native_tool_loop(
             record_trace(&ctx.toolbox, id, task, &steps, &touched);
             // No call THIS turn is the normal end of the loop. No call in the WHOLE
             // task is the thing worth reporting.
+            if calls_made > 0 && text.contains("<tool_call") {
+                // Accepted as the answer, but it carries a call nothing parsed: the
+                // model meant to act and did not.
+                eprintln!(
+                    "warning: task {id} answered after {calls_made} call(s) with unparsed \
+                     <tool_call markup in its reply; accepted as the answer"
+                );
+            }
             return Ok(if calls_made == 0 {
                 NativeOutcome::NoCallsEmitted(text)
             } else {
