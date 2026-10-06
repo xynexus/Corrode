@@ -19,6 +19,19 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
 
+  graph-store:
+    # The graph store (HelixDB, linked in-process) and doc ingestion (docling.rs)
+    # are feature-gated, so the build job above never compiles them; this one
+    # builds and tests them on every PR. helix-db links OpenSSL (its metrics crate
+    # uses native-tls).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - run: cargo test -p corrode-daemon --features helix,docling --locked
+
   webui:
     runs-on: ubuntu-latest
     steps:
