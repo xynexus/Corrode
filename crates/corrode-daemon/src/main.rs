@@ -100,22 +100,26 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::new(base_url, api_key.clone());
 
     // Resolve role -> model from hipfire's live model list + optional CORRODE_ROLES
-    // overrides. If hipfire is unreachable, fall back to CORRODE_MODEL for all roles.
+    // overrides. With no roles file, an unreachable hipfire (after the retry window)
+    // falls back to CORRODE_MODEL for all roles. With one, it refuses to start: the
+    // operator named the models, and running every role on the fallback instead
+    // is the silent wrong result an unattended run cannot notice.
     let overrides = RoleModels::overrides_from_env()?;
-    let models = match client.list_models().await {
-        Ok(m) => {
-            eprintln!("hipfire models: {}", m.join(", "));
-            m
+    let configured = !overrides.0.is_empty();
+    let listed = client.list_models_patiently().await;
+    if let Ok(m) = &listed {
+        eprintln!("hipfire models: {}", m.join(", "));
+    }
+    let models = listed.as_ref().cloned().unwrap_or_default();
+    let roles = match listed.map(|m| RoleModels::resolve(&m, &overrides)) {
+        Ok(Ok(roles)) => roles,
+        Ok(Err(e)) | Err(e) if configured => {
+            return Err(e.context("CORRODE_ROLES is set and cannot be honoured; refusing to start"))
         }
-        Err(e) => {
-            eprintln!("hipfire model list unavailable ({e}); using CORRODE_MODEL for all roles");
-            Vec::new()
+        Ok(Err(e)) | Err(e) => {
+            eprintln!("{e}; using CORRODE_MODEL ({fallback_model}) for all roles");
+            RoleModels::uniform(&fallback_model)
         }
-    };
-    let roles = if models.is_empty() {
-        RoleModels::uniform(&fallback_model)
-    } else {
-        RoleModels::resolve(&models, &overrides).unwrap_or_else(|_| RoleModels::uniform(&fallback_model))
     };
     let summary: Vec<String> = roles
         .0

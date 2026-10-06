@@ -144,6 +144,11 @@ pub struct Daemon {
     sandbox: crate::sandbox::Sandbox,
     /// Monotonic id source for plan (provenance root) nodes, one per Prompt turn.
     next_plan_id: std::sync::atomic::AtomicU64,
+    /// This process's start (unix seconds, hex), prefixed to plan ids: the counter
+    /// restarts at 0 every boot, and a plan id keys the turn journal, `ListTurns`,
+    /// `CancelTurn`, telemetry and the graph store -- `plan-0` from yesterday and
+    /// `plan-0` from today were one turn to all of them.
+    boot: String,
     /// Per-repo resources (graph/vfs/skills), shared across users working a repo —
     /// the LMDB store can't be opened twice. Keyed by canonical repo path.
     repos: Mutex<HashMap<PathBuf, RepoResources>>,
@@ -224,6 +229,7 @@ impl Daemon {
             telemetry,
             sandbox,
             next_plan_id: std::sync::atomic::AtomicU64::new(0),
+            boot: format!("{:x}", crate::telemetry::now_secs()),
             repos: Mutex::new(repos),
             sessions: Mutex::new(HashMap::new()),
             users: load_users(),
@@ -466,7 +472,8 @@ impl Daemon {
                 // one graph store both write `plan-0`, with no way to tell their
                 // lineage apart.
                 let plan_id = session.project.scope(&format!(
-                    "plan-{}",
+                    "plan-{}-{}",
+                    self.boot,
                     self.next_plan_id
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 ));

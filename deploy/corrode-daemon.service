@@ -1,12 +1,12 @@
 [Unit]
 Description=Corrode agent daemon (swarm, VFS, embedded HelixDB)
 Documentation=file:%h/Corrode/CLAUDE.md
-# hipfire must be up for role resolution + generation. It isn't a systemd unit by
-# default (started via `hipfire start`), so we only order after the network and let
-# the daemon degrade to CORRODE_MODEL if hipfire is briefly unreachable. If you run
-# hipfire as its own unit, add: After=hipfire.service  Wants=hipfire.service
-After=network-online.target
-Wants=network-online.target
+# hipfire must be up for role resolution + generation. Ordered after its unit when
+# one exists (a missing unit is ignored); the daemon also retries hipfire's model
+# list for CORRODE_RETRY_WINDOW_S before falling back (or, with CORRODE_ROLES set,
+# refusing to start).
+After=network-online.target hipfire.service
+Wants=network-online.target hipfire.service
 
 [Service]
 Type=exec

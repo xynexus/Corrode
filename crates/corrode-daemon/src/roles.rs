@@ -96,19 +96,25 @@ impl RoleModels {
         }
     }
 
-    /// Assign every role: use the override if it names a currently-served model,
-    /// else the default pick. Errors only if hipfire serves nothing to assign.
+    /// Assign every role: its override, else the default pick. An override naming a
+    /// model hipfire does not serve is an error, not a silent swap to the default --
+    /// a typo in the roles file used to run that role on whatever model sorted first.
+    /// Also errors if hipfire serves nothing to assign.
     pub fn resolve(available: &[String], overrides: &RoleModels) -> anyhow::Result<RoleModels> {
+        let unserved: Vec<String> = overrides
+            .0
+            .iter()
+            .filter(|(_, m)| !available.iter().any(|a| a == *m))
+            .map(|(r, m)| format!("{} -> {m}", r.as_str()))
+            .collect();
+        if !unserved.is_empty() {
+            anyhow::bail!("CORRODE_ROLES names models hipfire does not serve: {}", unserved.join(", "));
+        }
         let default = default_pick(available)
             .ok_or_else(|| anyhow::anyhow!("hipfire reports no usable models to assign"))?;
         let mut out = BTreeMap::new();
         for role in Role::ALL {
-            let model = overrides
-                .0
-                .get(&role)
-                .filter(|m| available.iter().any(|a| a == *m))
-                .cloned()
-                .unwrap_or_else(|| default.to_string());
+            let model = overrides.0.get(&role).cloned().unwrap_or_else(|| default.to_string());
             out.insert(role, model);
         }
         Ok(RoleModels(out))
@@ -188,7 +194,6 @@ mod tests {
         ];
         let mut ov = RoleModels::default();
         ov.0.insert(Role::Coder, "qwen3.5-9b".to_string()); // valid
-        ov.0.insert(Role::Review, "ghost-model".to_string()); // not served -> dropped
 
         let r = RoleModels::resolve(&available, &ov).unwrap();
         assert_eq!(r.model_for(Role::Coder), Some("qwen3.5-9b"));
@@ -211,6 +216,17 @@ mod tests {
         ];
         let r = RoleModels::resolve(&available, &RoleModels::default()).unwrap();
         assert_eq!(r.model_for(Role::Coder), Some("zaya1-8b-native.oq8++"));
+    }
+
+    // An override hipfire does not serve is refused by name, not swapped for the
+    // default pick.
+    #[test]
+    fn resolve_refuses_an_unserved_override() {
+        let available = vec!["Gemma-3-27B".to_string()];
+        let mut ov = RoleModels::default();
+        ov.0.insert(Role::Review, "ghost-model".to_string());
+        let err = RoleModels::resolve(&available, &ov).unwrap_err().to_string();
+        assert!(err.contains("review -> ghost-model"), "{err}");
     }
 
     #[test]
