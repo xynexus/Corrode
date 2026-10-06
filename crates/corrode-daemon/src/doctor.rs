@@ -72,7 +72,7 @@ pub async fn run() -> bool {
 
     // --- sandbox (only meaningful when enabled) ---
     let repo = std::env::var("CORRODE_REPO").unwrap_or_else(|_| ".".into());
-    let sandbox_on = crate::knobs::flag("CORRODE_SANDBOX", false);
+    let sandbox_on = crate::knobs::flag("CORRODE_SANDBOX", true);
     if sandbox_on {
         let root = std::fs::canonicalize(&repo).unwrap_or_else(|_| repo.clone().into());
         match sandboxed(&root, &["true"]) {
@@ -89,7 +89,7 @@ pub async fn run() -> bool {
             Err(e) => {
                 fatal += 1;
                 fail(
-                    &format!("CORRODE_SANDBOX=on but bwrap is unusable: {e}"),
+                    &format!("the sandbox is on but bwrap is unusable, so every command fails: {e}"),
                     "apt install bubblewrap; on Ubuntu load an AppArmor userns profile \
                      for /usr/bin/bwrap (docs/corrode-doctor.md §3)",
                 );
@@ -99,8 +99,8 @@ pub async fn run() -> bool {
         // The file tools refuse ~/.ssh and the other credential stores either way; a
         // command or the terminal outside the sandbox can still read them.
         warn(
-            "sandbox: off — run_command, skill scripts and the web terminal can read ~/.ssh \
-             and other credential stores (set CORRODE_SANDBOX=on to confine them)",
+            "sandbox: off (CORRODE_SANDBOX) — run_command, skill scripts and the web terminal \
+             can read ~/.ssh and other credential stores",
         );
     }
 
@@ -110,7 +110,7 @@ pub async fn run() -> bool {
         } else {
             warn(
                 "auto-approve: on WITHOUT the sandbox — every write and command the swarm \
-                 proposes runs unconfined with the daemon's privileges (set CORRODE_SANDBOX=on)",
+                 proposes runs unconfined with the daemon's privileges (CORRODE_SANDBOX is off)",
             );
         }
     }

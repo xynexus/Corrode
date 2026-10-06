@@ -82,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
         }
         std::process::exit(2);
     }
-    if knobs::flag("CORRODE_AUTO_APPROVE", false) && !knobs::flag("CORRODE_SANDBOX", false) {
+    if knobs::flag("CORRODE_AUTO_APPROVE", false) && !knobs::flag("CORRODE_SANDBOX", true) {
         eprintln!(
             "warning: CORRODE_AUTO_APPROVE is on without CORRODE_SANDBOX — every write and \
              command the swarm proposes runs unconfined, with this daemon's privileges"
