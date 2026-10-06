@@ -101,8 +101,11 @@ or at the KV capacity left comes back `status: incomplete`, which the client tur
 `hipfire::Truncated` error: the native tool loop tells the model and asks for a shorter
 reply, the planner retries once at reasoning effort `medium`, anything else fails the task
 visibly rather than taking half an answer as whole), `CORRODE_CONTEXT_TOKENS` (the serving
-model's context, default 32768; the tool loop stops gathering once the conversation leaves
-less than one `CORRODE_MAX_TOKENS` of it, so the final answer always fits), `CORRODE_STREAM`
+model's context, default 32768; every generation is checked first — prompt, replayed
+turns and declared tools, estimated at 3 bytes/token, with one `CORRODE_MAX_TOKENS` to
+spare: the native loop elides its oldest tool outputs to fit (`fit_context`), the Needle
+loop drops its oldest exchanges (`fit_scratchpad`), the fan-out judge is skipped, and a
+prompt that cannot fit at all fails its task with a clear error), `CORRODE_STREAM`
 (stream single-shot subagent output over SSE, relaying `SubagentDelta` events to
 the UI as tokens generate; off unless set on — the non-streaming path is
 unchanged when off), `CORRODE_FANOUT` (coder-task ensemble size — K read-only proposal
@@ -262,7 +265,10 @@ Every prompt in a turn — the orchestration call and each subagent
 they land on the same model. The divergent role/task goes in the tail; nothing
 role-specific precedes the prefix. The `subagent_prompt` test guards this invariant.
 The prefix travels as its own **system turn** (`Client::input_items`, split at the
-registered prefix), and the native tool loop replays each step as assistant
+prefix's closing `hipfire::PREFIX_END` line — the boundary is in each request, not in a
+process-global registry, which held the last 8 prefixes and silently sent an in-flight
+loop's requests as one user message once 8 newer turns had registered theirs; the
+prefix is budgeted: AGENTS.md capped at 32 KB, the tree at 8 KB), and the native tool loop replays each step as assistant
 `function_call` + `function_call_output` turns (`Client::respond_turns`) rather than
 folding a scratchpad into one message. Both are load-bearing: Qwen3.5's DeltaNet
 state cannot be rewound to an arbitrary shared prefix, so hipfire reuses prefill only
