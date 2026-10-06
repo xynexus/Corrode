@@ -741,7 +741,11 @@ impl ToolBox {
         match self.vfs.list(path).await {
             Ok(entries) => {
                 let mut out = format!("entries of {}:", if path.is_empty() { "." } else { path });
-                for e in entries {
+                // Capped: one listing of a generated or vendored directory could fill a
+                // step's share of the context on its own.
+                const LIST_CAP: usize = 500;
+                let more = entries.len().saturating_sub(LIST_CAP);
+                for e in entries.into_iter().take(LIST_CAP) {
                     out.push_str(&format!(
                         "\n  {}{}",
                         e.path,
@@ -751,6 +755,9 @@ impl ToolBox {
                             format!(" ({} bytes)", e.bytes)
                         }
                     ));
+                }
+                if more > 0 {
+                    out.push_str(&format!("\n  ... {more} more (list a subdirectory)"));
                 }
                 out
             }

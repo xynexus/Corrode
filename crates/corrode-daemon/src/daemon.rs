@@ -117,6 +117,13 @@ fn load_users() -> Option<HashMap<String, UserEntry>> {
 /// is prefix content, prefilled once per model and reused across the turn's fan-out
 /// and every later turn on the same project.
 const README_CAP: usize = 4096;
+
+/// Caps on the parts of the shared prefix that grow with the repository. The CAE
+/// prefix ran ~35-40 KB with AGENTS.md (an `@CLAUDE.md` include) inlined uncapped --
+/// over a third of a 32K-token window before any task text. Its 25.6 KB of rules
+/// fit under the AGENTS cap; a tree is a listing `list_dir` can always redo.
+const AGENTS_CAP: usize = 32 * 1024;
+const TREE_CAP: usize = 8 * 1024;
 /// Entries listed per directory in the second level of the repo tree.
 const TREE_BREADTH: usize = 24;
 /// Directories never descended into — noise that would crowd out real source.
@@ -1486,7 +1493,12 @@ impl Daemon {
         let rules = session.skills.agents_rules();
         if !rules.trim().is_empty() {
             s.push_str("\nProject instructions (AGENTS.md):\n");
-            s.push_str(rules.trim_end());
+            let rules = rules.trim_end();
+            let end = crate::tools::floor_char_boundary(rules, AGENTS_CAP.min(rules.len()));
+            s.push_str(&rules[..end]);
+            if end < rules.len() {
+                s.push_str(&format!("\n... (AGENTS.md truncated at {} KB)", AGENTS_CAP / 1024));
+            }
             s.push('\n');
         }
         let manifest = session
@@ -1505,10 +1517,15 @@ impl Daemon {
             s.push_str(&readme);
         }
         s.push_str("\nRepository tree:\n");
-        s.push_str(&self.repo_tree(session).await);
-        // Every prompt of the turn starts with this; the client sends it as its own
-        // system turn so hipfire can checkpoint and reuse its prefill.
-        self.swarm.client().register_shared_prefix(&s);
+        let tree = self.repo_tree(session).await;
+        let end = crate::tools::floor_char_boundary(&tree, TREE_CAP.min(tree.len()));
+        s.push_str(&tree[..end]);
+        if end < tree.len() {
+            s.push_str("  ... (tree truncated; list_dir shows the rest)\n");
+        }
+        // Every prompt of the turn starts with this; the marker is where the client
+        // splits it off as its own system turn, so hipfire can checkpoint and reuse it.
+        s.push_str(crate::hipfire::PREFIX_END);
         s
     }
 
@@ -1617,14 +1634,85 @@ fn context_tokens() -> usize {
 }
 
 
-/// Whether `prompt` plus the replayed `turns` is too close to the context to take
-/// another tool step. Estimated, not tokenized: 3 bytes per token is conservative
-/// for code and markdown (Qwen's tokenizer averages ~3.5-4 on this repo).
-fn over_context_budget(prompt: &str, turns: &[serde_json::Value]) -> bool {
-    let bytes = prompt.len() + turns.iter().map(|t| t.to_string().len()).sum::<usize>();
+/// Whether a request of `prompt`, the replayed `turns` and the declared `tools` leaves
+/// less than one output cap of the context. Estimated, not tokenized: 3 bytes per
+/// token is conservative for code and markdown (Qwen's tokenizer averages ~3.5-4 on
+/// this repo). The tools count: they render into the system turn, ~2-4 KB of JSON.
+fn over_context_budget(
+    prompt: &str,
+    turns: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+) -> bool {
+    let bytes = prompt.len()
+        + turns.iter().map(|t| t.to_string().len()).sum::<usize>()
+        + tools.map_or(0, |t| t.to_string().len());
     // Keep a whole output cap free: hipfire clamps a reply to the KV capacity left, so
     // a 4096-token reserve under an 8192-token cap cut long final answers short.
     bytes / 3 + crate::hipfire::max_output_tokens() as usize > context_tokens()
+}
+
+const ELIDED: &str = "[observation elided";
+
+/// Make a native tool-loop request fit the context: elide tool outputs, oldest first
+/// (the newest are what the next step builds on). False when it does not fit even with
+/// every output elided -- the prompt and tools alone are too big. The check used to run
+/// only from the second step and never before the final answer, so a step that read six
+/// files could overflow the very request meant to conclude the task -- a 500 that also
+/// failed its batch-mates.
+fn fit_context(
+    prompt: &str,
+    turns: &mut [serde_json::Value],
+    tools: Option<&serde_json::Value>,
+) -> bool {
+    while over_context_budget(prompt, turns, tools) {
+        let oldest = turns.iter_mut().find(|t| {
+            t["type"] == "function_call_output"
+                && !t["output"].as_str().unwrap_or_default().starts_with(ELIDED)
+        });
+        let Some(turn) = oldest else {
+            return false;
+        };
+        let n = turn["output"].as_str().map_or(0, str::len);
+        turn["output"] = serde_json::json!(format!(
+            "{ELIDED} ({n} bytes) to fit the context window; call the tool again if you \
+             still need it]"
+        ));
+    }
+    true
+}
+
+/// Make the Needle loop's prompt fit: drop the oldest `TOOL:`/`RESULT:` exchanges from
+/// the scratchpad. False when the prompt does not fit even with an empty scratchpad.
+fn fit_scratchpad(prompt_of: impl Fn(&str) -> String, scratchpad: &mut String) -> bool {
+    const NOTE: &str = "[observation elided: earlier tool results dropped to fit the context window]\n";
+    while over_context_budget(&prompt_of(scratchpad), &[], None) {
+        // Each exchange starts at "\nTOOL: "; every pass removes the oldest whole one,
+        // so the loop ends: out of exchanges, it drops what is left, then gives up.
+        let Some(first) = scratchpad.find("\nTOOL: ") else {
+            if scratchpad.is_empty() {
+                return false;
+            }
+            scratchpad.clear();
+            continue;
+        };
+        let end = scratchpad[first + 1..]
+            .find("\nTOOL: ")
+            .map_or(scratchpad.len(), |n| first + 1 + n);
+        scratchpad.replace_range(first..end, "");
+        if !scratchpad.starts_with(ELIDED) {
+            scratchpad.insert_str(0, NOTE);
+        }
+    }
+    true
+}
+
+/// The error for a request that cannot fit the context at all.
+fn too_big_for_context(what: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{what} does not fit the model's {}-token context with an output cap to spare \
+         (CORRODE_CONTEXT_TOKENS); shorten the prompt or split the task",
+        context_tokens()
+    )
 }
 
 /// Tool calls one step may run. A step is one generation; the model may emit several
@@ -2112,7 +2200,7 @@ async fn run_native_tool_loop(
         // reads per step can outgrow it -- a CAE research conversation passed the
         // 27B's 32K tokens, hipfire refused the prefill, and the request was shed
         // with a 500. Past the budget the loop goes straight to the final answer.
-        if step > 0 && over_context_budget(&prompt, &turns) {
+        if !fit_context(&prompt, &mut turns, Some(&tools)) {
             break;
         }
         // Cooperative cancellation at a STEP boundary — never mid-call. A mutating
@@ -2281,6 +2369,9 @@ async fn run_native_tool_loop(
             last["output"] = serde_json::json!(format!("{out}\n\n{FINAL_ANSWER_NUDGE}"));
         }
     }
+    if !fit_context(&prompt, &mut turns, Some(&tools)) {
+        return Err(too_big_for_context(&format!("task {id}'s prompt with its tools")));
+    }
     let (mut text, _reasoning, calls) = client
         .respond_turns(
             model,
@@ -2303,7 +2394,7 @@ async fn run_native_tool_loop(
     // front of the call ("Let me start by reading..."). Give it the one step it
     // asked for, then ask again. (hipfire has no tool_choice "none"; dropping the
     // tools would change the system turn and re-prefill the whole conversation.)
-    if !calls.is_empty() && !over_context_budget(&prompt, &turns) {
+    if !calls.is_empty() && !over_context_budget(&prompt, &turns, Some(&tools)) {
         let batch = &calls[..calls.len().min(MAX_CALLS_PER_STEP)];
         let mut observations = Vec::with_capacity(batch.len());
         for call in batch {
@@ -2338,6 +2429,9 @@ async fn run_native_tool_loop(
                 "call_id": format!("call_{id}_final_{k}"),
                 "output": output,
             }));
+        }
+        if !fit_context(&prompt, &mut turns, Some(&tools)) {
+            return Err(too_big_for_context(&format!("task {id}'s prompt with its tools")));
         }
         let (again, _reasoning, _calls) = client
             .respond_turns(
@@ -2425,6 +2519,9 @@ async fn run_tool_loop(
                 .await;
             return Ok(format!("{last}\n[stopped: turn budget reached]"));
         }
+        if !fit_scratchpad(|s| planner::tool_loop_prompt(prefix, role, task, s), &mut scratchpad) {
+            return Err(too_big_for_context(&format!("task {id}'s prompt")));
+        }
         let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
         let text = client
             .respond(model, &prompt, band, toolbox.owner_token(), Some(&effort))
@@ -2485,6 +2582,9 @@ async fn run_tool_loop(
     }
     // Step budget spent: ask once more, for the answer (see FINAL_ANSWER_NUDGE).
     record_trace(&toolbox, id, task, &steps, &touched);
+    if !fit_scratchpad(|s| planner::tool_loop_prompt(prefix, role, task, s), &mut scratchpad) {
+        return Err(too_big_for_context(&format!("task {id}'s prompt")));
+    }
     scratchpad.push_str(&format!("\n{FINAL_ANSWER_NUDGE}\n"));
     let prompt = planner::tool_loop_prompt(prefix, role, task, &scratchpad);
     let text = client
@@ -2704,6 +2804,9 @@ async fn run_task(
         .await
     } else {
         let full = planner::subagent_prompt(prefix, role, task);
+        if over_context_budget(&full, &[], None) {
+            return Err(too_big_for_context(&format!("task {id}'s prompt")));
+        }
         let out = if client.streaming() {
             // Relay each delta to the UI as it arrives (best-effort: try_send drops
             // under backpressure, the final SubagentOutput below reconciles).
@@ -2853,16 +2956,21 @@ async fn run_fanout(
     let mut steered = task.to_string();
     if proposals.len() >= 2 {
         let judge_prompt = planner::fanout_judge_prompt(prefix, task, &proposals);
-        match client
-            .respond(
-                review_model,
-                &judge_prompt,
-                planner::band_for(Role::Review),
-                toolbox.owner_token(),
-                Some(&crate::roles::effort_for(Role::Review)),
-            )
-            .await
-        {
+        // A judge that cannot fit the context is skipped like one that failed.
+        let judged = if over_context_budget(&judge_prompt, &[], None) {
+            Err(too_big_for_context("the fan-out judge's prompt"))
+        } else {
+            client
+                .respond(
+                    review_model,
+                    &judge_prompt,
+                    planner::band_for(Role::Review),
+                    toolbox.owner_token(),
+                    Some(&crate::roles::effort_for(Role::Review)),
+                )
+                .await
+        };
+        match judged {
             Ok(directive) => {
                 let _ = events
                     .send(AgentEvent::SubagentOutput {
@@ -2968,8 +3076,42 @@ mod tests {
         let read = serde_json::json!({"type": "function_call_output", "call_id": "c", "output": "y".repeat(4096)});
         let few: Vec<_> = std::iter::repeat(read.clone()).take(5).collect();
         let many: Vec<_> = std::iter::repeat(read).take(40).collect();
-        assert!(!super::over_context_budget(&prompt, &few), "5 reads fit");
-        assert!(super::over_context_budget(&prompt, &many), "40 reads (~160 KB) do not");
+        assert!(!super::over_context_budget(&prompt, &few, None), "5 reads fit");
+        assert!(super::over_context_budget(&prompt, &many, None), "40 reads (~160 KB) do not");
+        // The declared tools count too.
+        let tools = serde_json::json!("t".repeat(80_000));
+        assert!(super::over_context_budget(&prompt, &few, Some(&tools)));
+    }
+
+    // A request that would overflow has its tool outputs elided, oldest first, until it
+    // fits; one whose prompt alone overflows is reported as not fitting.
+    #[test]
+    fn an_overflowing_request_sheds_its_oldest_observations() {
+        let read = |n: &str| serde_json::json!({"type": "function_call_output", "call_id": n, "output": "y".repeat(20_000)});
+        let mut turns: Vec<_> = (0..6).map(|i| read(&i.to_string())).collect();
+        let prompt = "x".repeat(10_000);
+        assert!(super::over_context_budget(&prompt, &turns, None));
+        assert!(super::fit_context(&prompt, &mut turns, None));
+        assert!(!super::over_context_budget(&prompt, &turns, None));
+        let elided = |t: &serde_json::Value| t["output"].as_str().unwrap().starts_with(super::ELIDED);
+        assert!(elided(&turns[0]), "the oldest goes first");
+        assert!(!elided(&turns[5]), "the newest is kept");
+        let huge = "x".repeat(200_000);
+        assert!(!super::fit_context(&huge, &mut turns, None), "the prompt alone does not fit");
+    }
+
+    // The Needle loop's scratchpad drops its oldest exchanges to fit.
+    #[test]
+    fn an_overflowing_scratchpad_drops_its_oldest_exchanges() {
+        let mut pad: String = (0..6)
+            .map(|i| format!("\nTOOL: read file {i}\nRESULT: {}\n", "y".repeat(20_000)))
+            .collect();
+        let prompt_of = |s: &str| format!("{}{s}", "x".repeat(10_000));
+        assert!(super::fit_scratchpad(prompt_of, &mut pad));
+        assert!(!super::over_context_budget(&prompt_of(&pad), &[], None));
+        assert!(pad.starts_with(super::ELIDED), "{}", &pad[..60]);
+        assert!(pad.contains("read file 5"), "the newest exchange is kept");
+        assert!(!pad.contains("read file 0"), "the oldest is gone");
     }
 
     use super::*;
