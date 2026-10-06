@@ -30,7 +30,8 @@ pub enum LogEntry {
 
 /// Open the socket and keep it open: return the sender UI callbacks push
 /// `AgentCommand`s into, and reconnect whenever the socket closes. The commands that
-/// bind a connection (`Authenticate`, `SelectRepo`) are resent on every new socket,
+/// bind a connection (`Authenticate`, `SelectRepo`) are resent on every new socket
+/// (`corrode_core::reattach`, which binds the default repo when none was selected),
 /// so it lands on the same session, and the daemon replays that session's recent
 /// turn events -- a reload, a sleep or a proxy restart no longer loses a turn's
 /// answers. The console is cleared on reconnect and rebuilt from that replay.
@@ -63,13 +64,15 @@ pub fn spawn_agent(
             }
             first = false;
             let (mut sink, mut stream) = ws.split();
-            let resend: Vec<AgentCommand> = binding.iter().cloned().chain(unsent.drain(..)).collect();
+            let resend: Vec<AgentCommand> =
+                corrode_core::reattach(&binding).into_iter().chain(unsent.drain(..)).collect();
             let mut alive = true;
             for cmd in resend {
                 if alive && send(&mut sink, &cmd).await.is_err() {
                     alive = false;
                 }
-                if !alive && !is_binding(&cmd) {
+                // `reattach` adds a ListTurns to every resend; don't queue a second.
+                if !alive && !is_binding(&cmd) && !matches!(cmd, AgentCommand::ListTurns) {
                     unsent.push(cmd);
                 }
             }

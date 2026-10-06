@@ -249,9 +249,39 @@ pub enum AgentEvent {
     Error { message: String },
 }
 
+/// What a client sends on each new socket to land back on its session: the
+/// `Authenticate`/`SelectRepo` it sent before, then -- when none selects a repo --
+/// `ListTurns`. The daemon binds the default repo lazily, on the first repo-scoped
+/// command, so a client that never selected one was bound to nothing after a
+/// reconnect or reload and replayed nothing until its user acted.
+pub fn reattach(binding: &[AgentCommand]) -> Vec<AgentCommand> {
+    let mut cmds = binding.to_vec();
+    if !binding.iter().any(|c| matches!(c, AgentCommand::SelectRepo { .. })) {
+        cmds.push(AgentCommand::ListTurns);
+    }
+    cmds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reattach_binds_the_default_repo_when_none_was_selected() {
+        let names = |b: &[AgentCommand]| serde_json::to_string(&reattach(b)).unwrap();
+        let auth = AgentCommand::Authenticate { user: "u".into(), token: "t".into() };
+        let select = AgentCommand::SelectRepo { path: "/r".into() };
+        assert_eq!(names(&[]), r#"["ListTurns"]"#);
+        assert_eq!(
+            names(&[auth.clone()]),
+            r#"[{"Authenticate":{"user":"u","token":"t"}},"ListTurns"]"#
+        );
+        // A selected repo binds (and replays) by itself.
+        assert_eq!(
+            names(&[auth, select]),
+            r#"[{"Authenticate":{"user":"u","token":"t"}},{"SelectRepo":{"path":"/r"}}]"#
+        );
+    }
 
     #[test]
     fn projection_mode_round_trips_through_json() {
