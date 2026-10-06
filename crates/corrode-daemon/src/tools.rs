@@ -971,6 +971,7 @@ async fn run_bounded(
         Err(e) => return format!("error: could not run {what}: {e}"),
     };
     let mut group = GroupKill(child.id());
+    let started = std::time::Instant::now();
     let (so, se) = (child.stdout.take(), child.stderr.take());
     let run = async {
         let out = async {
@@ -995,11 +996,18 @@ async fn run_bounded(
     }
     drop(group);
     match done {
-        Ok((stdout, stderr, Ok(status))) => format_command_output(std::process::Output {
-            status,
-            stdout,
-            stderr,
-        }),
+        // How long it took goes at the END, so the digest's first line (exit status,
+        // test counts) is unchanged: a model choosing between a full build and a
+        // focused test had no way to know one took 4 minutes and the other 2 seconds.
+        Ok((stdout, stderr, Ok(status))) => format!(
+            "{}\n(took {:.1}s)",
+            format_command_output(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            }),
+            started.elapsed().as_secs_f32()
+        ),
         Ok((_, _, Err(e))) => format!("error: {what}: {e}"),
         Err(_) => {
             format!(
@@ -1294,6 +1302,9 @@ mod tests {
 
         let out = toolbox.execute(&call("run_command", serde_json::json!({"command": true}))).await;
         assert!(out.starts_with("exit 0"), "`true` coerced to a bool still runs: {out}");
+        // The run's duration closes the observation, after the digest.
+        let took = out.lines().last().unwrap_or_default();
+        assert!(took.starts_with("(took ") && took.ends_with("s)"), "{out}");
         std::fs::remove_dir_all(&dir).ok();
     }
     use super::*;
