@@ -56,6 +56,10 @@ struct ChatEndpoint {
     /// `max_tokens`); vLLM, llama.cpp and the hosted GLM/DeepSeek APIs take
     /// `max_tokens`.
     max_tokens_field: &'static str,
+    /// The `reasoning_effort` sent (`CORRODE_OPENAI_REASONING_EFFORT`): none at all
+    /// by default -- many servers refuse a field they do not know -- else the
+    /// role's own effort (`role`), or one fixed level.
+    reasoning_effort: Option<String>,
 }
 
 /// One decoded SSE event from hipfire's `/v1/responses` stream. hipfire tags each
@@ -227,6 +231,20 @@ pub fn max_output_tokens() -> u32 {
 /// `response.output_text.delta` even for a reasoning delta — only the `event:` name
 /// distinguishes them. Falls back to the JSON `type` if there's no `event:` line
 /// (a spec-compliant server that omits it).
+/// The usage a stream's final event reports: `response.completed` and
+/// `response.incomplete` carry the response, `usage` and all.
+fn sse_usage(block: &str) -> Option<WireUsage> {
+    let data: String = block
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let json: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let usage = json.pointer("/response/usage").or(json.get("usage"))?;
+    serde_json::from_value(usage.clone()).ok()
+}
+
 fn parse_sse_event(block: &str) -> Option<SseDelta> {
     let mut event_name = "";
     let mut data_parts: Vec<&str> = Vec::new();
@@ -643,10 +661,23 @@ impl Client {
         };
         Self {
             stream: false,
-            chat: Some(ChatEndpoint { max_tokens_field }),
+            chat: Some(ChatEndpoint {
+                max_tokens_field,
+                reasoning_effort: None,
+            }),
             inflight: tokio::sync::Semaphore::new(max_inflight.max(1)),
             ..Self::new(base_url, api_key)
         }
+    }
+
+    /// Send this endpoint a `reasoning_effort`: `role` sends each role's own
+    /// (`roles::effort_for`; a role with none sends nothing), a level sends that
+    /// one. Only for a server that accepts the field. No effect on hipfire.
+    pub fn with_reasoning_effort(mut self, knob: Option<&str>) -> Self {
+        if let Some(chat) = self.chat.as_mut() {
+            chat.reasoning_effort = knob.map(str::to_string);
+        }
+        self
     }
 
     /// Whether this is an OpenAI-compatible endpoint rather than hipfire.
@@ -795,7 +826,7 @@ impl Client {
         effort: Option<&str>,
     ) -> anyhow::Result<(String, String, Vec<crate::toolcall::ToolCall>)> {
         if let Some(chat) = &self.chat {
-            return self.chat_turns(chat, model, prompt, turns, tools).await;
+            return self.chat_turns(chat, model, prompt, turns, tools, effort).await;
         }
         let mut input = self.input_items(prompt);
         if !turns.is_empty() {
@@ -937,6 +968,7 @@ impl Client {
         prompt: &str,
         turns: &[serde_json::Value],
         tools: Option<&serde_json::Value>,
+        effort: Option<&str>,
     ) -> anyhow::Result<(String, String, Vec<crate::toolcall::ToolCall>)> {
         let mut messages = match self.input_items(prompt) {
             serde_json::Value::Array(items) => items,
@@ -947,6 +979,13 @@ impl Client {
         }
         let mut body = serde_json::json!({"model": model, "messages": messages});
         body[chat.max_tokens_field] = serde_json::json!(self.max_output_tokens);
+        let effort = match chat.reasoning_effort.as_deref() {
+            Some("role") => effort.filter(|e| *e != "none"),
+            fixed => fixed,
+        };
+        if let Some(effort) = effort {
+            body["reasoning_effort"] = serde_json::json!(effort);
+        }
         if let Some(tools) = tools {
             body["tools"] = tools.clone();
         }
@@ -1031,9 +1070,6 @@ impl Client {
         if let Some(id) = next_call_id() {
             rb = rb.header("x-request-id", id);
         }
-        // ponytail: counts the request only; read usage from `response.completed` if
-        // streamed runs need their tokens too.
-        record_usage(responses_usage(None), false);
         // Held until the stream ends: the generation runs as long as it streams.
         let _permit = self.inflight.acquire().await?;
         let resp = rb.send().await?.error_for_status()?;
@@ -1041,6 +1077,8 @@ impl Client {
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut cut_off: Option<String> = None;
+        // The final `response.completed` (or `.incomplete`) carries the usage.
+        let mut usage: Option<WireUsage> = None;
         let mut apply = |ev: Option<SseDelta>, text: &mut String, reasoning: &mut String| {
             match ev {
                 Some(SseDelta::Text(d)) => {
@@ -1070,20 +1108,20 @@ impl Client {
             buf.extend_from_slice(&chunk?);
             while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
                 let block: Vec<u8> = buf.drain(..pos + 2).collect();
-                apply(
-                    parse_sse_event(&String::from_utf8_lossy(&block)),
-                    &mut text,
-                    &mut reasoning,
-                );
+                let block = String::from_utf8_lossy(&block);
+                usage = sse_usage(&block).or(usage);
+                apply(parse_sse_event(&block), &mut text, &mut reasoning);
             }
         }
         // A final event without a trailing blank line.
         if !buf.is_empty() {
             let block = String::from_utf8_lossy(&buf);
             if !block.trim().is_empty() {
+                usage = sse_usage(&block).or(usage);
                 apply(parse_sse_event(&block), &mut text, &mut reasoning);
             }
         }
+        record_usage(responses_usage(usage.as_ref()), false);
         let answer = answer_or_reasoning(text, &reasoning);
         if let Some(reason) = cut_off {
             return Err(Truncated { partial: answer, reason }.into());
@@ -1409,6 +1447,86 @@ mod tests {
         assert_eq!(
             scope.usage(),
             Usage { requests: 2, input_tokens: 200, output_tokens: 14, cached_tokens: 128 }
+        );
+    }
+
+    // A streamed reply's tokens count: the final `response.completed` carries the
+    // usage, which the stream used to drop (it counted the request only).
+    #[tokio::test]
+    async fn a_streamed_reply_counts_the_usage_its_final_event_reports() {
+        use axum::{routing::post, Router};
+        let sse = "event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\n\
+                   event: response.output_text.done\ndata: {\"text\":\"hi\"}\n\n\
+                   event: response.completed\ndata: {\"type\":\"response.completed\",\
+                   \"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":40,\
+                   \"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":32}}}}\n\n";
+        let app = Router::new().route("/v1/responses", post(move || async move { sse }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(url, None);
+        let scope = CallScope::new("s/1");
+        let (text, _) = CALLS
+            .scope(scope.clone(), async {
+                client
+                    .respond_streaming("m", "p", Priority::Default, None, None, |_| {})
+                    .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(text, "hi");
+        assert_eq!(
+            scope.usage(),
+            Usage { requests: 1, input_tokens: 40, output_tokens: 2, cached_tokens: 32 }
+        );
+    }
+
+    // `CORRODE_OPENAI_REASONING_EFFORT`: unset sends no effort; `role` sends the
+    // role's (none for a role without one); a level sends that level.
+    #[tokio::test]
+    async fn the_remote_gets_a_reasoning_effort_only_when_configured() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let seen = bodies.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(body.0);
+                    Json(serde_json::json!({
+                        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ask = |knob: Option<&'static str>, effort: Option<&'static str>| {
+            let client = Client::openai_compatible(&url, None, 1).with_reasoning_effort(knob);
+            async move {
+                client
+                    .respond_turns("m", "p", &[], Priority::Default, None, None, effort)
+                    .await
+                    .unwrap();
+            }
+        };
+        ask(None, Some("medium")).await;
+        ask(Some("role"), Some("medium")).await;
+        ask(Some("role"), Some("none")).await;
+        ask(Some("high"), Some("none")).await;
+        let sent: Vec<serde_json::Value> =
+            bodies.lock().unwrap().iter().map(|b| b["reasoning_effort"].clone()).collect();
+        assert_eq!(
+            sent,
+            [
+                serde_json::Value::Null,
+                serde_json::json!("medium"),
+                serde_json::Value::Null,
+                serde_json::json!("high")
+            ]
         );
     }
 

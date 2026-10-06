@@ -18,6 +18,11 @@
 //! The endpoint is `CORRODE_OPENAI_BASE_URL` (default `https://api.openai.com/v1`),
 //! the key `CORRODE_OPENAI_API_KEY`, else `OPENAI_API_KEY` (optional: a local server
 //! may need none). hipfire's requests are untouched -- this is a second `Client`.
+//!
+//! `CORRODE_OPENAI_REASONING_EFFORT` sends a `reasoning_effort`, for a model that
+//! takes one: `role` sends each role's own (`CORRODE_EFFORT_<ROLE>` and the
+//! defaults; a role with none sends nothing), a level sends that level. Unset,
+//! nothing is sent: many servers refuse a field they do not know.
 
 use crate::hipfire::{Client, Usage};
 use crate::roles::Role;
@@ -52,7 +57,8 @@ impl Remote {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4);
         Some(Self {
-            client: Client::openai_compatible(&base, key, inflight),
+            client: Client::openai_compatible(&base, key, inflight)
+                .with_reasoning_effort(env("CORRODE_OPENAI_REASONING_EFFORT").as_deref()),
             model,
             roles: env("CORRODE_OPENAI_ROLES").map_or_else(Vec::new, |v| parse_roles(&v)),
             budget_usd: number("CORRODE_OPENAI_BUDGET_USD", 2.0),

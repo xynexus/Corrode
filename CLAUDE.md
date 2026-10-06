@@ -161,6 +161,9 @@ hipfire on failure; any other task that fails on hipfire escalates there once),
 `CORRODE_OPENAI_BUDGET_USD` (per-turn spend cap, default 2; past it everything stays on
 hipfire), `CORRODE_OPENAI_PRICE_IN`/`_OUT` (USD per 1M tokens; unset = unpriced, the cap
 cannot bind), `CORRODE_OPENAI_MAX_INFLIGHT` (concurrent remote requests, default 4),
+`CORRODE_OPENAI_REASONING_EFFORT` (send the remote a `reasoning_effort`: `role` = each
+role's own, none for a role without one; or one fixed level; unset = never sent, since
+many servers refuse the field),
 `CORRODE_USERS` (path to a JSON `user -> {token, hipfire_token?}` table; present =
 auth on, connections must `Authenticate` before repo-scoped commands, and each
 user's `hipfire_token` — if set — attributes their swarm to a distinct hipfire
