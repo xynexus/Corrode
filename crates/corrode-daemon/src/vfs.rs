@@ -78,17 +78,46 @@ impl PassthroughVfs {
 /// committed) made write_file and read_file reach outside it. The deepest existing part
 /// of the path is checked, so a file about to be created is covered by its parent, and
 /// a dangling link is refused (writing through it would create its outside target).
+/// Returns the real path, which the caller opens with [`open_nofollow`]: a link swapped
+/// in for the checked file after the check is then refused rather than followed.
 /// ponytail: check-then-open, not openat2(RESOLVE_BENEATH): a process racing to swap a
-/// directory for a link between the check and the open can still escape.
-fn confine(root: &Path, full: &Path) -> anyhow::Result<()> {
+/// DIRECTORY on the path for a link between the check and the open can still escape.
+fn confine(root: &Path, full: &Path) -> anyhow::Result<PathBuf> {
     confine_in(root, full, crate::sandbox::home().as_deref())
+}
+
+/// [`confine`] for a write, which also may not land in `.git` (a written
+/// `core.hooksPath` or `fsmonitor` runs code at the human's next `git status`) or
+/// `.corrode` (the graph store and skills, which the sandbox mounts read-only). Judged
+/// on the real path: the path as written let `./.git/config` and a link to `.git`
+/// through.
+fn confine_write(root: &Path, full: &Path) -> anyhow::Result<PathBuf> {
+    let real = confine(root, full)?;
+    let first = real.strip_prefix(real_path(root)?).ok().and_then(|r| r.components().next());
+    if matches!(first, Some(std::path::Component::Normal(c)) if c == ".git" || c == ".corrode") {
+        anyhow::bail!("refusing to write inside .git or .corrode: {}", full.display());
+    }
+    Ok(real)
+}
+
+/// Open `real` (a path [`confine`] resolved) without following a link at its last
+/// component.
+fn open_nofollow(real: &Path, write: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    if write {
+        opts.write(true).create(true).truncate(true);
+    } else {
+        opts.read(true);
+    }
+    opts.custom_flags(libc::O_NOFOLLOW).open(real)
 }
 
 /// [`confine`] with the home directory given: also refuses home's credential stores
 /// ([`crate::sandbox::PROTECTED_HOME_PATHS`]), which a repo of `~` itself contains.
 /// The file tools run in the daemon, outside any sandbox, so this is where they are
 /// kept from `~/.ssh`.
-fn confine_in(root: &Path, full: &Path, home: Option<&Path>) -> anyhow::Result<()> {
+fn confine_in(root: &Path, full: &Path, home: Option<&Path>) -> anyhow::Result<PathBuf> {
     let real = real_path(full)?;
     if !real.starts_with(real_path(root)?) {
         anyhow::bail!("path leaves the repository: {}", full.display());
@@ -101,7 +130,7 @@ fn confine_in(root: &Path, full: &Path, home: Option<&Path>) -> anyhow::Result<(
             anyhow::bail!("refusing a credentials path: {}", p.display());
         }
     }
-    Ok(())
+    Ok(real)
 }
 
 /// `p` with every existing part resolved (symlinks followed) and the part that does
@@ -124,16 +153,6 @@ fn real_path(p: &Path) -> anyhow::Result<PathBuf> {
             }
         }
     }
-}
-
-/// Directories the tool layer may read but never write: `.git` (a written
-/// `core.hooksPath` or `fsmonitor` runs code at the human's next `git status`) and
-/// `.corrode` (the graph store and skills, which the sandbox mounts read-only).
-fn write_protected(path: &str) -> bool {
-    matches!(
-        path.trim_start_matches('/').split('/').next(),
-        Some(".git" | ".corrode")
-    )
 }
 
 #[async_trait]
@@ -204,8 +223,10 @@ impl Vfs for PassthroughVfs {
         let full = self.resolve(path)?;
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-            confine(&root, &full)?;
-            Ok(std::fs::read(full)?)
+            let real = confine(&root, &full)?;
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut open_nofollow(&real, false)?, &mut buf)?;
+            Ok(buf)
         })
         .await?
     }
@@ -253,18 +274,15 @@ impl Vfs for PassthroughVfs {
     }
 
     async fn write(&self, path: &str, contents: &[u8]) -> anyhow::Result<()> {
-        if write_protected(path) {
-            anyhow::bail!("refusing to write inside .git or .corrode: {path}");
-        }
         let full = self.resolve(path)?;
         let contents = contents.to_vec();
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            confine(&root, &full)?;
-            if let Some(parent) = full.parent() {
+            let real = confine_write(&root, &full)?;
+            if let Some(parent) = real.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(full, contents)?;
+            std::io::Write::write_all(&mut open_nofollow(&real, true)?, &contents)?;
             Ok(())
         })
         .await?
@@ -325,6 +343,13 @@ mod tests {
         assert!(vfs.list("dir").await.is_err());
         assert!(vfs.write(".git/config", b"x").await.is_err());
         assert!(vfs.write(".corrode/skills/x/SKILL.md", b"x").await.is_err());
+        // The same, spelled so the first segment is not `.git`, or reached by a link.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::os::unix::fs::symlink(root.join(".git"), root.join("gitdir")).unwrap();
+        assert!(vfs.write("./.git/config", b"x").await.is_err(), "./.git");
+        assert!(vfs.write("gitdir/hooks/pre-commit", b"x").await.is_err(), "link to .git");
+        assert!(vfs.write("sub/./../.git/x", b"x").await.is_err());
+        assert!(!root.join(".git/config").exists() && !root.join(".git/hooks").exists());
 
         // Inside the repo everything still works, links included.
         assert_eq!(vfs.read("alias").await.unwrap(), b"ok");
