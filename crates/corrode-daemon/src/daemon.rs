@@ -1970,6 +1970,13 @@ async fn gate_and_execute(
             names.join(", ")
         )
     } else if let Some(prior) = prior {
+        // A read answered from the turn's cache counts as this task having read the
+        // file, for write_file's staleness check.
+        if call.name == "read_file" {
+            if let Some(path) = call.arguments.get("path").and_then(|p| p.as_str()) {
+                toolbox.note_read(path).await;
+            }
+        }
         prior
     } else if !missing.is_empty() {
         let refused = crate::tools::missing_required_error(call, &missing);
@@ -3665,6 +3672,42 @@ mod tests {
         seen.record(&bad, "exit 127:\ncarg: command not found");
         assert!(seen.repeat(&bad).is_some(), "a failing command's retry stays dead");
         assert!(seen.repeat(&read).is_none(), "the re-read runs for real");
+    }
+
+    // A read the turn's cache answered still counts as the task having read the file:
+    // a sibling's later write makes that task's write from the cached text refused.
+    #[tokio::test]
+    async fn a_cached_read_still_guards_the_write_after_it() {
+        let dir = std::env::temp_dir().join(format!("corrode-occ-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), "one").unwrap();
+        let task = || {
+            ToolBox::new(
+                Arc::new(PassthroughVfs::new(&dir)),
+                dir.clone(),
+                Arc::new(std::collections::HashMap::new()),
+            )
+        };
+        let call = |name: &str, args: serde_json::Value| crate::toolcall::ToolCall {
+            name: name.to_string(),
+            arguments: args,
+        };
+        let approvals = ApprovalGate::auto_approving();
+        let (etx, _erx) = mpsc::channel(64);
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let (a, b, c) = (task(), task(), task());
+        let read = call("read_file", serde_json::json!({"path": "lib.rs"}));
+        gate_and_execute(&read, &a, &approvals, &etx, 1, &mut written, &seen, false, Role::Coder).await;
+        let cached = gate_and_execute(&read, &b, &approvals, &etx, 2, &mut written, &seen, false, Role::Coder).await;
+        assert!(cached.starts_with("note:"), "served from the cache: {cached}");
+        let c_write = call("write_file", serde_json::json!({"path": "lib.rs", "contents": "two"}));
+        gate_and_execute(&c_write, &c, &approvals, &etx, 3, &mut written, &seen, false, Role::Coder).await;
+        let b_write = call("write_file", serde_json::json!({"path": "lib.rs", "contents": "one, edited"}));
+        let refused = gate_and_execute(&b_write, &b, &approvals, &etx, 2, &mut written, &seen, false, Role::Coder).await;
+        assert!(refused.contains("changed since you last read it"), "{refused}");
+        assert_eq!(std::fs::read_to_string(dir.join("lib.rs")).unwrap(), "two");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // Any mutating call that RAN invalidates the cache, whatever it printed. A passing
