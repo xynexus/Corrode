@@ -22,3 +22,23 @@ Corrode
 17. OpenAI client (#48, review s.6): backend seam (respond_turns, embeddings) with hipfire + OpenAI; route the hardest tasks by role/difficulty; per-run cost/rate/budget caps; fall back to local; secrets from env; hipfire KV-reuse request shape unchanged.
 
 Done: all merged with tests, both daemons restarted on merged code, and one full unattended swarm turn on the CAE fixture (sandbox + AUTO_APPROVE on) completing with files written, nothing hanging, memory flat. Report changes, measurements, deferrals.
+
+## Status (2026-10-06)
+
+Items 1-7 and 10-17 are merged with tests: hipfire #428-#436, Corrode #31-#41.
+
+Final check: both daemons were restarted on merged code (hipfire `c9c7eb16e`, Corrode `1b31e37`). One unattended CAE turn then ran with the sandbox on and auto-approve on, using the prompt "write docs/crate-map.md, one heading per crate":
+- 1338 s, 9 tasks, 0 failed, 104 tool calls, no errors, no approval prompts.
+- `docs/crate-map.md` written with all 15 crates; no other file changed.
+- 994k prompt tokens over 68 requests, 800k (80%) of them from a cached prefix.
+- MemAvailable 121 GB idle → about 78 GB with both models resident; low of 73 GB mid-turn, back to 77.5 GB after. The watchdog never fired.
+
+Deferred:
+- 8 (rest): the grouped MoE f32 GEMM is about 55% of A3B prefill and needs a faster bit-exact kernel. Prefill is 328 → 451 tok/s after #434.
+- 9: a decode-width kernel for 9-16 rows (R&D).
+- #31 extras: the fused-vs-serial cell, the spec oracle, and a KVarN smoke in the serving-shape gate.
+- The web UI reconnect is type-checked only, not driven in a browser.
+- The stray `<|im_start|>` in streamed replies (cleaning the stream) is still open.
+- The remote backend counts streamed requests without their tokens, and never sends reasoning effort.
+
+18. New, found live: on hipfire's plain-scaffold path, every turn of `messages` is dropped except the last user message. That path is the default for Qwen3.5-family models without `jinja_chat: on`, and the fallback whenever a template fails to render; the separate `system` field still works. A [system, user] request counts the same tokens as user-only: on `qwen3.5:9b` (Corrode's offline `CORRODE_MODEL` default), 162 tokens versus 845 with the text merged. So system prompts, history, tool calls and tool results are lost silently. The configured swarm models carry `jinja_chat: on` and are unaffected. Fix: a messages-aware `ChatFrame::build_messages`, used at every plain render site in serving-core (about 12; see `generate.rs`, `generate_arch.rs`, `qwen35_prefill.rs`). The test: [system, user] must render like `system` + user.
