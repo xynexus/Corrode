@@ -49,6 +49,14 @@ const WHOLE: &[&str] = &[
     "CORRODE_MAX_TOKENS",
     "CORRODE_CONTEXT_TOKENS",
     "CORRODE_FANOUT",
+    "CORRODE_OPENAI_MAX_INFLIGHT",
+];
+
+/// Dollar amounts: the remote's per-turn budget and its prices.
+const USD: &[&str] = &[
+    "CORRODE_OPENAI_BUDGET_USD",
+    "CORRODE_OPENAI_PRICE_IN",
+    "CORRODE_OPENAI_PRICE_OUT",
 ];
 
 const FRACTIONS: &[&str] = &["CORRODE_SKILL_ACTIVATE_MIN", "CORRODE_SKILL_LIST_MIN"];
@@ -77,6 +85,49 @@ fn check_with(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
     for k in FRACTIONS {
         if let Some(v) = set(k).filter(|v| v.parse::<f32>().is_err()) {
             bad.push(format!("{k}={v:?}: expected a number"));
+        }
+    }
+    for k in USD {
+        if let Some(v) =
+            set(k).filter(|v| !v.parse::<f64>().is_ok_and(|x| x.is_finite() && x >= 0.0))
+        {
+            bad.push(format!(
+                "{k}={v:?}: expected a non-negative number of dollars"
+            ));
+        }
+    }
+    if let Some(v) = set("CORRODE_OPENAI_ROLES") {
+        let unknown: Vec<&str> = v
+            .split(',')
+            .map(str::trim)
+            .filter(|r| crate::roles::Role::from_str(r).is_none())
+            .collect();
+        if !unknown.is_empty() {
+            bad.push(format!(
+                "CORRODE_OPENAI_ROLES={v:?}: unknown role(s) {}; expected research/orchestration/architect/coder/review",
+                unknown.join(", ")
+            ));
+        }
+    }
+    if let Some(v) = set("CORRODE_OPENAI_BASE_URL")
+        .filter(|v| !v.starts_with("http://") && !v.starts_with("https://"))
+    {
+        bad.push(format!(
+            "CORRODE_OPENAI_BASE_URL={v:?}: expected an http(s) URL"
+        ));
+    }
+    // Remote settings without a model would leave routing silently off.
+    if set("CORRODE_OPENAI_MODEL").is_none() {
+        for k in [
+            "CORRODE_OPENAI_ROLES",
+            "CORRODE_OPENAI_BASE_URL",
+            "CORRODE_OPENAI_BUDGET_USD",
+        ] {
+            if set(k).is_some() {
+                bad.push(format!(
+                    "{k} is set but CORRODE_OPENAI_MODEL is not: name the remote model"
+                ));
+            }
         }
     }
     let per_role = crate::roles::Role::ALL
@@ -132,6 +183,36 @@ mod tests {
         ] {
             assert!(bad.iter().any(|b| b.contains(k)), "{k} not refused: {bad:?}");
         }
+    }
+
+    #[test]
+    fn remote_knobs_are_checked_and_need_a_model() {
+        let bad = check_of(&[
+            ("CORRODE_OPENAI_ROLES", "review,boss"),
+            ("CORRODE_OPENAI_BUDGET_USD", "-1"),
+            ("CORRODE_OPENAI_PRICE_IN", "cheap"),
+            ("CORRODE_OPENAI_BASE_URL", "api.openai.com/v1"),
+        ]);
+        for k in [
+            "boss",
+            "BUDGET_USD=",
+            "PRICE_IN",
+            "http(s) URL",
+            "CORRODE_OPENAI_MODEL is not",
+        ] {
+            assert!(
+                bad.iter().any(|b| b.contains(k)),
+                "{k} not refused: {bad:?}"
+            );
+        }
+        assert!(check_of(&[
+            ("CORRODE_OPENAI_MODEL", "deepseek-chat"),
+            ("CORRODE_OPENAI_ROLES", "orchestration, review"),
+            ("CORRODE_OPENAI_BASE_URL", "http://127.0.0.1:8000/v1"),
+            ("CORRODE_OPENAI_BUDGET_USD", "2"),
+            ("CORRODE_OPENAI_PRICE_IN", "0.27"),
+        ])
+        .is_empty());
     }
 
     #[test]

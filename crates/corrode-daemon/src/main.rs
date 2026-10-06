@@ -43,6 +43,7 @@ mod session;
 mod skills;
 mod swarm;
 mod telemetry;
+mod remote;
 mod terminal;
 mod trace;
 mod toolcall;

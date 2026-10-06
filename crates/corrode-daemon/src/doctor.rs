@@ -70,6 +70,26 @@ pub async fn run() -> bool {
         }
     }
 
+    // --- remote endpoint (optional; work falls back to hipfire without it) ---
+    if let Some(r) = crate::remote::Remote::from_env() {
+        info(&r.describe());
+        match r.client.list_models().await {
+            Ok(models) if models.contains(&r.model) => {
+                ok(&format!("remote serves {}", r.model))
+            }
+            Ok(models) => warn(&format!(
+                "remote at {} does not list {} ({} model(s) listed); its work will fall back to hipfire if it refuses",
+                r.client.base_url(),
+                r.model,
+                models.len()
+            )),
+            Err(e) => warn(&format!(
+                "remote at {} unreachable ({e}); its work will fall back to hipfire",
+                r.client.base_url()
+            )),
+        }
+    }
+
     // --- sandbox (only meaningful when enabled) ---
     let repo = std::env::var("CORRODE_REPO").unwrap_or_else(|_| ".".into());
     let sandbox_on = crate::knobs::flag("CORRODE_SANDBOX", true);
