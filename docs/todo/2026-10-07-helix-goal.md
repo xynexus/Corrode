@@ -63,3 +63,79 @@ Done:
   - LMDB commits per turn, before and after;
   - the context-prefix A/B;
   - changes, measurements and deferrals.
+
+## Status (2026-10-07)
+
+Every item is merged with tests:
+- Corrode #63, #64 and #66–#70;
+- hipfire #455–#457;
+- #62 corrected item 3 to load models from the local store, not `/srv`.
+
+Also done, at the user's request:
+- **ROCm.** The host moved from a June ROCm 7.14 nightly to stable **ROCm 10.1.0** (the TheRock gfx1151 tarball); 7.14 is kept in `~/rocm-backup`.
+  - The GPU gates gave identical results on 7.14 and 10.1. The full agentic gate fails one cell on both: Qwen3.5-35B-A3B `pi_clamped`, a model that doesn't serve the swarm.
+  - Performance is equal or slightly better: A3B pp512 588 → 604 tok/s, 27B pp512 344 → 349, decode unchanged.
+- **AMD agent skills** vendored (#65): `third_party/amd-skills`, all 12 in `.agents/skills` and `.claude/skills`.
+- **Models.** The embedding and reranker models were copied into `~/.hipfire/models`.
+
+### Done check
+
+The standing daemon (7878) runs merged main (`fe8857e`) as a release `--features helix,docling` build, with the NPU embedder and the reranker served. One unattended CAE crate-map turn ran on it, sandbox and auto-approve on:
+
+| | base build (previous goal) | helix deploy |
+|---|---|---|
+| turn time | 910 s | 1643 s |
+| tool results | | 127 |
+| errors | 0 | 0 |
+| files written | `docs/crate-map.md` | `docs/crate-map.md` (15 crates), nothing else |
+| prefix reuse | 86% | 73.6% over 58 sessions |
+| MemAvailable | low 76 GB | 117.8 idle → low 74.1 → 74.5 GB after (flat once both models resident) |
+| store | none | 101 MB, the whole repository (911 files ingested at session open in 2 s) |
+
+Turn times on this prompt varied from 953 to 1643 s across today's runs.
+
+The store agrees with disk: the recorded oids matched `git hash-object` for the written file and 20 random tracked files (21/21).
+
+### Measurements
+
+**Items 1–2, build contention.** Three cold CAE builds ran beside both swarm models. Decode tok/s; idle is 27B 14.8, 35B 58.5.
+
+| | 27B | 35B |
+|---|---|---|
+| `-j32` (before) | 12.2 (−18%) | 46.9 (−20%) |
+| spawn policy | 13.0 (−12%) | 57.7 (−1%) |
+
+- The policy is `CARGO_BUILD_JOBS=8`, plus a 16 GB systemd scope with no swap; the defaults are the user's.
+- One build alone costs 6% at `-j32` and 3% at `-j8`.
+- nice/ionice changed nothing. The APU's GPU clock falls as the CPU draws power.
+
+**Item 3, embeddings.**
+- hipfire serves embeddings only on the NPU. The Qwen3-Embedding-0.6B source was downloaded (the user's choice), calibrated from activation statistics, and quantized `--npu-embedding oq8+`.
+- Two hipfire fixes made it serve correctly: the LUT3-coded table loads (#455), and inputs end with the `<|endoftext|>` the model pools (#456). Cosine to the fp32 model is 0.9997.
+- The 0.6B reranker serves on the GPU.
+
+**Item 5, store write transactions per turn** (LMDB's last transaction id):
+
+| turn | main | after #67/#68 |
+|---|---|---|
+| crate-map | 46 | 8 |
+| audit | 1,278 | 9 |
+
+On main, one audit task wrote 65 notes with 1,170 edges, each committed separately. After the change, each task's trace is one transaction. The audit run on the new build was stopped at about 80 minutes, longer than main's whole 57-minute turn.
+
+**Item 8, context from the graph.** CAE crate-map turn, B (without) vs C (with):
+- Both named 15 of 16 crates and invented none.
+- Requests per task fell from **11.5 to 4.7**.
+- The summaries followed each crate's own docs: B called `cae-thermal` "on the constraint graph", which its doc contradicts ("graph-free"). C quoted its modules.
+
+**Item 10.** A non-streamed batched reply reports `tok_s`, `decode_tok_s` and `ttft_ms` (before: token counts only).
+
+### Deferred
+- **Item 8 used BM25 plus the cross-encoder, not embedding search.** Code nodes carry no vectors, and the NPU embedder (~300 tok/s) would take over an hour per CAE-sized repository. The section is cached per turn, so adding vectors later changes nothing else.
+- **The sweep reads every held tracked file each turn** (`ponytail:`). Drive it from `git status` once repositories get large.
+- **The initial ingest is not batched** (two transactions per file, one-time).
+- **The EmbeddingGemma path still embeds unframed inputs.** There is no local source to verify it against.
+- **hipfire's reported `usage.prompt_tokens` undercounts** embedding inputs.
+- **The full agentic gate's `pi_clamped` cell** fails for Qwen3.5-35B-A3B, on 7.14 and 10.1 alike.
+- **The `rocm` CLI** (which drives the vendored `rocm-doctor` skill) is not installed; it needs consent for a remote installer.
+- **Item 9 was checked with the page's frame sequence, not in a browser.** Typing an auth token into the LAN-served page is outside what browser automation may do.
