@@ -17,6 +17,14 @@ use corrode_core::GraphNodeView;
 /// The daemon's view of the embedded store. Kept as a trait so the swarm/VFS code
 /// and its tests don't drag the (heavy, feature-gated) HelixDB compile in, and so
 /// the daemon can hold it as `Option<Arc<dyn GraphStore>>` (None until opened).
+/// The node recording which embedding model (and dimension) made the store's vectors.
+pub const EMBEDDING_META: &str = "meta:embedding";
+
+/// How a store records its vectors' maker: `"{model} dim={n}"`.
+pub fn embedding_identity(model: &str, dim: usize) -> String {
+    format!("{model} dim={dim}")
+}
+
 pub trait GraphStore: Send + Sync {
     /// The one-hop neighborhood around `id` — the queried node plus every adjacent
     /// node in either direction — for the explorer's interactive graph browse
@@ -36,6 +44,32 @@ pub trait GraphStore: Send + Sync {
 
     /// Create-or-update a provenance node (plan / task / contract / code) by id.
     fn upsert_node(&self, id: &str, kind: &str, label: &str) -> anyhow::Result<()>;
+
+    /// The label of the node with this id, if there is one.
+    fn node_label(&self, _id: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Whether vectors made under `identity` (`"{model} dim={n}"`) may be written:
+    /// the store's first vector write records its identity, and a write under another
+    /// is refused. All vectors share one HNSW index, so a second model's would sit
+    /// beside the first's and every search would rank across both (#47).
+    fn admit_vector_write(&self, identity: &str) -> anyhow::Result<bool> {
+        match self.node_label(EMBEDDING_META)? {
+            None => {
+                self.upsert_node(EMBEDDING_META, "meta", identity)?;
+                Ok(true)
+            }
+            Some(stored) => Ok(stored == identity),
+        }
+    }
+
+    /// Whether a query vector made under `identity` can search the stored ones: not
+    /// when they were made by another model or dimension -- the search either errors
+    /// (dimension) or ranks nonsense (model). A store with no vectors yet is fine.
+    fn vectors_searchable(&self, identity: &str) -> anyhow::Result<bool> {
+        Ok(self.node_label(EMBEDDING_META)?.is_none_or(|stored| stored == identity))
+    }
 
     /// Add a directed, labelled provenance edge (`from -rel-> to`), e.g. a code node
     /// `produced_by` its task, a task `part_of` its plan. Idempotent per (from,rel,to).
@@ -428,6 +462,15 @@ pub mod embedded {
             self.upsert_in(&mut txn, &arena, id, kind, label)?;
             txn.commit()?;
             Ok(())
+        }
+
+        fn node_label(&self, id: &str) -> anyhow::Result<Option<String>> {
+            let arena = Bump::new();
+            let txn = self.storage.graph_env.read_txn()?;
+            let found: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
+                .n_from_index(LABEL, "key", &id.to_string())
+                .take_and_collect_to(1);
+            Ok(found.first().map(|n| prop_str(n, "label")))
         }
 
         fn add_edge(&self, from: &str, rel: &str, to: &str) -> anyhow::Result<()> {
@@ -1435,6 +1478,30 @@ pub mod embedded {
                 "only code nodes, (path, id): {got:?}"
             );
 
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        // The first vector write records its maker; another model's vectors are
+        // refused and its queries kept off the index, instead of mixing in one HNSW.
+        #[test]
+        fn the_store_keeps_one_embedding_model() {
+            let dir = scratch_dir("embedid");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+            let qwen = embedding_identity("Qwen3-Embedding-0.6B--npu.oq8+.gfx1151", 1024);
+            let gemma = embedding_identity("EmbeddingGemma-300M.bf16", 768);
+
+            assert!(store.vectors_searchable(&gemma).unwrap(), "no vectors yet: any query");
+            assert!(store.admit_vector_write(&qwen).unwrap());
+            assert_eq!(store.node_label(EMBEDDING_META).unwrap(), Some(qwen.clone()));
+            assert!(store.admit_vector_write(&qwen).unwrap(), "same model: still admitted");
+            assert!(!store.admit_vector_write(&gemma).unwrap(), "another model: refused");
+            assert!(store.vectors_searchable(&qwen).unwrap());
+            assert!(!store.vectors_searchable(&gemma).unwrap());
+            assert!(
+                !store.vectors_searchable(&embedding_identity("Qwen3-Embedding-0.6B--npu.oq8+.gfx1151", 256)).unwrap(),
+                "a truncated dimension cannot search the full-width vectors"
+            );
             std::fs::remove_dir_all(&dir).ok();
         }
 

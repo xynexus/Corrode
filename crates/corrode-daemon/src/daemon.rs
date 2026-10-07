@@ -1385,16 +1385,35 @@ impl Daemon {
                     .into(),
             };
         };
-        let query_vec = match session.skills.embed_model() {
+        let model = session.skills.embed_model().map(str::to_string);
+        let query_vec = match &model {
             Some(model) => self.swarm.client().embed_query(model, question).await.ok(),
             None => None,
         };
         // LMDB read txn + HNSW search are sync — off the tokio worker.
         let store = Arc::clone(g);
         let q = question.to_string();
-        let searched =
-            tokio::task::spawn_blocking(move || store.doc_search(&q, query_vec.as_deref(), 8))
-                .await;
+        let searched = tokio::task::spawn_blocking(move || {
+            // Vectors another model made cannot rank this one's query: BM25 only.
+            let query_vec = match (query_vec, &model) {
+                (Some(v), Some(m)) => {
+                    let mine = crate::graph::embedding_identity(m, v.len());
+                    if store.vectors_searchable(&mine)? {
+                        Some(v)
+                    } else {
+                        eprintln!(
+                            "doc query: the store's vectors were made by {:?}, not {mine}; \
+                             searching by text only",
+                            store.node_label(crate::graph::EMBEDDING_META)?.unwrap_or_default()
+                        );
+                        None
+                    }
+                }
+                _ => None,
+            };
+            store.doc_search(&q, query_vec.as_deref(), 8)
+        })
+        .await;
         let hits = match searched {
             Ok(Ok(hits)) => hits,
             Ok(Err(e)) => {
@@ -1536,6 +1555,10 @@ impl Daemon {
             return false;
         };
         let embeddings = self.embed_chunks(session, &doc.chunks).await;
+        let identity = embeddings.as_ref().and_then(|v| {
+            let dim = v.iter().flatten().next()?.len();
+            Some(crate::graph::embedding_identity(session.skills.embed_model()?, dim))
+        });
         let chunks = doc
             .chunks
             .iter()
@@ -1545,13 +1568,30 @@ impl Daemon {
                 (id.clone(), text.clone(), emb)
             })
             .collect();
-        let write = crate::graph::DocWrite {
+        let mut write = crate::graph::DocWrite {
             doc_id: doc.doc_id.clone(),
             title: doc.title.clone(),
             chunks,
         };
         let store = Arc::clone(store);
-        match tokio::task::spawn_blocking(move || store.replace_doc(&write)).await {
+        let written = tokio::task::spawn_blocking(move || {
+            // One model's vectors per store: another's are dropped, the text kept.
+            if let Some(mine) = identity {
+                if !store.admit_vector_write(&mine)? {
+                    eprintln!(
+                        "doc ingest: the store's vectors were made by {:?}, not {mine}; \
+                         {} is stored without vectors (searchable by text)",
+                        store.node_label(crate::graph::EMBEDDING_META)?.unwrap_or_default(),
+                        write.doc_id
+                    );
+                    for chunk in &mut write.chunks {
+                        chunk.2 = None;
+                    }
+                }
+            }
+            store.replace_doc(&write)
+        });
+        match written.await {
             Ok(Ok(())) => true,
             Ok(Err(e)) => {
                 eprintln!("doc persistence unavailable ({e}); skipping");

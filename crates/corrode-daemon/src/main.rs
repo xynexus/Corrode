@@ -131,7 +131,14 @@ async fn main() -> anyhow::Result<()> {
     // Discover Agent Skills (.agents/skills + .corrode/skills, project + ~/) and
     // project AGENTS.md, then embed skill descriptions for relevance-ranked selection
     // (if hipfire serves an embedding model). Falls back to the full manifest.
-    let embed_model = roles::default_embedding_model(&models).map(str::to_string);
+    let embed_model = match roles::embedding_model(&models, roles::embed_model_env().as_deref()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{e}; retrieval falls back to text (BM25) and the full skill manifest");
+            None
+        }
+    };
+    eprintln!("embedding model: {}", embed_model.as_deref().unwrap_or("none"));
     let project = project::Project::load(std::path::Path::new(&repo_root));
     let skills = skills::SkillContext::build(
         std::path::Path::new(&repo_root),

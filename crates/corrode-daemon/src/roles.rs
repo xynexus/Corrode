@@ -140,6 +140,25 @@ const NON_CHAT_MARKERS: &[&str] = &[
     "krea", "flux", "sdxl", "sd3", "stable-diffusion", "-sd", "pixart", "kolors", "imagen",
 ];
 
+/// The embedding model for retrieval (skill ranking, doc and code search):
+/// `CORRODE_EMBED_MODEL` when set -- it must be served, and `off` turns embedding
+/// retrieval off -- else [`default_embedding_model`]. The default takes the first id
+/// containing "embed", which on a host with several (a bf16 copy hipfire can only
+/// serve as an NPU artifact, a second family) may be one that cannot embed at all.
+pub fn embedding_model(available: &[String], wanted: Option<&str>) -> anyhow::Result<Option<String>> {
+    match wanted {
+        Some(w) if crate::knobs::parse_flag(w) == Some(false) => Ok(None),
+        Some(w) if available.iter().any(|a| a == w) => Ok(Some(w.to_string())),
+        Some(w) => anyhow::bail!("CORRODE_EMBED_MODEL={w} is not a model hipfire serves"),
+        None => Ok(default_embedding_model(available).map(str::to_string)),
+    }
+}
+
+/// `CORRODE_EMBED_MODEL`, if set.
+pub fn embed_model_env() -> Option<String> {
+    std::env::var("CORRODE_EMBED_MODEL").ok().filter(|v| !v.is_empty())
+}
+
 /// The embedding model to use for retrieval (skill/doc selection): the first served
 /// model that looks like an embedding model. `None` if hipfire serves none.
 pub fn default_embedding_model(available: &[String]) -> Option<&str> {
@@ -220,6 +239,22 @@ mod tests {
 
     // An override hipfire does not serve is refused by name, not swapped for the
     // default pick.
+    #[test]
+    fn the_embedding_model_is_the_operators_when_named() {
+        let served: Vec<String> = ["EmbeddingGemma-300M.bf16", "Qwen3-Embedding-0.6B--npu.oq8+.gfx1151", "Qwen3.8-27B--oq4.25++"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pick = |w: Option<&str>| embedding_model(&served, w);
+        assert_eq!(pick(None).unwrap().as_deref(), Some("EmbeddingGemma-300M.bf16"), "first 'embed' id");
+        assert_eq!(
+            pick(Some("Qwen3-Embedding-0.6B--npu.oq8+.gfx1151")).unwrap().as_deref(),
+            Some("Qwen3-Embedding-0.6B--npu.oq8+.gfx1151")
+        );
+        assert_eq!(pick(Some("off")).unwrap(), None);
+        assert!(pick(Some("Qwen3-Embedding-8B")).is_err(), "a typo is an error, not a silent default");
+    }
+
     #[test]
     fn resolve_refuses_an_unserved_override() {
         let available = vec!["Gemma-3-27B".to_string()];

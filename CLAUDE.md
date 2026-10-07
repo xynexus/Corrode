@@ -85,7 +85,14 @@ works out of the box; absent -> tool-caller disabled, swarm falls back to
 model-emitted calls), `CORRODE_SKILL_ACTIVATE_MIN` (cosine bar to inject a skill's full body,
 default 0.35), `CORRODE_SKILL_LIST_MIN` (cosine bar to list a skill at all, default
 0.30 — below it the skills section is omitted rather than filled with the
-least-irrelevant matches), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -> tool-profile` file
+least-irrelevant matches), `CORRODE_EMBED_MODEL` (the served embedding model for skill
+ranking and doc/code search; must be one hipfire serves, `off` disables; unset -> the first
+served id containing "embed", which may be one that cannot embed -- `doctor` asks it for a
+vector. Here: `Qwen3-Embedding-0.6B--npu.oq8+.gfx1151`, hipfire's NPU artifact. The graph
+store records which model and dimension made its vectors (`meta:embedding`); vectors from
+another are not written and its queries search by text, both logged),
+`CORRODE_RERANK_MODEL` (a served cross-encoder that reorders graph search hits, e.g.
+`Qwen3-Reranker-0.6B--oq8`; unset -> no reranking), `CORRODE_TOOL_DIALECTS` (path to a JSON `model-glob -> tool-profile` file
 — per-model tool names/schema/parse; absent -> the built-in Needle default),
 `CORRODE_NEEDLE_MODEL_ID` (dialect key for the Needle caller, default `needle`),
 `CORRODE_DAEMON_ADDR` (daemon ws bind, default `127.0.0.1:7878`),
