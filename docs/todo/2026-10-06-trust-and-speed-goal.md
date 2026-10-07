@@ -54,7 +54,7 @@ Measurements:
   - GTT max: 41.7 → 43.0 GiB
   - MemAvailable min: 76.1 → 74.9 GB
 
-  Neutral on this workload, which has fewer than 4 live tails per worker.
+  Neutral on this workload.
 - 11: at effort `none` the 27B's streamed answer used to arrive entirely as reasoning; now it arrives as the answer.
 - 12: in Chrome, restarting corrode-web mid-turn rebuilt the console from the replay and live events resumed (after #58; before it, nothing replayed).
 
