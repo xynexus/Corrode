@@ -1867,20 +1867,32 @@ pub(crate) fn context_tokens() -> usize {
 
 
 /// Whether a request of `prompt`, the replayed `turns` and the declared `tools` leaves
-/// less than one output cap of the context. Estimated, not tokenized: 3 bytes per
-/// token is conservative for code and markdown (Qwen's tokenizer averages ~3.5-4 on
-/// this repo). The tools count: they render into the system turn, ~2-4 KB of JSON.
+/// less than one output cap of the context. Estimated, not tokenized: at the bytes per
+/// token the task's previous request measured (`hipfire::bytes_per_token`, held to
+/// 3-4), else 3 -- conservative for code and markdown, which Qwen's tokenizer averages
+/// ~3.5-4 on; a flat 3 elided outputs at ~20K real tokens of a 24K budget. The tools
+/// count: they render into the system turn, ~2-4 KB of JSON.
 fn over_context_budget(
     prompt: &str,
     turns: &[serde_json::Value],
     tools: Option<&serde_json::Value>,
 ) -> bool {
+    context_estimate(prompt, turns, tools) > context_tokens()
+}
+
+/// The tokens a request would take, its output cap included.
+fn context_estimate(
+    prompt: &str,
+    turns: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+) -> usize {
     let bytes = prompt.len()
         + turns.iter().map(|t| t.to_string().len()).sum::<usize>()
         + tools.map_or(0, |t| t.to_string().len());
+    let per_token = crate::hipfire::bytes_per_token().unwrap_or(3.0).clamp(3.0, 4.0);
     // Keep a whole output cap free: hipfire clamps a reply to the KV capacity left, so
     // a 4096-token reserve under an 8192-token cap cut long final answers short.
-    bytes / 3 + crate::hipfire::max_output_tokens() as usize > context_tokens()
+    (bytes as f64 / per_token) as usize + crate::hipfire::max_output_tokens() as usize
 }
 
 const ELIDED: &str = "[observation elided";
@@ -1891,18 +1903,30 @@ const ELIDED: &str = "[observation elided";
 /// only from the second step and never before the final answer, so a step that read six
 /// files could overflow the very request meant to conclude the task -- a 500 that also
 /// failed its batch-mates.
+///
+/// Once over, it elides until the turns take at most half the room the prompt and
+/// output cap leave them, not just until it fits. An elision rewrites an early turn,
+/// and hipfire reuses a request's prefill only up to the first turn that changed, so
+/// everything after it is prefilled again. Eliding one output per step made every step
+/// past the limit such a miss: a CAE review fell back to its first prompt on 5 of its
+/// 17 steps, ~11K tokens each time.
 fn fit_context(
     prompt: &str,
     turns: &mut [serde_json::Value],
     tools: Option<&serde_json::Value>,
 ) -> bool {
-    while over_context_budget(prompt, turns, tools) {
+    if !over_context_budget(prompt, turns, tools) {
+        return true;
+    }
+    let base = context_estimate(prompt, &[], tools);
+    let low_water = context_tokens() - context_tokens().saturating_sub(base) / 2;
+    while context_estimate(prompt, turns, tools) > low_water {
         let oldest = turns.iter_mut().find(|t| {
             t["type"] == "function_call_output"
                 && !t["output"].as_str().unwrap_or_default().starts_with(ELIDED)
         });
         let Some(turn) = oldest else {
-            return false;
+            return !over_context_budget(prompt, turns, tools);
         };
         let n = turn["output"].as_str().map_or(0, str::len);
         turn["output"] = serde_json::json!(format!(
@@ -3327,6 +3351,27 @@ mod tests {
         assert!(!elided(&turns[5]), "the newest is kept");
         let huge = "x".repeat(200_000);
         assert!(!super::fit_context(&huge, &mut turns, None), "the prompt alone does not fit");
+    }
+
+    // Past the limit it elides in one batch, leaving room: the next steps' requests
+    // extend this one byte for byte (hipfire reuses their prefill) rather than each
+    // eliding one more early output and re-prefilling everything after it.
+    #[test]
+    fn eliding_leaves_room_so_the_next_steps_extend_the_request() {
+        let read = |n: usize| serde_json::json!({"type": "function_call_output", "call_id": n.to_string(), "output": "y".repeat(6_000)});
+        let prompt = "x".repeat(10_000);
+        let mut turns: Vec<_> = (0..12).map(read).collect();
+        assert!(super::fit_context(&prompt, &mut turns, None));
+        for step in 12..15 {
+            let before = turns.clone();
+            turns.push(read(step));
+            assert!(super::fit_context(&prompt, &mut turns, None));
+            assert_eq!(&turns[..before.len()], &before[..], "step {step} only appended");
+        }
+        // A prompt that fits only once every output is gone still fits.
+        let tight = "x".repeat(70_000);
+        let mut turns: Vec<_> = (0..3).map(read).collect();
+        assert!(super::fit_context(&tight, &mut turns, None));
     }
 
     // The Needle loop's scratchpad drops its oldest exchanges to fit.
