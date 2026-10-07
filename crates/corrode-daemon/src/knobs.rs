@@ -120,6 +120,16 @@ fn check_with(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
             EFFORTS.join("/")
         ));
     }
+    // A systemd size (`16G`, `512M`, `25%` of RAM) or off; anything else would make
+    // every capped command fail to start.
+    if let Some(v) = set("CORRODE_COMMAND_MEMORY_MAX").filter(|v| {
+        let n = v.trim_end_matches(['K', 'M', 'G', 'T', '%']);
+        parse_flag(v) != Some(false) && !(n.len() + 1 >= v.len() && n.parse::<u64>().is_ok_and(|n| n > 0))
+    }) {
+        bad.push(format!(
+            "CORRODE_COMMAND_MEMORY_MAX={v:?}: expected a size like 16G or 512M, a share of RAM like 25%, or off"
+        ));
+    }
     if let Some(v) = set("CORRODE_OPENAI_BASE_URL")
         .filter(|v| !v.starts_with("http://") && !v.starts_with("https://"))
     {
@@ -233,6 +243,17 @@ mod tests {
         let bad = check_of(&[("CORRODE_VFS_GRAPH", "maybe"), ("CORRODE_VFS_VERIFY", "sure")]);
         assert_eq!(bad.len(), 2, "{bad:?}");
         assert!(check_of(&[("CORRODE_VFS_GRAPH", "yes"), ("CORRODE_VFS_VERIFY", "0")]).is_empty());
+    }
+
+    // A cap systemd cannot read would fail every command at its first spawn.
+    #[test]
+    fn the_command_memory_cap_must_be_a_size() {
+        for good in ["16G", "512M", "25%", "off", "0"] {
+            assert!(check_of(&[("CORRODE_COMMAND_MEMORY_MAX", good)]).is_empty(), "{good}");
+        }
+        for bad in ["lots", "16GB", "G", "16g", "-4G"] {
+            assert_eq!(check_of(&[("CORRODE_COMMAND_MEMORY_MAX", bad)]).len(), 1, "{bad}");
+        }
     }
 
     #[test]

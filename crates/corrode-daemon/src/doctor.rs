@@ -124,6 +124,17 @@ pub async fn run() -> bool {
         );
     }
 
+    // --- spawn policy (every command, confined or not) ---
+    let policy = crate::sandbox::SpawnPolicy::from_env();
+    match &policy.uncapped {
+        None => ok(&format!("spawn policy: {}", policy.describe())),
+        Some(why) => warn(&format!(
+            "spawn policy: commands run with no memory cap ({why}) -- a runaway build or \
+             test can take the RAM hipfire serves from; set CORRODE_COMMAND_MEMORY_MAX=off \
+             to accept that"
+        )),
+    }
+
     if crate::knobs::flag("CORRODE_AUTO_APPROVE", false) {
         if sandbox_on {
             info("auto-approve: on — writes and commands run without a human, inside the sandbox");
