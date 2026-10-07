@@ -223,10 +223,6 @@ impl Sandbox {
         Self { enabled: false, share_net: false, policy: SpawnPolicy::default() }
     }
 
-    pub fn policy(&self) -> &SpawnPolicy {
-        &self.policy
-    }
-
     /// Turn `argv` (program + args) into the argv actually spawned: the spawn policy's
     /// env defaults just before the command, bwrap confinement to `repo` around it when
     /// enabled, and the policy's capped scope outermost. Returns `(program, args)` so
