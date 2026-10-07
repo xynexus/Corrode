@@ -47,6 +47,10 @@ pub struct TaskRecord<'a> {
     /// Requests and tokens the task's calls cost (retries included).
     #[serde(flatten)]
     pub usage: crate::hipfire::Usage,
+    /// Each of those calls: wall time, tokens, and hipfire's time to first token and
+    /// decode rate -- what a turn profile is built from.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<crate::hipfire::CallStat>,
     /// How an `ok` task ended when it was not a plain answer (`turn budget`), so a
     /// budget stop does not read like a clean finish.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,6 +74,9 @@ pub struct TurnRecord<'a> {
     pub duration_s: u64,
     /// The planner's calls.
     pub planner: crate::hipfire::Usage,
+    /// Each of them, as `TaskRecord::calls`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub planner_calls: Vec<crate::hipfire::CallStat>,
     /// Every task's calls, summed.
     pub usage: crate::hipfire::Usage,
     /// Spent on the remote endpoint, the planner included.
@@ -163,6 +170,7 @@ mod tests {
                 output_tokens: 400,
                 cached_tokens: 8100,
             },
+            calls: Vec::new(),
             stop: None,
             remote_usd: None,
         }
@@ -218,6 +226,7 @@ mod tests {
             failed: 1,
             duration_s: 100,
             planner: Default::default(),
+            planner_calls: Vec::new(),
             usage: rec("", true).usage,
             remote_usd: 0.25,
         });

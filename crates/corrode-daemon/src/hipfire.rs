@@ -344,10 +344,28 @@ pub struct WireUsage {
 /// carry to hipfire (`X-Request-Id: <id>/<n>`, which hipfire echoes and names its
 /// session and log lines after) and what they cost. A task-local, so the tool loops
 /// need no extra plumbing: the client fills it in whenever it is set.
+/// One request as a turn profile needs it: how long the client waited for it (its
+/// own slot wait included), what it sent and got back, and where hipfire says the time
+/// went when it reports `timings` -- time to first token (queueing and prefill) and
+/// the decode rate after it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CallStat {
+    pub wall_ms: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_tok_s: Option<f64>,
+}
+
 pub struct CallScope {
     id: String,
     seq: std::sync::atomic::AtomicU64,
     usage: std::sync::Mutex<Usage>,
+    /// Each request, in order.
+    calls: std::sync::Mutex<Vec<CallStat>>,
     /// The part of `usage` spent on the remote endpoint (`crate::remote`), which is
     /// what costs money.
     remote: std::sync::Mutex<Usage>,
@@ -374,9 +392,14 @@ impl CallScope {
             id,
             seq: Default::default(),
             usage: Default::default(),
+            calls: Default::default(),
             remote: Default::default(),
             deterministic,
         })
+    }
+
+    pub fn calls(&self) -> Vec<CallStat> {
+        self.calls.lock().unwrap().clone()
     }
 
     pub fn usage(&self) -> Usage {
@@ -448,13 +471,23 @@ fn chat_usage(reply: &serde_json::Value) -> Usage {
     }
 }
 
-/// Add one request's usage to the running scope, if any.
-fn record_usage(u: Usage, remote: bool) {
+/// Add one request's usage, and its profile line, to the running scope, if any.
+/// `started` is when the client began waiting for it; `timings` is hipfire's own
+/// account of the request, when the reply carries one.
+fn record_call(u: Usage, remote: bool, started: std::time::Instant, timings: Option<&serde_json::Value>) {
     let _ = CALLS.try_with(|c| {
         c.usage.lock().unwrap().add(u);
         if remote {
             c.remote.lock().unwrap().add(u);
         }
+        c.calls.lock().unwrap().push(CallStat {
+            wall_ms: started.elapsed().as_millis() as u64,
+            input_tokens: u.input_tokens,
+            cached_tokens: u.cached_tokens,
+            output_tokens: u.output_tokens,
+            ttft_ms: timings.and_then(|t| t["ttft_ms"].as_f64()),
+            decode_tok_s: timings.and_then(|t| t["decode_tok_s"].as_f64()),
+        });
     });
 }
 
@@ -509,6 +542,9 @@ pub struct ResponsesReply {
     /// answer stays clean and the reasoning is still recoverable.
     #[serde(default)]
     pub output: Vec<OutputItem>,
+    /// hipfire's account of the request (`ttft_ms`, `decode_tok_s`, ...), when given.
+    #[serde(default)]
+    pub timings: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -846,11 +882,12 @@ impl Client {
             reasoning_effort: effort,
         };
         let body = serde_json::to_value(&req)?;
+        let started = std::time::Instant::now();
         let reply = {
             let _permit = self.inflight.acquire().await?;
             self.post_responses(&body, owner_token).await?
         };
-        record_usage(responses_usage(reply.usage.as_ref()), false);
+        record_call(responses_usage(reply.usage.as_ref()), false, started, reply.timings.as_ref());
         let reasoning = reply.reasoning().to_string();
         if reply.status == "incomplete" {
             let reason = reply
@@ -989,10 +1026,11 @@ impl Client {
         if let Some(tools) = tools {
             body["tools"] = tools.clone();
         }
+        let started = std::time::Instant::now();
         let _permit = self.inflight.acquire().await?;
         let url = format!("{}/chat/completions", self.base_url);
         let reply: serde_json::Value = self.post(&url, &body, self.api_key.as_deref()).await?;
-        record_usage(chat_usage(&reply), true);
+        record_call(chat_usage(&reply), true, started, None);
         let choice = &reply["choices"][0];
         let message = &choice["message"];
         let text = message["content"].as_str().unwrap_or_default().to_string();
@@ -1071,6 +1109,7 @@ impl Client {
             rb = rb.header("x-request-id", id);
         }
         // Held until the stream ends: the generation runs as long as it streams.
+        let started = std::time::Instant::now();
         let _permit = self.inflight.acquire().await?;
         let resp = rb.send().await?.error_for_status()?;
 
@@ -1121,7 +1160,7 @@ impl Client {
                 apply(parse_sse_event(&block), &mut text, &mut reasoning);
             }
         }
-        record_usage(responses_usage(usage.as_ref()), false);
+        record_call(responses_usage(usage.as_ref()), false, started, None);
         let answer = answer_or_reasoning(text, &reasoning);
         if let Some(reason) = cut_off {
             return Err(Truncated { partial: answer, reason }.into());
@@ -1421,7 +1460,8 @@ mod tests {
                     let id = h.get("x-request-id").map(|v| v.to_str().unwrap().to_string());
                     seen.lock().unwrap().push(id);
                     r#"{"status":"completed","output_text":"ok","output":[],
-                        "usage":{"input_tokens":100,"output_tokens":7,"input_tokens_details":{"cached_tokens":64}}}"#
+                        "usage":{"input_tokens":100,"output_tokens":7,"input_tokens_details":{"cached_tokens":64}},
+                        "timings":{"ttft_ms":12.5,"decode_tok_s":40.0}}"#
                 }
             }),
         );
@@ -1448,6 +1488,14 @@ mod tests {
             scope.usage(),
             Usage { requests: 2, input_tokens: 200, output_tokens: 14, cached_tokens: 128 }
         );
+        // And one profile line per call, with hipfire's timings.
+        let calls = scope.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            (calls[0].input_tokens, calls[0].cached_tokens, calls[0].output_tokens),
+            (100, 64, 7)
+        );
+        assert_eq!((calls[1].ttft_ms, calls[1].decode_tok_s), (Some(12.5), Some(40.0)));
     }
 
     // A streamed reply's tokens count: the final `response.completed` carries the

@@ -555,6 +555,7 @@ impl Daemon {
                             failed: 0,
                             duration_s: now.saturating_sub(started),
                             planner: planner_calls.usage(),
+                            planner_calls: planner_calls.calls(),
                             usage: Default::default(),
                             remote_usd: self
                                 .remote
@@ -771,6 +772,7 @@ impl Daemon {
                             ok: output.is_ok(),
                             error: output.as_ref().err().map(|e| e.to_string()),
                             usage,
+                            calls: calls.calls(),
                             stop: output
                                 .as_ref()
                                 .ok()
@@ -923,6 +925,7 @@ impl Daemon {
                     failed,
                     duration_s: now.saturating_sub(started),
                     planner: planner_calls.usage(),
+                    planner_calls: planner_calls.calls(),
                     usage: *turn_usage.lock().unwrap(),
                     remote_usd: *turn_spend.lock().unwrap(),
                 });

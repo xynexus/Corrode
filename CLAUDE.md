@@ -103,7 +103,8 @@ from the same host:port the request names, or a client sending no `Origin`, may:
 sites are refused 403, so a page the user visits cannot drive the swarm through their
 browser), `CORRODE_TELEMETRY` (path to a JSONL
 file recording one line per subagent execution — role, model, band, prefix/tail bytes,
-duration, artifacts, ok/error, requests and input/output/cached tokens — plus one
+duration, artifacts, ok/error, requests and input/output/cached tokens, and each call's
+wall time, tokens, time to first token and decode rate (from hipfire's `timings`) — plus one
 `"kind":"turn"` line per Prompt turn with its status and the planner's and tasks' usage;
 absent -> disabled. Every hipfire call carries `X-Request-Id: <plan>/<task|plan>/<n>`,
 which hipfire names its session and response after), `CORRODE_MAX_FOLLOWUPS` (emitted follow-up tasks folded in per drive, default 3;
