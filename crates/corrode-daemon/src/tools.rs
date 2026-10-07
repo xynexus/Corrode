@@ -524,7 +524,7 @@ impl ToolBox {
     /// hit's order key selects its placement. A line written at ingest time would be
     /// wrong after the next edit above it; this is right by construction, which is what
     /// the sparse order key and byte-exact composition were for.
-    async fn graph_matches(&self, query: &str, prefix: Option<&str>, already: &[String]) -> Vec<String> {
+    pub(crate) async fn graph_matches(&self, query: &str, prefix: Option<&str>, already: &[String]) -> Vec<String> {
         const MAX_SOFT: usize = 12;
         /// Shortlist handed to the cross-encoder. It costs one forward per candidate, so
         /// this is the knob that decides whether reranking is affordable: BM25 narrows

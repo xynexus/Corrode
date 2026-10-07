@@ -43,6 +43,47 @@ pub fn ingest_source(
     Ok(Some(update))
 }
 
+/// Ingest every tracked file the store does not hold yet, in the background, so the
+/// graph answers for the whole repository -- not only for what tasks have written,
+/// which was all a fresh store ever saw. Files already held (an oid record) are left
+/// to the turn-end sweep; binary and unreadable files are skipped.
+pub fn spawn_initial_ingest(
+    store: std::sync::Arc<dyn GraphStore>,
+    vfs: std::sync::Arc<dyn crate::vfs::Vfs>,
+    root: std::path::PathBuf,
+) {
+    tokio::spawn(async move {
+        let Ok(files) = vfs.tracked_files().await else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let counts = tokio::task::spawn_blocking(move || {
+            let (mut ingested, mut held, mut failed) = (0usize, 0usize, 0usize);
+            for path in files {
+                if store.node_label(&oid_key(&path)).ok().flatten().is_some() {
+                    held += 1;
+                    continue;
+                }
+                let Some(src) = std::fs::read(root.join(&path)).ok().and_then(|b| String::from_utf8(b).ok()) else {
+                    continue;
+                };
+                match ingest_source(store.as_ref(), &path, &src) {
+                    Ok(_) => ingested += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+            (ingested, held, failed)
+        })
+        .await;
+        if let Ok((ingested, held, failed)) = counts {
+            eprintln!(
+                "graph: ingested {ingested} file(s) of the repository ({held} already held, {failed} failed) in {:.0?}",
+                started.elapsed()
+            );
+        }
+    });
+}
+
 /// The node recording which embedding model (and dimension) made the store's vectors.
 pub const EMBEDDING_META: &str = "meta:embedding";
 

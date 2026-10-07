@@ -124,6 +124,8 @@ const README_CAP: usize = 4096;
 /// fit under the AGENTS cap; a tree is a listing `list_dir` can always redo.
 const AGENTS_CAP: usize = 32 * 1024;
 const TREE_CAP: usize = 8 * 1024;
+/// Prefix bytes for the graph's code most relevant to the request.
+const RELEVANT_CAP: usize = 4 * 1024;
 /// Entries listed per directory in the second level of the repo tree.
 const TREE_BREADTH: usize = 24;
 /// Directories never descended into — noise that would crowd out real source.
@@ -211,6 +213,9 @@ impl Daemon {
             }
             _ => vfs,
         };
+        if let Some(store) = &graph {
+            crate::graph::spawn_initial_ingest(Arc::clone(store), Arc::clone(&vfs), repo_root.clone());
+        }
         let default_res = RepoResources {
             repo_root: default_repo.clone(),
             project: Arc::new(project),
@@ -267,6 +272,9 @@ impl Daemon {
         }
         let graph = crate::graph::open(repo);
         let vfs: Arc<dyn Vfs> = Arc::new(PassthroughVfs::new(repo));
+        if let Some(store) = &graph {
+            crate::graph::spawn_initial_ingest(Arc::clone(store), Arc::clone(&vfs), repo.clone());
+        }
         // Each repo carries its own identity and global-skill policy: a daemon serving
         // several projects must not hand one project's skills to another, which is the
         // whole point of the config.
@@ -1708,6 +1716,27 @@ impl Daemon {
         // project-stable, so it rides the shared prefix and is prefilled once.
         if let Some(readme) = self.readme_digest(session).await {
             s.push_str(&readme);
+        }
+        // What the repository graph finds for this request: the request's terms
+        // against the code nodes, reranked by the cross-encoder when one is served --
+        // the same search `search_files` runs. The tree still orients; this points at
+        // the code. Same bytes for the whole turn: the prefix is built once per turn.
+        if let Some(store) = &session.graph {
+            let toolbox = ToolBox::new(Arc::clone(&session.vfs), session.repo_root.clone(), Arc::clone(&session.skill_scripts))
+                .with_graph(Some(Arc::clone(store)))
+                .with_reranker(Some(self.swarm.client()));
+            let hits = toolbox.graph_matches(task, None, &[]).await;
+            if !hits.is_empty() {
+                s.push_str("\nCode most relevant to this request (from the repository graph; path:line: text):\n");
+                let mut section = String::new();
+                for hit in hits {
+                    section.push_str("  ");
+                    section.push_str(&hit);
+                    section.push('\n');
+                }
+                let end = crate::tools::floor_char_boundary(&section, RELEVANT_CAP.min(section.len()));
+                s.push_str(&section[..end]);
+            }
         }
         s.push_str("\nRepository tree:\n");
         let tree = self.repo_tree(session).await;
@@ -3532,6 +3561,77 @@ mod tests {
         assert!(!prefix.contains(".git"), "{prefix}");
         assert!(!prefix.contains("HEAD"), "{prefix}");
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Item 8: with a store holding the code, the prefix points at the code the request
+    // is about -- the graph's search, reranked when it can be, BM25 order when not
+    // (the reranker here is unreachable).
+    #[cfg(feature = "helix")]
+    #[tokio::test]
+    async fn the_prefix_points_at_the_code_the_request_is_about() {
+        let root = std::env::temp_dir().join(format!("corrode-prefix-graph-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let queue = "/// Push onto the ring.\npub fn enqueue_item(q: &mut Ring, v: u64) {\n    q.push(v);\n}\n";
+        let other = "pub fn parse_header(b: &[u8]) -> usize {\n    b.len()\n}\n";
+        std::fs::write(root.join("src/queue.rs"), queue).unwrap();
+        std::fs::write(root.join("src/other.rs"), other).unwrap();
+        let store: Arc<dyn crate::graph::GraphStore> = Arc::new(
+            crate::graph::embedded::HelixStore::open(root.join(".graph").to_str().unwrap()).unwrap(),
+        );
+        crate::graph::ingest_source(store.as_ref(), "src/queue.rs", queue).unwrap();
+        crate::graph::ingest_source(store.as_ref(), "src/other.rs", other).unwrap();
+        let daemon = Daemon::new(
+            Swarm::new(Client::new("http://127.0.0.1:1", None), 1),
+            RoleModels::uniform("test-model"),
+            Some(store),
+            Arc::new(PassthroughVfs::new(&root)),
+            SkillContext::default(),
+            None,
+            None,
+            root.clone(),
+            Project::load(&root),
+            Arc::new(Dialects::default()),
+        );
+        let session = daemon.bind_session(None, "").await.unwrap();
+        let prefix = daemon.context_prefix(&session, "how does enqueue_item push onto the ring").await;
+        let section = prefix
+            .split("Code most relevant to this request")
+            .nth(1)
+            .expect("a relevant-code section");
+        let section = section.split("Repository tree:").next().unwrap();
+        assert!(section.contains("src/queue.rs:"), "{section}");
+        assert!(section.len() <= RELEVANT_CAP + 200, "budgeted: {} bytes", section.len());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Item 8: a store a session opens is filled with the repository's tracked files in
+    // the background, so the graph answers for more than what tasks wrote.
+    #[cfg(feature = "helix")]
+    #[tokio::test]
+    async fn a_new_store_ingests_the_tracked_files() {
+        let root = std::env::temp_dir().join(format!("corrode-initial-ingest-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "# demo\n").unwrap();
+        for args in [vec!["init", "-q"], vec!["add", "-A"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&root).args(&args).status().unwrap().success());
+        }
+        let store: Arc<dyn crate::graph::GraphStore> = Arc::new(
+            crate::graph::embedded::HelixStore::open(root.join(".graph").to_str().unwrap()).unwrap(),
+        );
+        crate::graph::spawn_initial_ingest(Arc::clone(&store), Arc::new(PassthroughVfs::new(&root)), root.clone());
+        let held = |p: &str| store.node_label(&crate::graph::oid_key(p)).unwrap().is_some();
+        for _ in 0..100 {
+            if held("src/lib.rs") && held("README.md") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(held("src/lib.rs") && held("README.md"));
+        assert!(!store.file_nodes("src/lib.rs").unwrap().is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 
