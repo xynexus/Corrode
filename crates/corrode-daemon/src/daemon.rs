@@ -2287,15 +2287,24 @@ async fn turn_diff(seen: &std::sync::Mutex<SeenCalls>, vfs: &dyn Vfs) -> Option<
 
 const REVIEW_DIFF_CAP: usize = 24 * 1024;
 
-/// A review task's prompt: its own, then the turn's diff so far when there is one.
+/// A review task's prompt: its own, its step budget, then the turn's diff so far when
+/// there is one. The budget is stated up front: a CAE plan review checking 15 crate
+/// summaries read two files a step, spent its 6 steps, and kept calling tools through
+/// both requests for its verdict -- it answered nothing.
 async fn review_prompt(prompt: String, seen: &std::sync::Mutex<SeenCalls>, vfs: &dyn Vfs) -> String {
+    let budget = format!(
+        "You have {} tool steps. Read what you need together -- one reply may make up to \
+         {MAX_CALLS_PER_STEP} calls -- check a sample if there is more than that covers, and \
+         end with your verdict.",
+        max_tool_steps_for(Role::Review)
+    );
     match turn_diff(seen, vfs).await {
         Some(d) => format!(
-            "{prompt}\n\nWhat this turn changed so far -- each written file against its \
-             content before the turn. This is the written files' current content: check it \
-             against the sources rather than re-reading it.\n{d}"
+            "{prompt}\n\n{budget}\n\nWhat this turn changed so far -- each written file \
+             against its content before the turn. This is the written files' current content: \
+             check it against the sources rather than re-reading it.\n{d}"
         ),
-        None => prompt,
+        None => format!("{prompt}\n\n{budget}"),
     }
 }
 
@@ -2810,10 +2819,13 @@ async fn run_native_tool_loop(
             text = again;
         }
     }
-    Ok(NativeOutcome::Answered(if text.trim().is_empty() {
-        last
+    // Nothing said at all reads as a clean, empty pass downstream -- a review with no
+    // verdict emits no fix. Say what happened instead.
+    let answer = if text.trim().is_empty() { last } else { text };
+    Ok(NativeOutcome::Answered(if answer.trim().is_empty() {
+        format!("(no answer: task {id} spent its {max_steps} tool steps without giving one)")
     } else {
-        text
+        answer
     }))
 }
 
@@ -4220,7 +4232,8 @@ mod tests {
         let (etx, _erx) = mpsc::channel(64);
         let seen = std::sync::Mutex::new(SeenCalls::default());
         let mut written = Vec::new();
-        assert_eq!(review_prompt("Review.".into(), &seen, &*vfs).await, "Review.", "nothing written");
+        let unchanged = review_prompt("Review.".into(), &seen, &*vfs).await;
+        assert!(!unchanged.contains("What this turn changed"), "nothing written: {unchanged}");
 
         let write = |path: &str, contents: &str| crate::toolcall::ToolCall {
             name: "write_file".to_string(),
@@ -4236,7 +4249,8 @@ mod tests {
             assert!(!obs.starts_with("error"), "{obs}");
         }
         let prompt = review_prompt("Review.".into(), &seen, &*vfs).await;
-        assert!(prompt.starts_with("Review.\n\nWhat this turn changed"), "{prompt}");
+        assert!(prompt.starts_with("Review.\n\nYou have 6 tool steps."), "{prompt}");
+        assert!(prompt.contains("What this turn changed"), "{prompt}");
         assert!(prompt.contains("--- a/lib.rs\n+++ b/lib.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn c() {}\n"), "{prompt}");
         assert!(!prompt.contains("b2"), "diffed against the file before the turn: {prompt}");
         assert!(prompt.contains("--- /dev/null\n+++ b/map.md\n@@ -0,0 +1,1 @@\n+## a\n"), "{prompt}");
