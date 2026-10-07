@@ -594,10 +594,9 @@ pub mod embedded {
                     Some(crate::projection::Node {
                         path: path.to_string(),
                         order,
-                        // `kind` is `&'static str` in the projection and arrives here as
-                        // a runtime string; projection only compares it against
-                        // "trivia", so that is the distinction worth preserving.
-                        kind: if prop_str(n, "kind") == "trivia" { "trivia" } else { "item" },
+                        // The stored kind, not just trivia-or-item: reconcile matches a
+                        // stored node to a fresh one by kind AND text (#44).
+                        kind: crate::projection::intern_kind(&prop_str(n, "kind")),
                         text: prop_str(n, "label"),
                     })
                 })
@@ -1478,6 +1477,34 @@ pub mod embedded {
                 "only code nodes, (path, id): {got:?}"
             );
 
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        // #44: kinds come back as stored, so inserting a node keeps every other
+        // node's key on the same code instead of re-pairing them by position.
+        #[test]
+        fn an_insert_keeps_every_other_nodes_key() {
+            let dir = scratch_dir("kinds");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+            let path = "src/lib.rs";
+            let lang = crate::projection::for_path(path);
+            let before = "fn a() {}\n\nfn b() {}\n";
+            store
+                .replace_file(&crate::projection::ingest::file(lang.as_ref(), path, before).unwrap())
+                .unwrap();
+            let stored = store.file_nodes(path).unwrap();
+            assert!(stored.iter().any(|n| n.kind == "fn"), "kinds read back as stored: {stored:?}");
+
+            let after = "use std::fmt;\n\nfn a() {}\n\nfn b() {}\n";
+            let (fw, _) =
+                crate::projection::ingest::file_against(lang.as_ref(), path, after, &stored).unwrap();
+            store.replace_file(&fw).unwrap();
+            let now = store.file_nodes(path).unwrap();
+            for old in &stored {
+                let kept = now.iter().find(|n| n.order == old.order).expect("the key survives");
+                assert_eq!(kept.text, old.text, "key {} now names other code", old.order);
+            }
             std::fs::remove_dir_all(&dir).ok();
         }
 
