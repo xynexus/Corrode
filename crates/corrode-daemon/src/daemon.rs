@@ -1889,10 +1889,33 @@ fn context_estimate(
     let bytes = prompt.len()
         + turns.iter().map(|t| t.to_string().len()).sum::<usize>()
         + tools.map_or(0, |t| t.to_string().len());
-    let per_token = crate::hipfire::bytes_per_token().unwrap_or(3.0).clamp(3.0, 4.0);
     // Keep a whole output cap free: hipfire clamps a reply to the KV capacity left, so
     // a 4096-token reserve under an 8192-token cap cut long final answers short.
-    (bytes as f64 / per_token) as usize + crate::hipfire::max_output_tokens() as usize
+    tokens_for(bytes) + crate::hipfire::max_output_tokens() as usize
+}
+
+/// `bytes` of this conversation in tokens: see [`over_context_budget`].
+fn tokens_for(bytes: usize) -> usize {
+    let per_token = crate::hipfire::bytes_per_token().unwrap_or(3.0).clamp(3.0, 4.0);
+    (bytes as f64 / per_token) as usize
+}
+
+/// Whether a step's next read is put off: its results so far (`step_bytes`) already
+/// take three quarters of the `room` the prompt and output cap leave, so more would be
+/// elided before the model ever saw them (the rest of the room is the step's calls and
+/// whatever older turns cannot be elided). A review reading 15 crate sources in two steps had them
+/// elided unseen, re-read them from the turn's cache, and spent its whole budget doing
+/// so -- no verdict. A step's first call always runs, and a mutating one is never put
+/// off (it is the work itself).
+fn defer_read(call: &crate::toolcall::ToolCall, step_bytes: usize, room: usize) -> Option<String> {
+    (step_bytes > 0 && !crate::tools::is_mutating(call) && tokens_for(step_bytes) > room * 3 / 4).then(|| {
+        format!(
+            "not run: this step's results already fill the context. Note what you found in \
+             them in your reply, then {} in a later step -- older results are dropped as the \
+             context fills.",
+            crate::tools::describe(call)
+        )
+    })
 }
 
 const ELIDED: &str = "[observation elided";
@@ -2294,8 +2317,9 @@ const REVIEW_DIFF_CAP: usize = 24 * 1024;
 async fn review_prompt(prompt: String, seen: &std::sync::Mutex<SeenCalls>, vfs: &dyn Vfs) -> String {
     let budget = format!(
         "You have {} tool steps. Read what you need together -- one reply may make up to \
-         {MAX_CALLS_PER_STEP} calls -- check a sample if there is more than that covers, and \
-         end with your verdict.",
+         {MAX_CALLS_PER_STEP} calls -- and write down what each batch showed before reading \
+         the next: older tool results are dropped as the context fills. Check a sample if there \
+         is more than that covers, and end with your verdict.",
         max_tool_steps_for(Role::Review)
     );
     match turn_diff(seen, vfs).await {
@@ -2711,8 +2735,14 @@ async fn run_native_tool_loop(
         // spent 16 generations on what parallel calls do in a few. Sequential is
         // enough: the generation, not the call, is the cost.
         let batch = &calls[..calls.len().min(MAX_CALLS_PER_STEP)];
-        let mut observations = Vec::with_capacity(batch.len());
+        let mut observations: Vec<String> = Vec::with_capacity(batch.len());
+        let room = context_tokens().saturating_sub(context_estimate(&prompt, &[], Some(&tools)));
         for call in batch {
+            let step_bytes = observations.iter().map(String::len).sum();
+            if let Some(deferred) = defer_read(call, step_bytes, room) {
+                observations.push(deferred);
+                continue;
+            }
             calls_made += 1;
             note_touched(&mut touched, call);
             let observation = ctx.gate(call, written).await;
@@ -3363,6 +3393,18 @@ mod tests {
         assert!(!elided(&turns[5]), "the newest is kept");
         let huge = "x".repeat(200_000);
         assert!(!super::fit_context(&huge, &mut turns, None), "the prompt alone does not fit");
+    }
+
+    // A step's reads stop at 3/4 of the room: the rest are put off with a note, not run
+    // and then elided unseen. The first call and any mutating one always run.
+    #[test]
+    fn a_step_puts_off_reads_that_would_not_fit() {
+        let call = |name: &str| crate::toolcall::ToolCall { name: name.into(), arguments: serde_json::json!({"path": "a.rs"}) };
+        assert!(super::defer_read(&call("read_file"), 0, 10).is_none(), "the first call runs");
+        assert!(super::defer_read(&call("read_file"), 3_000, 10_000).is_none(), "room left");
+        let note = super::defer_read(&call("read_file"), 30_000, 10_000).expect("past 3/4 of the room");
+        assert!(note.starts_with("not run:") && note.contains("read_file a.rs"), "{note}");
+        assert!(super::defer_read(&call("write_file"), 30_000, 10_000).is_none(), "a write is the work");
     }
 
     // Past the limit it elides in one batch, leaving room: the next steps' requests
