@@ -26,6 +26,13 @@ pub trait Vfs: Send + Sync {
     async fn stat(&self, path: &str) -> anyhow::Result<FileNodeView>;
     /// Full contents of a file path. Used by the context prefix's README digest.
     async fn read(&self, path: &str) -> anyhow::Result<Vec<u8>>;
+
+    /// The file as it is on disk, whatever a wrapper would serve instead: what ingest
+    /// reads. Through the graph-backed VFS, `read` answers from the graph, so ingesting
+    /// through it re-read the graph's own copy and a file froze at its first ingest.
+    async fn read_disk(&self, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.read(path).await
+    }
     // ponytail: `write` has no loop caller yet; wired with the WriteFile command when
     // the explorer's file open/edit lands. Covered by the vfs test.
     /// Write a file path (the edit/"absorb" direction).
@@ -395,5 +402,26 @@ mod tests {
         assert!(names.contains(&"src".to_string()), "source kept: {names:?}");
         assert!(!names.iter().any(|n| n == ".git" || n == "target"), "noise pruned: {names:?}");
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// Git's blob id for `bytes` (`sha1("blob {len}\0" + bytes)`): what the graph records
+/// a file's nodes were ingested from, so a reader can tell whether the file on disk is
+/// still that content -- and the id `git` itself would give it.
+pub fn blob_oid(bytes: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update(format!("blob {}\0", bytes.len()).as_bytes());
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod blob_oid_tests {
+    #[test]
+    fn matches_git_hash_object() {
+        // `printf 'hello\n' | git hash-object --stdin`
+        assert_eq!(super::blob_oid(b"hello\n"), "ce013625030ba8dba906f756967f9e9ca394464a");
+        assert_eq!(super::blob_oid(b""), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
     }
 }

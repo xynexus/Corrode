@@ -17,6 +17,32 @@ use corrode_core::GraphNodeView;
 /// The daemon's view of the embedded store. Kept as a trait so the swarm/VFS code
 /// and its tests don't drag the (heavy, feature-gated) HelixDB compile in, and so
 /// the daemon can hold it as `Option<Arc<dyn GraphStore>>` (None until opened).
+/// The node recording the content (git blob oid) a file's nodes were ingested from.
+pub fn oid_key(path: &str) -> String {
+    format!("oid:{path}")
+}
+
+/// Ingest `src` as `path`'s current content: reconcile it against the nodes the store
+/// holds (so unchanged nodes keep their keys), write them, and record the content's
+/// oid -- the record a reader checks for freshness (#43). `Ok(None)` when the store
+/// already holds exactly this content.
+pub fn ingest_source(
+    store: &dyn GraphStore,
+    path: &str,
+    src: &str,
+) -> anyhow::Result<Option<crate::projection::update::Update>> {
+    let oid = crate::vfs::blob_oid(src.as_bytes());
+    if store.node_label(&oid_key(path))?.as_deref() == Some(oid.as_str()) {
+        return Ok(None);
+    }
+    let lang = crate::projection::for_path(path);
+    let stored = store.file_nodes(path).unwrap_or_default();
+    let (fw, update) = crate::projection::ingest::file_against(lang.as_ref(), path, src, &stored)?;
+    store.replace_file(&fw)?;
+    store.upsert_node(&oid_key(path), "oid", &oid)?;
+    Ok(Some(update))
+}
+
 /// The node recording which embedding model (and dimension) made the store's vectors.
 pub const EMBEDDING_META: &str = "meta:embedding";
 
@@ -61,6 +87,13 @@ pub trait GraphStore: Send + Sync {
             self.add_edge(from, rel, to)?;
         }
         Ok(())
+    }
+
+    /// Remove a file and everything it owns -- its code and comment nodes and its oid
+    /// record -- so a file deleted on disk stops answering searches (#43). Default:
+    /// refuse, like `replace_file`.
+    fn drop_file(&self, _path: &str) -> anyhow::Result<()> {
+        anyhow::bail!("drop_file is not implemented by this store")
     }
 
     /// The label of the node with this id, if there is one.
@@ -508,6 +541,30 @@ pub mod embedded {
                     Err(e) if format!("{e:?}").contains("DuplicateKey") => {}
                     Err(e) => anyhow::bail!("write_batch: {from} -{rel}-> {to}: {e:?}"),
                 }
+            }
+            txn.commit()?;
+            Ok(())
+        }
+
+        fn drop_file(&self, path: &str) -> anyhow::Result<()> {
+            let arena = Bump::new();
+            let mut txn = self.storage.graph_env.write_txn()?;
+            let file_id = format!("file:{path}");
+            let mut keys = Vec::new();
+            if let Some(fid) = self.find_id(&txn, &arena, &file_id) {
+                for rel in ["has_code", "has_comment"] {
+                    let kids: Vec<TraversalValue> = G::new(&self.storage, &txn, &arena)
+                        .n_from_id(&fid)
+                        .out_node(rel)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| anyhow::anyhow!("list {rel} of {path}: {e:?}"))?;
+                    keys.extend(kids.iter().map(|c| prop_str(c, "key")));
+                }
+                keys.push(file_id);
+            }
+            keys.push(oid_key(path));
+            for key in &keys {
+                self.drop_node_in(&mut txn, &arena, key)?;
             }
             txn.commit()?;
             Ok(())
