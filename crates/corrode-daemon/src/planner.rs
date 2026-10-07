@@ -169,11 +169,51 @@ excerpts don't contain the answer, say so plainly.\n\n",
 pub fn plan_review_task(digest: &str) -> String {
     format!(
         "Review the work this plan just completed. The digest below lists each task, its \
-output, and the files it wrote. Verify against the actual repo — read the written files \
-rather than trusting the outputs. If you find a defect or a gap, name the single most \
-important fix as your NEXT: line; if the work holds, say so and emit no follow-up.\n\n\
+output, and the files it wrote; the diff after it is what those files now say. Verify the \
+work against the repo -- check each claim against the source it describes rather than \
+trusting the outputs. If you find a defect or a gap, name the single most important fix as \
+your NEXT: line; if the work holds, say so and emit no follow-up.\n\n\
 {digest}"
     )
+}
+
+/// One file's change as a unified diff: `before` is its content before the turn
+/// (`None`: it did not exist), `after` its content now (`None`: deleted). Empty when
+/// unchanged. ponytail: a single hunk from the first changed line to the last, so two
+/// edits far apart show the lines between them as removed and re-added; an LCS diff
+/// once multi-edit files bloat what a reviewer reads.
+pub fn file_diff(path: &str, before: Option<&str>, after: Option<&str>) -> String {
+    let a: Vec<&str> = before.unwrap_or("").lines().collect();
+    let b: Vec<&str> = after.unwrap_or("").lines().collect();
+    if a == b && before.is_some() == after.is_some() {
+        return String::new();
+    }
+    let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
+    const CONTEXT: usize = 3;
+    let start = pre.saturating_sub(CONTEXT);
+    let (a_end, b_end) = ((a.len() - suf + CONTEXT).min(a.len()), (b.len() - suf + CONTEXT).min(b.len()));
+    let range = |len: usize| if len == 0 { format!("{start},0") } else { format!("{},{len}", start + 1) };
+    let name = |side: &str, present: bool| if present { format!("{side}/{path}") } else { "/dev/null".into() };
+    let mut d = format!(
+        "--- {}\n+++ {}\n@@ -{} +{} @@\n",
+        name("a", before.is_some()),
+        name("b", after.is_some()),
+        range(a_end - start),
+        range(b_end - start)
+    );
+    let mut push = |mark: char, lines: &[&str]| {
+        for l in lines {
+            d.push(mark);
+            d.push_str(l);
+            d.push('\n');
+        }
+    };
+    push(' ', &a[start..pre]);
+    push('-', &a[pre..a.len() - suf]);
+    push('+', &b[pre..b.len() - suf]);
+    push(' ', &a[a.len() - suf..a_end]);
+    d
 }
 
 #[derive(Deserialize)]
@@ -420,5 +460,20 @@ mod tests {
         let review = plan_review_task("task 0 [coder]: write the parser\nwrote: src/parser.rs");
         assert!(review.contains("NEXT:"));
         assert!(review.ends_with("wrote: src/parser.rs"));
+    }
+
+    #[test]
+    fn file_diff_is_one_hunk_with_context() {
+        assert_eq!(file_diff("a", Some("x\n"), Some("x\n")), "", "unchanged");
+        assert_eq!(file_diff("a", None, Some("x\ny\n")), "--- /dev/null\n+++ b/a\n@@ -0,0 +1,2 @@\n+x\n+y\n");
+        assert_eq!(file_diff("a", Some("x\n"), None), "--- a/a\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-x\n");
+        let before = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+        let after = "1\n2\n3\n4\nfive\n6\n7\n8\n9\n";
+        assert_eq!(
+            file_diff("n", Some(before), Some(after)),
+            "--- a/n\n+++ b/n\n@@ -2,7 +2,7 @@\n 2\n 3\n 4\n-5\n+five\n 6\n 7\n 8\n"
+        );
+        // A line only appended: the suffix match must not reach back past the prefix.
+        assert_eq!(file_diff("r", Some("a\na\n"), Some("a\na\na\n")), "--- a/r\n+++ b/r\n@@ -1,2 +1,3 @@\n a\n a\n+a\n");
     }
 }

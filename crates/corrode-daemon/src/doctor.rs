@@ -222,9 +222,10 @@ pub async fn run() -> bool {
         crate::hipfire::retry_window().as_secs()
     );
     println!(
-        "  tool steps {} (research {}), follow-ups {} per drive, fan-out {}, plan review {}, concurrency {}",
+        "  tool steps {} (research {}, review {}), follow-ups {} per drive, fan-out {}, plan review {}, concurrency {}",
         crate::daemon::max_tool_steps(),
         crate::daemon::max_tool_steps_for(roles::Role::Research),
+        crate::daemon::max_tool_steps_for(roles::Role::Review),
         crate::plan_graph::max_followups(),
         crate::daemon::fanout_k(),
         on(crate::daemon::plan_review_enabled()),
