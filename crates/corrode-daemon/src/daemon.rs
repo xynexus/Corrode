@@ -1254,16 +1254,12 @@ impl Daemon {
         let Some(store) = &session.graph else {
             return;
         };
-        let mut seen: std::collections::BTreeSet<&str> = Default::default();
         let mut failed = 0usize;
+        let tracked = session.vfs.tracked_files().await.unwrap_or_default();
         // The repo's real directory set, so `docmap` can confirm a cited path exists
         // rather than inventing an edge to a directory nobody has. Computed once per
         // turn: a doc naming twenty subsystems must not cost twenty walks.
-        let known_dirs: std::collections::BTreeSet<String> = session
-            .vfs
-            .tracked_files()
-            .await
-            .unwrap_or_default()
+        let known_dirs: std::collections::BTreeSet<String> = tracked
             .iter()
             .flat_map(|p| {
                 let mut acc = Vec::new();
@@ -1275,38 +1271,72 @@ impl Daemon {
                 acc
             })
             .collect();
+        // What to look at: every file a task wrote this turn, then every tracked file
+        // the store already holds -- a command (`cargo fmt`, `sed`) or a human changes
+        // files no task wrote, and those went stale too (#43). Each is re-ingested only
+        // when its content's oid differs from the one recorded.
+        // ponytail: the sweep reads every tracked file the store holds, every turn;
+        // drive it from `git status` once repositories get large.
+        let mut paths: Vec<String> = Vec::new();
         for node in &graph.provenance().nodes {
             // Code nodes are `{plan}:code:{path}`; match on the kind rather than
             // reaching for the plan id, which the graph keeps private.
             if node.kind != plan_graph::NodeKind::Code {
                 continue;
             }
-            let Some(path) = node.id.rsplit(":code:").next() else {
-                continue;
-            };
-            if !seen.insert(path) {
-                continue;
+            if let Some(path) = node.id.rsplit(":code:").next() {
+                if !paths.iter().any(|p| p == path) {
+                    paths.push(path.to_string());
+                }
             }
-            let Ok(bytes) = session.vfs.read(path).await else {
-                continue; // written then removed, or outside the VFS
+        }
+        for path in &tracked {
+            if !paths.contains(path)
+                && store.node_label(&crate::graph::oid_key(path)).ok().flatten().is_some()
+            {
+                paths.push(path.clone());
+            }
+        }
+        for path in &paths {
+            // From disk, never through the session VFS: with the graph-backed VFS on,
+            // `read` answers from the graph, and ingesting that re-read its own copy.
+            let bytes = match session.vfs.read_disk(path).await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    // Written, then removed: it must stop answering searches.
+                    if store.node_label(&crate::graph::oid_key(path)).ok().flatten().is_some() {
+                        match store.drop_file(path) {
+                            Ok(()) => eprintln!("code ingest: {path} is gone; dropped from the graph"),
+                            Err(e) => eprintln!("code ingest: dropping {path} failed: {e}"),
+                        }
+                    }
+                    continue;
+                }
             };
             let Ok(src) = String::from_utf8(bytes) else {
                 continue;
             };
-            // Backend chosen per path: Rust gets syn, anything else falls back to the
-            // plain-text projector, which still ingests and projects byte-exactly with
-            // less structure. Absorbing an unfamiliar codebase is never blocked.
-            let lang = crate::projection::for_path(path);
-            // Reconcile against what the store already holds, rather than re-scanning
-            // from scratch. A fresh scan renumbers the file end to end, and since ids
-            // derive from the order key that re-addresses every node for a one-line
-            // change — the churn the sparse key exists to prevent. `stored` is empty for
-            // a file the graph has not seen, which is exactly a first ingest.
-            let stored = store.file_nodes(path).unwrap_or_default();
-            let Ok((fw, update)) =
-                crate::projection::ingest::file_against(lang.as_ref(), path, &src, &stored)
-            else {
-                continue; // unparseable mid-edit: leave the previous nodes in place
+            // Backend chosen per path (inside `ingest_source`): Rust gets syn, anything
+            // else falls back to the plain-text projector, which still ingests and
+            // projects byte-exactly with less structure. It reconciles against the stored
+            // nodes rather than re-scanning: a fresh scan renumbers the file end to end,
+            // and since ids derive from the order key that re-addresses every node for a
+            // one-line change -- the churn the sparse key exists to prevent.
+            let update = match crate::graph::ingest_source(store.as_ref(), path, &src) {
+                Ok(Some(update)) => update,
+                Ok(None) => continue, // the store holds exactly this content
+                Err(e) => {
+                    // Continue, do not abort the turn. One unwritable file must not stop
+                    // every later file from being indexed: measured on curl, 5 of 2,995
+                    // files contain a token longer than LMDB's 511-byte max key, which
+                    // the BM25 index rejects (`MDB_BAD_VALSIZE`); an unparseable file
+                    // mid-edit keeps its previous nodes.
+                    failed += 1;
+                    if failed <= 3 {
+                        eprintln!("code ingest failed for {path}: {e}");
+                    }
+                    continue;
+                }
             };
             if !update.changed.is_empty() || update.rebalanced {
                 eprintln!(
@@ -1319,19 +1349,6 @@ impl Daemon {
                         ""
                     }
                 );
-            }
-            if let Err(e) = store.replace_file(&fw) {
-                // Continue, do not abort the turn. One unwritable file must not stop
-                // every later file from being indexed: measured on curl, 5 of 2,995
-                // files contain a token longer than LMDB's 511-byte max key, which the
-                // BM25 index rejects (`MDB_BAD_VALSIZE`) — a base64 blob on one line is
-                // enough. Returning here let one such file silently cost the whole
-                // turn's code ingest.
-                failed += 1;
-                if failed <= 3 {
-                    eprintln!("code ingest failed for {path}: {e}");
-                }
-                continue;
             }
             // Join the graphs: place the file in its directory, and link it to whatever
             // it documents. A README or design note written by a task becomes reachable

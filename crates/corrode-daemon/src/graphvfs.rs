@@ -10,8 +10,11 @@
 //! serve confidently wrong bytes, and an agent editing against them produces a patch
 //! that does not apply. That is worse than any error this replaces.
 //!
-//! So the wrapper is honest about not knowing. It serves the graph only for files the
-//! graph actually holds, falls through to the inner VFS for everything else, and — when
+//! So the wrapper is honest about not knowing. It serves the graph only for a file whose
+//! CURRENT content it holds -- the git blob oid recorded at ingest must match the file's
+//! on disk (#43; it used to serve whatever it had ingested last, and ingest itself read
+//! back through this wrapper, so a file froze at its first ingest) -- falls through to
+//! the inner VFS for everything else, and — when
 //! `CORRODE_VFS_VERIFY` is on — compares its own answer against the inner one and reports
 //! every divergence instead of silently preferring itself. Off by default
 //! (`CORRODE_VFS_GRAPH`), like `CORRODE_SANDBOX`, so existing behaviour is unchanged
@@ -59,6 +62,16 @@ impl GraphVfs {
         )
     }
 
+    /// The graph's composition of `path`, if it holds the content `disk` currently is.
+    fn fresh(&self, path: &str, disk: &[u8]) -> Option<Vec<u8>> {
+        let stored = self.store.node_label(&crate::graph::oid_key(path)).ok().flatten()?;
+        if stored != crate::vfs::blob_oid(disk) {
+            eprintln!("vfs: the graph's copy of {path} is stale; reading it from disk");
+            return None;
+        }
+        self.compose(path)
+    }
+
     /// The file's bytes as the graph holds them, if it holds it at all.
     fn compose(&self, path: &str) -> Option<Vec<u8>> {
         let nodes = self.store.file_nodes(path).ok()?;
@@ -82,31 +95,37 @@ pub fn enabled() -> bool {
 #[async_trait]
 impl Vfs for GraphVfs {
     async fn read(&self, path: &str) -> anyhow::Result<Vec<u8>> {
-        let Some(bytes) = self.compose(path) else {
+        // The freshness check needs the disk's bytes, so read them first; a path that is
+        // not on disk errors as the inner VFS would.
+        let disk = self.inner.read(path).await?;
+        let Some(bytes) = self.fresh(path, &disk) else {
             self.fell_through.fetch_add(1, Ordering::Relaxed);
-            return self.inner.read(path).await;
+            return Ok(disk);
         };
-        if self.verify {
-            // Divergence means the graph missed an edit. Report it rather than resolve
-            // it: silently preferring either side is how an agent ends up editing text
-            // that does not exist, and which side is right depends on why they differ.
-            if let Ok(disk) = self.inner.read(path).await {
-                if disk != bytes {
-                    self.diverged.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "vfs: graph and disk disagree on {path} ({} vs {} bytes) — graph is stale",
-                        bytes.len(),
-                        disk.len()
-                    );
-                }
-            }
+        if self.verify && disk != bytes {
+            // Same content by oid, different bytes composed: the projection, not the
+            // ingest, is wrong. Report it rather than resolve it.
+            self.diverged.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "vfs: graph composes {path} differently from the content it ingested ({} vs {} bytes)",
+                bytes.len(),
+                disk.len()
+            );
         }
         self.served.fetch_add(1, Ordering::Relaxed);
         Ok(bytes)
     }
 
+    async fn read_disk(&self, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.read(path).await
+    }
+
     async fn stat(&self, path: &str) -> anyhow::Result<FileNodeView> {
-        match self.compose(path) {
+        let composed = match self.inner.read(path).await {
+            Ok(disk) => self.fresh(path, &disk),
+            Err(_) => None,
+        };
+        match composed {
             // Size comes from the composed bytes, not from disk: a stat that disagrees
             // with the following read is worse than either answer alone, and FUSE will
             // truncate a read to the size stat promised.
@@ -148,8 +167,8 @@ mod tests {
     use super::*;
     use crate::vfs::PassthroughVfs;
 
-    /// A store that holds exactly the nodes it was handed.
-    struct FakeStore(Vec<crate::projection::Node>);
+    /// A store that holds exactly the nodes it was handed, ingested from `oid`.
+    struct FakeStore(Vec<crate::projection::Node>, Option<String>);
 
     impl GraphStore for FakeStore {
         fn neighbors(&self, _: &str) -> anyhow::Result<Vec<corrode_core::GraphNodeView>> {
@@ -176,6 +195,9 @@ mod tests {
         fn file_nodes(&self, path: &str) -> anyhow::Result<Vec<crate::projection::Node>> {
             Ok(self.0.iter().filter(|n| n.path == path).cloned().collect())
         }
+        fn node_label(&self, id: &str) -> anyhow::Result<Option<String>> {
+            Ok(id.starts_with("oid:").then(|| self.1.clone()).flatten())
+        }
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -188,28 +210,50 @@ mod tests {
     #[tokio::test]
     async fn a_file_the_graph_holds_is_served_from_nodes() {
         let dir = scratch("served");
-        // Disk holds something DIFFERENT, so a pass-through would be visible.
-        std::fs::write(dir.join("a.rs"), b"from disk\n").unwrap();
         let src = "fn a() { 1 }\n\nfn b() { 2 }\n";
+        std::fs::write(dir.join("a.rs"), src).unwrap();
         let lang = crate::projection::for_path("a.rs");
         let (items, _) = lang.spans(src).unwrap();
         let nodes = crate::projection::nodes_from_items("a.rs", src, &items);
+        let oid = Some(crate::vfs::blob_oid(src.as_bytes()));
 
         let vfs = GraphVfs::new(
-            Arc::new(FakeStore(nodes)),
+            Arc::new(FakeStore(nodes, oid)),
             Arc::new(PassthroughVfs::new(&dir)),
         );
-        assert_eq!(vfs.read("a.rs").await.unwrap(), src.as_bytes(), "must compose from the graph");
+        assert_eq!(vfs.read("a.rs").await.unwrap(), src.as_bytes());
         // stat must agree with read, or FUSE truncates to a size that is not the content.
         assert_eq!(vfs.stat("a.rs").await.unwrap().bytes, src.len() as u64);
-        assert_eq!(vfs.counts().0, 1);
+        assert_eq!(vfs.counts().0, 1, "served from the graph");
+    }
+
+    // #43: the graph used to serve whatever it ingested last, however the file had
+    // changed since; an agent editing against those bytes wrote a patch that did not apply.
+    #[tokio::test]
+    async fn a_stale_graph_answers_with_the_disk() {
+        let dir = scratch("stale");
+        let ingested = "fn a() { 1 }\n";
+        let lang = crate::projection::for_path("a.rs");
+        let (items, _) = lang.spans(ingested).unwrap();
+        let nodes = crate::projection::nodes_from_items("a.rs", ingested, &items);
+        // Edited on disk after the ingest.
+        std::fs::write(dir.join("a.rs"), b"fn a() { 2 }\n").unwrap();
+        let vfs = GraphVfs::new(
+            Arc::new(FakeStore(nodes, Some(crate::vfs::blob_oid(ingested.as_bytes())))),
+            Arc::new(PassthroughVfs::new(&dir)),
+        );
+        assert_eq!(vfs.read("a.rs").await.unwrap(), b"fn a() { 2 }\n");
+        assert_eq!(vfs.stat("a.rs").await.unwrap().bytes, 13);
+        assert_eq!(vfs.counts().0, 0, "not served from the graph");
+        // And ingest reads the disk, not the wrapper's answer.
+        assert_eq!(vfs.read_disk("a.rs").await.unwrap(), b"fn a() { 2 }\n");
     }
 
     #[tokio::test]
     async fn a_file_the_graph_lacks_falls_through_to_disk() {
         let dir = scratch("fallthrough");
         std::fs::write(dir.join("b.rs"), b"only on disk\n").unwrap();
-        let vfs = GraphVfs::new(Arc::new(FakeStore(Vec::new())), Arc::new(PassthroughVfs::new(&dir)));
+        let vfs = GraphVfs::new(Arc::new(FakeStore(Vec::new(), None)), Arc::new(PassthroughVfs::new(&dir)));
         assert_eq!(vfs.read("b.rs").await.unwrap(), b"only on disk\n");
         assert_eq!(vfs.counts(), (0, 1, 0), "should have fallen through, not served");
         // And a path in neither place still errors rather than returning empty bytes.
@@ -230,7 +274,7 @@ mod tests {
                 .arg("-C").arg(&dir).args(&args).status().map(|s| s.success()).unwrap_or(false);
             assert!(ok, "git {args:?} failed in the scratch repo");
         }
-        let vfs = GraphVfs::new(Arc::new(FakeStore(Vec::new())), Arc::new(PassthroughVfs::new(&dir)));
+        let vfs = GraphVfs::new(Arc::new(FakeStore(Vec::new(), None)), Arc::new(PassthroughVfs::new(&dir)));
         assert_eq!(vfs.list("").await.unwrap().len(), 2);
         assert_eq!(vfs.tracked_files().await.unwrap().len(), 2);
     }
@@ -240,7 +284,6 @@ mod tests {
 #[cfg(all(test, feature = "helix"))]
 mod live {
     use super::*;
-    use crate::projection::{self, ingest};
     use crate::vfs::PassthroughVfs;
 
     #[tokio::test]
@@ -257,8 +300,7 @@ mod live {
         let path = "src/lib.rs";
         let src = "//! Crate docs.\n\n/// Doc.\npub fn f(x: u32) -> u32 {\n    if x > 0 { x - 1 } else { 0 }\n}\n\nconst S: &str = r#\"a \"quoted\" thing\"#;\n";
         std::fs::write(dir.join(path), src).unwrap();
-        let lang = projection::for_path(path);
-        store.replace_file(&ingest::file(lang.as_ref(), path, src).unwrap()).unwrap();
+        crate::graph::ingest_source(store.as_ref(), path, src).unwrap();
 
         let vfs = GraphVfs::new(store.clone(), Arc::new(PassthroughVfs::new(&dir)));
         let read = vfs.read(path).await.unwrap();
@@ -270,26 +312,25 @@ mod live {
         assert_eq!(vfs.stat(path).await.unwrap().bytes, src.len() as u64, "stat must match read");
         assert_eq!(vfs.counts().0, 1, "should have been served from the graph");
 
-        // Now the failure mode this design exists to be honest about: edit the file on
-        // disk WITHOUT re-ingesting. The graph is stale and keeps serving the old bytes.
+        // The failure mode this design must not have (#43): edit the file on disk WITHOUT
+        // re-ingesting. The graph's copy is stale, so the disk answers.
         let edited = format!("{src}\npub fn g() {{ }}\n");
         std::fs::write(dir.join(path), &edited).unwrap();
-        let stale = vfs.read(path).await.unwrap();
-        assert_eq!(
-            String::from_utf8(stale).unwrap(),
-            src,
-            "an un-ingested edit is invisible to the graph — this is the staleness risk, pinned"
-        );
+        assert_eq!(String::from_utf8(vfs.read(path).await.unwrap()).unwrap(), edited);
+        assert_eq!(vfs.counts().0, 1, "the stale copy was not served");
 
-        // Re-ingest reconciled, and the VFS serves the edit.
-        let stored = store.file_nodes(path).unwrap();
-        let (fw, _) = ingest::file_against(lang.as_ref(), path, &edited, &stored).unwrap();
-        store.replace_file(&fw).unwrap();
-        assert_eq!(
-            String::from_utf8(vfs.read(path).await.unwrap()).unwrap(),
-            edited,
-            "after re-ingest the graph must serve the new bytes"
-        );
+        // Re-ingest from disk, and the graph serves the edit; the same content again is a no-op.
+        let disk = String::from_utf8(vfs.read_disk(path).await.unwrap()).unwrap();
+        assert!(crate::graph::ingest_source(store.as_ref(), path, &disk).unwrap().is_some());
+        assert!(crate::graph::ingest_source(store.as_ref(), path, &disk).unwrap().is_none());
+        assert_eq!(String::from_utf8(vfs.read(path).await.unwrap()).unwrap(), edited);
+        assert_eq!(vfs.counts().0, 2, "after re-ingest the graph serves the new bytes");
+
+        // Deleted: dropped, and nothing of it answers a search.
+        store.drop_file(path).unwrap();
+        assert!(store.file_nodes(path).unwrap().is_empty());
+        assert_eq!(store.node_label(&crate::graph::oid_key(path)).unwrap(), None);
+        assert!(store.code_search("quoted", 5).unwrap().iter().all(|(k, _)| !k.contains(path)));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

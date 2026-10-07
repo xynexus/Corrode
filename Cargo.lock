@@ -646,6 +646,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha1",
  "syn 2.0.119",
  "tar",
  "tokio",

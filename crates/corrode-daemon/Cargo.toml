@@ -10,6 +10,8 @@ license = "AGPL-3.0"
 description = "The Corrode agent daemon: hipfire swarm, graph<->git VFS, embedded HelixDB."
 
 [dependencies]
+# Git blob ids for what the graph ingested (graph::ingest_source); already in the tree via axum.
+sha1 = "0.10"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
