@@ -1359,17 +1359,19 @@ impl Daemon {
             return;
         };
         let prov = graph.provenance();
-        for node in &prov.nodes {
-            if let Err(e) = store.upsert_node(&node.id, node.kind.as_str(), &node.label) {
-                eprintln!("provenance persistence unavailable ({e}); skipping");
-                return;
-            }
-        }
-        for edge in &prov.edges {
-            if let Err(e) = store.add_edge(&edge.from, &edge.rel, &edge.to) {
-                eprintln!("provenance edge persistence unavailable ({e}); skipping");
-                return;
-            }
+        let nodes: Vec<(String, String, String)> = prov
+            .nodes
+            .iter()
+            .map(|n| (n.id.clone(), n.kind.as_str().to_string(), n.label.clone()))
+            .collect();
+        let edges: Vec<(String, String, String)> = prov
+            .edges
+            .iter()
+            .map(|e| (e.from.clone(), e.rel.to_string(), e.to.clone()))
+            .collect();
+        // One transaction for the turn's lineage, as for a task's trace (#46).
+        if let Err(e) = store.write_batch(&nodes, &edges) {
+            eprintln!("provenance persistence unavailable ({e}); skipping");
         }
     }
 
@@ -2396,7 +2398,13 @@ impl TaskCtx<'_> {
 /// never the model's prose: a note bound to a path guessed from English would attach
 /// real findings to the wrong file.
 fn note_touched(touched: &mut Vec<String>, call: &crate::toolcall::ToolCall) {
-    if let Some(p) = crate::tools::arg_str(call, "path") {
+    // Files only: a note is about a file it read or wrote. `list_dir("")` made `file:`
+    // (the repository root) a hub every note pointed at, and each listed directory
+    // a pseudo-file.
+    if !matches!(call.name.as_str(), "read_file" | "write_file") {
+        return;
+    }
+    if let Some(p) = crate::tools::arg_str(call, "path").filter(|p| !p.is_empty()) {
         if !touched.iter().any(|t| t == p) {
             touched.push(p.to_string());
         }
@@ -2539,7 +2547,7 @@ async fn run_native_tool_loop(
                 tool: None,
                 observation: None,
             });
-            record_trace(&ctx.toolbox, id, task, &steps, &touched);
+            record_trace(&ctx.toolbox, id, task, &steps, &touched).await;
             // No call THIS turn is the normal end of the loop. No call in the WHOLE
             // task is the thing worth reporting.
             if calls_made > 0 && text.contains("<tool_call") {
@@ -2602,7 +2610,7 @@ async fn run_native_tool_loop(
             }));
         }
     }
-    record_trace(&ctx.toolbox, id, task, &steps, &touched);
+    record_trace(&ctx.toolbox, id, task, &steps, &touched).await;
     // Step budget spent. Calls were made to spend it, so what follows is an answer —
     // asked for explicitly. Both choices here keep the prompt a byte-extension of the
     // last step's, so it forks that step's checkpoint instead of re-prefilling:
@@ -2731,7 +2739,7 @@ async fn run_tool_loop(
                 tool: None,
                 observation: None,
             });
-            record_trace(&ctx.toolbox, id, task, &steps, &touched);
+            record_trace(&ctx.toolbox, id, task, &steps, &touched).await;
             return Ok(text); // no TOOL: line -> this turn is the final answer
         };
 
@@ -2767,7 +2775,7 @@ async fn run_tool_loop(
         scratchpad.push_str(&format!("\nTOOL: {intent}\nRESULT: {observation}\n"));
     }
     // Step budget spent: ask once more, for the answer (see FINAL_ANSWER_NUDGE).
-    record_trace(&ctx.toolbox, id, task, &steps, &touched);
+    record_trace(&ctx.toolbox, id, task, &steps, &touched).await;
     if !fit_scratchpad(
         |s| planner::tool_loop_prompt(prefix, role, task, s),
         &mut scratchpad,
@@ -2784,11 +2792,10 @@ async fn run_tool_loop(
 
 /// Extract a task's notes and persist them.
 ///
-/// No new store method: a note is `upsert_node` and each edge is `add_edge`, both already
-/// on `GraphStore`. Notes are append-only — a correction arrives as a new note plus a
+/// The whole trace goes in one `GraphStore::write_batch`. Notes are append-only — a correction arrives as a new note plus a
 /// `supersedes` edge, never as an edit — so nothing here removes or rewrites what an
 /// earlier task recorded, however wrong it turns out to be.
-fn record_trace(
+async fn record_trace(
     toolbox: &ToolBox,
     task_id: u64,
     task: &str,
@@ -2805,7 +2812,10 @@ fn record_trace(
     // (`cannot record task node (add_n Review the work this plan just completed…`).
     // Same defect class as a base64 token breaking a node write.
     let task_key = toolbox.task_ref(task_id);
-    let notes = crate::trace::extract(&task_key, steps);
+    let mut notes = crate::trace::extract(&task_key, steps);
+    // A model restates a claim across steps; one note per distinct claim.
+    let mut said = std::collections::HashSet::new();
+    notes.retain(|n| n.kind == NoteKind::Observed || said.insert(n.text.clone()));
     if notes.is_empty() {
         return;
     }
@@ -2821,67 +2831,66 @@ fn record_trace(
         touched.len()
     );
 
-    let Some(store) = toolbox.graph() else {
+    let Some(store) = toolbox.graph().cloned() else {
         eprintln!("trace: no store on this session; notes extracted but not persisted");
         return;
     };
-    // The task must exist as a node before an edge can name it.
-    if let Err(e) = store.upsert_node(&task_key, "task", task) {
-        eprintln!("trace: cannot record task node ({e}); notes not persisted");
-        return;
-    }
-    let (mut wrote, mut edges) = (0usize, 0usize);
-    for n in &notes {
-        // `kind` carries the provenance, so a reader can weigh a tool result against a
-        // claim rather than the store flattening both into "a note".
-        if let Err(e) = store.upsert_node(&n.id(), n.kind.as_str(), &n.text) {
-            eprintln!("trace: note {} failed ({e})", n.id());
-            continue;
-        }
-        wrote += 1;
-        // `task_key`, NOT `task`: the edge has to name the node that was just written,
-        // and `task` is the prompt text. Pointing it at the text left every note
-        // attributed to a node that does not exist, so a walk from the task found
-        // nothing — the notes were stored and unreachable, which reads exactly like
-        // they were never stored. Reported rather than `.is_ok()`-swallowed: the silent
-        // discard is what let a dangling edge look like a clean write for two runs.
-        match store.add_edge(&n.id(), "noted_by", &task_key) {
-            Ok(()) => edges += 1,
-            Err(e) => eprintln!("trace: attributing {} to {task_key} failed ({e})", n.id()),
-        }
-        for path in touched {
-            // Bound to the file, not to a node inside it: a finding like "this loader is
-            // never called" is about the file's role, and binding it to whichever node
-            // happened to be read would be a precision the trace does not have.
+    let (task, touched) = (task.to_string(), touched.to_vec());
+    // One transaction, off the tokio worker (#46): a 40-file research task used to make
+    // thousands of fsync'd commits inline, each node and edge its own, while LMDB's
+    // single writer kept every other write waiting.
+    let written = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, usize)> {
+        // The task must exist as a node before an edge can name it -- in the same batch.
+        let mut nodes = vec![(task_key.clone(), "task".to_string(), task)];
+        for path in &touched {
             // The file node may not exist yet — a task can read a file the ingest pass
             // has not walked — so create it rather than dropping the edge.
-            let file_id = format!("file:{path}");
-            let _ = store.upsert_node(&file_id, "source_file", path);
-            match store.add_edge(&n.id(), "about", &file_id) {
-                Ok(()) => edges += 1,
-                Err(e) => eprintln!("trace: binding {} to {file_id} failed ({e})", n.id()),
+            nodes.push((format!("file:{path}"), "source_file".to_string(), path.clone()));
+        }
+        // Each file keeps one chain of notes: the newest supersedes the file's previous
+        // head, which `head:{path}` names. Superseding EVERY prior note on the file grew
+        // the edges with the square of the notes (~2.5M a night) for the same ordering.
+        let own = format!("note:{task_key}#");
+        let mut heads = Vec::new();
+        for path in &touched {
+            if let Some(prev) = store.node_label(&format!("head:{path}"))? {
+                if !prev.starts_with(&own) && !heads.contains(&prev) {
+                    heads.push(prev);
+                }
             }
         }
-    }
-    eprintln!(
-        "trace: persisted {wrote}/{} note(s), {edges} edge(s)",
-        notes.len()
-    );
-
-    // Supersede prior notes on the same files. The claim is ordering — this note was
-    // written with more of the trace behind it — not correctness.
-    let prior: Vec<String> = touched
-        .iter()
-        .filter_map(|p| store.neighbors(&format!("file:{p}")).ok())
-        .flatten()
-        .filter(|n| n.kind == "observed" || n.kind == "asserted")
-        .map(|n| n.id)
-        .filter(|id| !id.starts_with(&format!("note:{task_key}#")))
-        .collect();
-    for (from, rel, to) in crate::trace::note_edges(&notes, &task_key, &prior) {
-        if rel == "supersedes" {
-            let _ = store.add_edge(&from, rel, &to);
+        // `kind` carries the provenance, so a reader can weigh a tool result against a
+        // claim rather than the store flattening both into "a note". Edges name
+        // `task_key`, not the prompt text: pointing at the text attributed every note to
+        // a node that did not exist.
+        let mut edges: Vec<(String, String, String)> = crate::trace::note_edges(&notes, &task_key, &heads)
+            .into_iter()
+            .map(|(from, rel, to)| (from, rel.to_string(), to))
+            .collect();
+        for n in &notes {
+            nodes.push((n.id(), n.kind.as_str().to_string(), n.text.clone()));
+            for path in &touched {
+                // Bound to the file, not to a node inside it: a finding like "this
+                // loader is never called" is about the file's role.
+                edges.push((n.id(), "about".to_string(), format!("file:{path}")));
+            }
         }
+        if let Some(latest) = notes.last() {
+            for path in &touched {
+                nodes.push((format!("head:{path}"), "head".to_string(), latest.id()));
+            }
+        }
+        let counts = (notes.len(), edges.len());
+        store.write_batch(&nodes, &edges)?;
+        Ok(counts)
+    })
+    .await;
+    match written {
+        Ok(Ok((wrote, edges))) => eprintln!("trace: persisted {wrote} note(s), {edges} edge(s) in one transaction"),
+        // Reported, not swallowed: a silent discard once let a dangling edge read as a
+        // clean write for two runs.
+        Ok(Err(e)) => eprintln!("trace: notes not persisted ({e})"),
+        Err(e) => eprintln!("trace: persistence task failed ({e})"),
     }
 }
 
@@ -5250,6 +5259,101 @@ mod tests {
             "a declined NEXT: became a task"
         );
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A store that records each `write_batch` and keeps node labels, for the trace.
+    #[derive(Default)]
+    struct BatchStore {
+        batches: Mutex<Vec<(Vec<(String, String, String)>, Vec<(String, String, String)>)>>,
+        labels: Mutex<HashMap<String, String>>,
+    }
+
+    impl crate::graph::GraphStore for BatchStore {
+        fn neighbors(&self, _id: &str) -> anyhow::Result<Vec<corrode_core::GraphNodeView>> {
+            Ok(Vec::new())
+        }
+        fn doc_search(&self, _q: &str, _v: Option<&[f32]>, _k: usize) -> anyhow::Result<Vec<(String, String)>> {
+            Ok(Vec::new())
+        }
+        fn upsert_node(&self, _id: &str, _kind: &str, _label: &str) -> anyhow::Result<()> {
+            anyhow::bail!("trace writes go through write_batch")
+        }
+        fn add_edge(&self, _from: &str, _rel: &str, _to: &str) -> anyhow::Result<()> {
+            anyhow::bail!("trace writes go through write_batch")
+        }
+        fn replace_doc(&self, _doc: &crate::graph::DocWrite) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn list_docs(&self) -> anyhow::Result<Vec<(String, String)>> {
+            Ok(Vec::new())
+        }
+        fn code_nodes(&self) -> anyhow::Result<Vec<(String, String)>> {
+            Ok(Vec::new())
+        }
+        fn node_label(&self, id: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.labels.lock().unwrap().get(id).cloned())
+        }
+        fn write_batch(
+            &self,
+            nodes: &[(String, String, String)],
+            edges: &[(String, String, String)],
+        ) -> anyhow::Result<()> {
+            let mut labels = self.labels.lock().unwrap();
+            for (id, _, label) in nodes {
+                labels.insert(id.clone(), label.clone());
+            }
+            self.batches.lock().unwrap().push((nodes.to_vec(), edges.to_vec()));
+            Ok(())
+        }
+    }
+
+    // #46: a task's trace is one store write; a repeated claim is one note; each file
+    // keeps one chain (a new note supersedes the file's head, not every earlier note);
+    // and only files read or written are what a note is about.
+    #[tokio::test]
+    async fn a_tasks_trace_is_one_write_and_each_file_one_chain() {
+        let repo = std::path::PathBuf::from(".");
+        let store = Arc::new(BatchStore::default());
+        let toolbox = ToolBox::new(Arc::new(PassthroughVfs::new(&repo)), repo, Arc::new(HashMap::new()))
+            .with_graph(Some(store.clone() as Arc<dyn crate::graph::GraphStore>));
+        let said = |text: &str| crate::trace::Step {
+            said: text.to_string(),
+            intent: None,
+            tool: None,
+            observation: None,
+        };
+        // The claim twice, as a model restating itself across steps.
+        let steps = [said("The loader is never called."), said("The loader is never called.")];
+        let file = vec!["src/lib.rs".to_string()];
+        for task in 1..=3 {
+            record_trace(&toolbox, task, "look at the loader", &steps, &file).await;
+        }
+        let batches = store.batches.lock().unwrap();
+        assert_eq!(batches.len(), 3, "one write per task");
+        let notes = |b: usize| batches[b].0.iter().filter(|(id, _, _)| id.starts_with("note:")).count();
+        assert_eq!(notes(0), 1, "a repeated claim is one note");
+        let supersedes = |b: usize| -> Vec<String> {
+            batches[b].1.iter().filter(|(_, rel, _)| rel == "supersedes").map(|(_, _, to)| to.clone()).collect()
+        };
+        assert!(supersedes(0).is_empty());
+        assert_eq!(supersedes(1), vec!["note:task:1#0".to_string()]);
+        assert_eq!(supersedes(2), vec!["note:task:2#0".to_string()], "the head, not every earlier note");
+        assert_eq!(
+            store.labels.lock().unwrap().get("head:src/lib.rs").map(String::as_str),
+            Some("note:task:3#0")
+        );
+
+        // Files only: not the root listing, not a listed directory.
+        let mut touched = Vec::new();
+        let call = |name: &str, path: &str| crate::toolcall::ToolCall {
+            name: name.into(),
+            arguments: serde_json::json!({ "path": path }),
+        };
+        note_touched(&mut touched, &call("list_dir", ""));
+        note_touched(&mut touched, &call("list_dir", "src"));
+        note_touched(&mut touched, &call("read_file", "src/lib.rs"));
+        note_touched(&mut touched, &call("write_file", ""));
+        assert_eq!(touched, vec!["src/lib.rs".to_string()]);
     }
 
     /// A Chat Completions answer that reports 1000 prompt tokens.
