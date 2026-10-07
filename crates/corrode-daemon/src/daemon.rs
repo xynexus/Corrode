@@ -2035,6 +2035,11 @@ pub(crate) fn max_tool_steps_for(role: Role) -> usize {
 /// Appended when a task spends its step budget: one more generation that asks for no more calls, so
 /// the task ends on an answer rather than on whatever it said before its last call
 /// (usually nothing — a model calling a tool rarely writes prose with it).
+/// The last request of a task that would not stop calling tools.
+const ANSWER_NOW: &str = "No more tools will run. Answer now, in plain text, from what you \
+have found so far. If you are reviewing, give your verdict, and if something is wrong, end \
+with its NEXT: line.";
+
 const FINAL_ANSWER_NUDGE: &str = "You have used all your tool calls. Do not call any more tools. \
 Give your final answer now from what you have gathered, and say plainly what you did not get to.";
 
@@ -2890,7 +2895,12 @@ async fn run_native_tool_loop(
     }
     // Still nothing: the model calls tools however it is asked (hipfire has no
     // tool_choice "none"), the CAE reviews through both nudges above. Ask once with
-    // none declared.
+    // none declared, as a user message: this request re-prefills the conversation
+    // anyway, and a nudge inside a tool result was not enough -- with no tools
+    // declared a CAE review still answered only with a call.
+    if text.trim().is_empty() {
+        turns.push(serde_json::json!({"type": "message", "role": "user", "content": ANSWER_NOW}));
+    }
     if text.trim().is_empty() && fit_context(&prompt, &mut turns, None) {
         let bare = ctx.respond_without_tools(&prompt, &turns).await?;
         ctx.say(&bare).await;
@@ -5494,6 +5504,8 @@ mod tests {
         let bodies = bodies.lock().unwrap().clone();
         assert_eq!(bodies.len(), 3, "the read, its repeat, then the answer: {bodies:?}");
         assert!(bodies[2]["tools"].is_null(), "the answer was asked for with no tools");
+        let last = bodies[2]["input"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!((last["role"].as_str(), last["content"].as_str()), (Some("user"), Some(ANSWER_NOW)));
         std::fs::remove_dir_all(&dir).ok();
     }
 
