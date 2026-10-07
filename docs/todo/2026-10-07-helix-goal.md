@@ -23,9 +23,13 @@ Host resources (#30)
    Ask me before fixing the default caps. A/B against item 1's numbers.
 
 Graph store (#43, #44, #46, #47)
-3. Embeddings. No embedding model is served today, so skill ranking is off and doc search is BM25-only.
-   - Quantize Qwen3-Embedding-0.6B from the local weights in `/srv/huggingface` (no download), following hipfire `docs/QUANTIZE.md`. Use whichever path hipfire serves it on this host (GPU or NPU).
-   - Check that `/v1/embeddings` answers and that the daemon reports "ranked retrieval: true".
+3. Embeddings and rerank. No embedding model is served today, so skill ranking is off and doc search is BM25-only.
+   - The models are in the local store, `~/.hipfire/models`. Never load them from `/srv`, an NFS mount from `carbon`. Copied there:
+     - Qwen3-Embedding 0.6B, 4B and 8B (`--bf16.hfq`) and EmbeddingGemma-300M;
+     - Qwen3-Reranker-0.6B (`--oq8.hfq`);
+     - the 0.6B, 4B and 8B reranker sources (`.hfa`, for quantizing the larger ones).
+   - Serve Qwen3-Embedding-0.6B, and set `CORRODE_RERANK_MODEL` to the 0.6B reranker.
+   - Check that `/v1/embeddings` and `/v1/rerank` answer and that the daemon reports "ranked retrieval: true".
    - Then #47: read `CORRODE_EMBED_MODEL`; record `{model, dim}` in a `meta:embedding` node; on a mismatch, fall back to BM25 and log it instead of failing every DocQuery.
 4. Node kinds (#44). `file_nodes` reads stored kinds back as `item`/`trivia`, so reconcile pairs nodes by position: inserting a `use` before `fn a; fn b` re-keys both functions. Return the stored kind. Test: every key still maps to the same text after an insert.
 5. Batched `record_trace` (#46). It runs inline on tokio workers, one fsync'd LMDB transaction per node and edge, and each note supersedes every prior note on every file it touches.
