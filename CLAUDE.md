@@ -108,7 +108,9 @@ wall time, tokens, time to first token and decode rate (from hipfire's `timings`
 `"kind":"turn"` line per Prompt turn with its status and the planner's and tasks' usage;
 absent -> disabled. Every hipfire call carries `X-Request-Id: <plan>/<task|plan>/<n>`,
 which hipfire names its session and response after), `CORRODE_MAX_FOLLOWUPS` (emitted follow-up tasks folded in per drive, default 3;
-the plan-review round is its own drive; past it emissions are dropped and logged), `CORRODE_MAX_TOOL_STEPS` (tool calls a task may make before it must answer, default 16;
+the plan-review round is its own drive; past it emissions are dropped and logged), `CORRODE_MAX_TOOL_STEPS` (tool calls a task may make before it must answer, default 16 --
+research gets `CORRODE_RESEARCH_TOOL_STEPS` (8) and review `CORRODE_REVIEW_TOOL_STEPS` (6), a
+review being handed the turn's diff of every file written against its content before the turn;
 a note on the tool result warns at 3 left; when spent, one more generation asks for the final answer
 — tools still declared, none run), `CORRODE_MAX_TOKENS` (per-call output cap,
 default 8192 — a ceiling, so short outputs are unaffected; a reply hipfire cuts off at it

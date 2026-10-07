@@ -318,6 +318,11 @@ impl ToolBox {
     /// had since changed, otherwise lost each other's work silently -- and the
     /// result usually still compiled. A file the task never read is not checked
     /// (creating one, or a deliberate full rewrite).
+    /// A file's current contents as text, `None` when it cannot be read (absent).
+    pub async fn read_text(&self, path: &str) -> Option<String> {
+        self.vfs.read(path).await.ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
     async fn stale_write(&self, path: &str) -> Option<String> {
         let seen = *self.versions.lock().unwrap().get(&version_key(path))?;
         let now = self.vfs.read(path).await.ok().map(|b| content_version(&b));

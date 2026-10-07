@@ -648,6 +648,11 @@ impl Daemon {
                         prompt = format!("{prompt}\n\n{d}");
                     }
                     async move {
+                        // A review checks the turn's diff rather than re-reading what
+                        // was written (see `turn_diff`).
+                        if role == Role::Review {
+                            prompt = review_prompt(prompt, &seen, &*vfs).await;
+                        }
                         // `artifacts` collects the files a tool-loop task wrote (its code
                         // nodes in provenance). Coder tasks fan out K read-only proposal
                         // attempts first when CORRODE_FANOUT > 1; everything else runs
@@ -1960,18 +1965,23 @@ fn steps_left_note(left: usize) -> String {
 /// above [`max_tool_steps`]. Research only reads, and with several calls per step (a
 /// CAE research step averaged ~5 reads) 8 steps cover what 16 single-call steps did;
 /// given 16 it simply read twice as much -- 107K prompt tokens of file contents for
-/// three tasks, the prefill that dominated the turn. Other roles keep the full budget
-/// (a coder's edits are sequential).
+/// three tasks, the prefill that dominated the turn. A review task's,
+/// `CORRODE_REVIEW_TOOL_STEPS` (default 6): it is handed the turn's diff
+/// ([`review_prompt`]) and only checks claims against sources; given 16 it spent all 16
+/// re-reading, 607K input tokens for two reviews of one short document. Other roles
+/// keep the full budget (a coder's edits are sequential).
 pub(crate) fn max_tool_steps_for(role: Role) -> usize {
     let all = max_tool_steps();
-    if role != Role::Research {
-        return all;
-    }
-    std::env::var("CORRODE_RESEARCH_TOOL_STEPS")
+    let (knob, default) = match role {
+        Role::Research => ("CORRODE_RESEARCH_TOOL_STEPS", 8),
+        Role::Review => ("CORRODE_REVIEW_TOOL_STEPS", 6),
+        _ => return all,
+    };
+    std::env::var(knob)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|n| n.max(1))
-        .unwrap_or(8)
+        .unwrap_or(default)
         .min(all)
 }
 
@@ -2145,6 +2155,9 @@ struct SeenCalls {
     /// Bumped by every invalidation, so a read that was running when a sibling's
     /// mutation landed is not cached: its result may predate the change.
     gen: u64,
+    /// Each file the turn wrote, as it was before the turn's first write to it (`None`:
+    /// it did not exist) -- what [`turn_diff`] shows a reviewer. Survives `invalidate`.
+    originals: std::collections::BTreeMap<String, Option<String>>,
 }
 
 impl SeenCalls {
@@ -2226,6 +2239,42 @@ impl SeenCalls {
 const TURN_DIGEST_LINES: usize = 20;
 const LOG_LINE_CAP: usize = 96;
 
+/// What the turn has changed so far: every file it wrote, diffed against its content
+/// before the turn's first write (see [`SeenCalls::originals`]), capped at
+/// [`REVIEW_DIFF_CAP`]. `None` when nothing was written. A review task gets this
+/// instead of re-reading the written files through tools -- each such read re-sent its
+/// whole growing conversation, and reviews were 64% of a crate-map turn's input.
+async fn turn_diff(seen: &std::sync::Mutex<SeenCalls>, vfs: &dyn Vfs) -> Option<String> {
+    let originals = seen.lock().unwrap().originals.clone();
+    let mut diff = String::new();
+    for (path, before) in &originals {
+        let after = vfs.read(path).await.ok().map(|b| String::from_utf8_lossy(&b).into_owned());
+        diff.push_str(&planner::file_diff(path, before.as_deref(), after.as_deref()));
+    }
+    if diff.is_empty() {
+        return None;
+    }
+    if diff.len() > REVIEW_DIFF_CAP {
+        diff.truncate(crate::tools::floor_char_boundary(&diff, REVIEW_DIFF_CAP));
+        diff.push_str("\n[diff truncated -- read the files for the rest]\n");
+    }
+    Some(crate::tools::neutralize(&diff).into_owned())
+}
+
+const REVIEW_DIFF_CAP: usize = 24 * 1024;
+
+/// A review task's prompt: its own, then the turn's diff so far when there is one.
+async fn review_prompt(prompt: String, seen: &std::sync::Mutex<SeenCalls>, vfs: &dyn Vfs) -> String {
+    match turn_diff(seen, vfs).await {
+        Some(d) => format!(
+            "{prompt}\n\nWhat this turn changed so far -- each written file against its \
+             content before the turn. This is the written files' current content: check it \
+             against the sources rather than re-reading it.\n{d}"
+        ),
+        None => prompt,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Run one tool call: an exact repeat short-circuits to its prior observation (see
 /// [`SeenCalls`]); mutating ones (write_file / run_command / run_skill_script) pass
@@ -2304,6 +2353,16 @@ async fn gate_and_execute(
         denied
     } else {
         let gen = seen.lock().unwrap().gen;
+        if call.name == "write_file" {
+            if let Some(path) = call.arguments.get("path").and_then(|p| p.as_str()) {
+                // Read before the lock, kept by whichever task got there first: a
+                // sibling's later read could already see this turn's write.
+                if !seen.lock().unwrap().originals.contains_key(path) {
+                    let before = toolbox.read_text(path).await;
+                    seen.lock().unwrap().originals.entry(path.to_string()).or_insert(before);
+                }
+            }
+        }
         let observation = toolbox.execute(call).await;
         if call.name == "write_file" && observation.starts_with("wrote") {
             if let Some(path) = call.arguments.get("path").and_then(|p| p.as_str()) {
@@ -4099,6 +4158,123 @@ mod tests {
         let refused = gate_and_execute(&b_write, &b, &approvals, &etx, 2, &mut written, &seen, false, Role::Coder).await;
         assert!(refused.contains("changed since you last read it"), "{refused}");
         assert_eq!(std::fs::read_to_string(dir.join("lib.rs")).unwrap(), "two");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A review is handed what the turn changed: each written file against its content
+    // before the turn's FIRST write (a second write must not move the baseline), new
+    // files whole. Without the capture a review had only file names, and re-read them.
+    #[tokio::test]
+    async fn a_review_is_handed_the_turns_diff_against_the_files_before_it() {
+        let dir = std::env::temp_dir().join(format!("corrode-review-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let vfs: Arc<dyn Vfs> = Arc::new(PassthroughVfs::new(&dir));
+        let toolbox = ToolBox::new(Arc::clone(&vfs), dir.clone(), Arc::new(std::collections::HashMap::new()));
+        let approvals = ApprovalGate::auto_approving();
+        let (etx, _erx) = mpsc::channel(64);
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        assert_eq!(review_prompt("Review.".into(), &seen, &*vfs).await, "Review.", "nothing written");
+
+        let write = |path: &str, contents: &str| crate::toolcall::ToolCall {
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({"path": path, "contents": contents}),
+        };
+        for call in [
+            crate::toolcall::ToolCall { name: "read_file".into(), arguments: serde_json::json!({"path": "lib.rs"}) },
+            write("lib.rs", "fn a() {}\nfn b2() {}\n"),
+            write("lib.rs", "fn a() {}\nfn c() {}\n"),
+            write("map.md", "## a\n"),
+        ] {
+            let obs = gate_and_execute(&call, &toolbox, &approvals, &etx, 1, &mut written, &seen, false, Role::Coder).await;
+            assert!(!obs.starts_with("error"), "{obs}");
+        }
+        let prompt = review_prompt("Review.".into(), &seen, &*vfs).await;
+        assert!(prompt.starts_with("Review.\n\nWhat this turn changed"), "{prompt}");
+        assert!(prompt.contains("--- a/lib.rs\n+++ b/lib.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn c() {}\n"), "{prompt}");
+        assert!(!prompt.contains("b2"), "diffed against the file before the turn: {prompt}");
+        assert!(prompt.contains("--- /dev/null\n+++ b/map.md\n@@ -0,0 +1,1 @@\n+## a\n"), "{prompt}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The seeded-defect check for review-from-diff, against the live review model: a
+    // task wrote a crate map whose summary of `thermal` is the renderer's. Handed the
+    // diff and its reduced budget, the review must still name that as its fix.
+    // Run: CORRODE_MODEL=<review model> cargo test -p corrode-daemon live_review -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs hipfire serving the review model named by CORRODE_MODEL"]
+    async fn live_review_catches_a_seeded_wrong_fact() {
+        let model = std::env::var("CORRODE_MODEL").expect("CORRODE_MODEL names the review model");
+        let base = std::env::var("HIPFIRE_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:11435".into());
+        let dir = std::env::temp_dir().join(format!("corrode-seeded-{}", std::process::id()));
+        for (path, body) in [
+            ("crates/thermal/src/lib.rs", "//! Heat conduction: advances a finite-volume temperature field over a mesh by one implicit time step.\npub fn step(field: &mut [f64], dt: f64) {\n    let _ = (field, dt);\n}\n"),
+            ("crates/render/src/lib.rs", "//! Vulkan renderer: rasterises meshes into PNG frames.\npub fn draw() {}\n"),
+        ] {
+            std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(path), body).unwrap();
+        }
+        let vfs: Arc<dyn Vfs> = Arc::new(PassthroughVfs::new(&dir));
+        let toolbox = ToolBox::new(Arc::clone(&vfs), dir.clone(), Arc::new(std::collections::HashMap::new()));
+        let approvals = ApprovalGate::auto_approving();
+        let (etx, mut erx) = mpsc::channel(1024);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
+        let seen = std::sync::Mutex::new(SeenCalls::default());
+        let mut written = Vec::new();
+        let map = "# Crate map\n\n## thermal\nRasterises meshes into PNG frames with Vulkan.\n\n## render\nThe Vulkan renderer: rasterises meshes into PNG frames.\n";
+        let write = crate::toolcall::ToolCall {
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "map.md", "contents": map}),
+        };
+        gate_and_execute(&write, &toolbox, &approvals, &etx, 0, &mut written, &seen, false, Role::Coder).await;
+        let digest = "task 0 [coder]: For every crate under crates/, read its src/lib.rs and write \
+            map.md: one ## heading per crate with a one-sentence summary of what it does.\n\
+            output: Wrote map.md covering thermal and render.\nwrote: map.md\n\n";
+        let task = review_prompt(planner::plan_review_task(digest), &seen, &*vfs).await;
+        let client = Client::new(base, std::env::var("HIPFIRE_API_KEY").ok());
+        let dialects = Dialects::load();
+        let prefix = format!("A small Rust workspace: crates/thermal, crates/render, map.md.{}", crate::hipfire::PREFIX_END);
+        let calls = crate::hipfire::CallScope::new("live-review/0".to_string());
+        let started = std::time::Instant::now();
+        let out = crate::hipfire::CALLS
+            .scope(Arc::clone(&calls), async {
+                run_task(
+                    &TaskCtx {
+                        client: &client,
+                        model: &model,
+                        band: Priority::Default,
+                        dialects: &dialects,
+                        tool_caller: None,
+                        toolbox: toolbox.clone(),
+                        approvals: &approvals,
+                        prefix: &prefix,
+                        role: Role::Review,
+                        events: &etx,
+                        id: 1,
+                        read_only: false,
+                        seen: &seen,
+                        deadline: None,
+                    },
+                    &task,
+                    &mut written,
+                )
+                .await
+            })
+            .await
+            .expect("the review ran");
+        let u = calls.usage();
+        eprintln!(
+            "review: {:.0} s, {} requests, {} input tokens ({} cached), {} output\n{out}",
+            started.elapsed().as_secs_f64(),
+            u.requests,
+            u.input_tokens,
+            u.cached_tokens,
+            u.output_tokens
+        );
+        let fix = crate::plan_graph::parse_next_instruction(&out).expect("the review names a fix");
+        assert!(fix.to_lowercase().contains("thermal"), "the fix is the seeded one: {fix}");
+        assert!(u.requests as usize <= max_tool_steps_for(Role::Review) + 1, "within its budget");
         std::fs::remove_dir_all(&dir).ok();
     }
 
