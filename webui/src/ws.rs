@@ -67,6 +67,9 @@ pub fn spawn_agent(
             let resend: Vec<AgentCommand> =
                 corrode_core::reattach(&binding).into_iter().chain(unsent.drain(..)).collect();
             let mut alive = true;
+            // A sign-in the user made on this socket, awaiting its AuthOk (see
+            // `corrode_core::after_sign_in`); `reattach` covers the resent one.
+            let mut signing_in = false;
             for cmd in resend {
                 if alive && send(&mut sink, &cmd).await.is_err() {
                     alive = false;
@@ -80,6 +83,7 @@ pub fn spawn_agent(
                 match select(cmd_rx.next(), stream.next()).await {
                     Either::Left((None, _)) => return, // the UI is gone
                     Either::Left((Some(cmd), _)) => {
+                        signing_in |= matches!(cmd, AgentCommand::Authenticate { .. });
                         if is_binding(&cmd) {
                             let same = std::mem::discriminant(&cmd);
                             binding.retain(|c| std::mem::discriminant(c) != same);
@@ -98,7 +102,15 @@ pub fn spawn_agent(
                             Message::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
                         };
                         match serde_json::from_str::<AgentEvent>(&txt) {
-                            Ok(ev) => apply_event(ev, None, &shared, log, entries, approvals, busy),
+                            Ok(ev) => {
+                                if signing_in && matches!(ev, AgentEvent::AuthOk { .. }) {
+                                    signing_in = false;
+                                    if let Some(cmd) = corrode_core::after_sign_in(&binding) {
+                                        alive = send(&mut sink, &cmd).await.is_ok();
+                                    }
+                                }
+                                apply_event(ev, None, &shared, log, entries, approvals, busy)
+                            }
                             Err(e) => log.update(|l| {
                                 l.push(LogEntry::Ws(format!("undecodable event: {e}")))
                             }),

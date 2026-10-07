@@ -256,10 +256,17 @@ pub enum AgentEvent {
 /// reconnect or reload and replayed nothing until its user acted.
 pub fn reattach(binding: &[AgentCommand]) -> Vec<AgentCommand> {
     let mut cmds = binding.to_vec();
-    if !binding.iter().any(|c| matches!(c, AgentCommand::SelectRepo { .. })) {
-        cmds.push(AgentCommand::ListTurns);
-    }
+    cmds.extend(after_sign_in(binding));
     cmds
+}
+
+/// What a client sends once a sign-in it made succeeds: `ListTurns` when no repo is
+/// selected. With auth on, a reloaded page's first `ListTurns` is refused until the
+/// user signs in, and the `Authenticate` binds no session by itself -- so the page
+/// stayed empty, a running turn unreplayed, until its user did something.
+pub fn after_sign_in(binding: &[AgentCommand]) -> Option<AgentCommand> {
+    (!binding.iter().any(|c| matches!(c, AgentCommand::SelectRepo { .. })))
+        .then_some(AgentCommand::ListTurns)
 }
 
 #[cfg(test)]
@@ -276,6 +283,8 @@ mod tests {
             names(&[auth.clone()]),
             r#"[{"Authenticate":{"user":"u","token":"t"}},"ListTurns"]"#
         );
+        assert_eq!(serde_json::to_string(&after_sign_in(&[auth.clone()])).unwrap(), r#""ListTurns""#);
+        assert!(after_sign_in(&[auth.clone(), select.clone()]).is_none());
         // A selected repo binds (and replays) by itself.
         assert_eq!(
             names(&[auth, select]),
