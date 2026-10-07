@@ -45,6 +45,24 @@ pub trait GraphStore: Send + Sync {
     /// Create-or-update a provenance node (plan / task / contract / code) by id.
     fn upsert_node(&self, id: &str, kind: &str, label: &str) -> anyhow::Result<()>;
 
+    /// Upsert `nodes` (`id, kind, label`) and add `edges` (`from, rel, to`) together: one
+    /// write transaction where the store has them, so a task's trace is one durable
+    /// commit rather than one per node and edge (#46). An edge may name a node written
+    /// in the same batch. Default: one call each.
+    fn write_batch(
+        &self,
+        nodes: &[(String, String, String)],
+        edges: &[(String, String, String)],
+    ) -> anyhow::Result<()> {
+        for (id, kind, label) in nodes {
+            self.upsert_node(id, kind, label)?;
+        }
+        for (from, rel, to) in edges {
+            self.add_edge(from, rel, to)?;
+        }
+        Ok(())
+    }
+
     /// The label of the node with this id, if there is one.
     fn node_label(&self, _id: &str) -> anyhow::Result<Option<String>> {
         Ok(None)
@@ -460,6 +478,37 @@ pub mod embedded {
             let arena = Bump::new();
             let mut txn = self.storage.graph_env.write_txn()?;
             self.upsert_in(&mut txn, &arena, id, kind, label)?;
+            txn.commit()?;
+            Ok(())
+        }
+
+        fn write_batch(
+            &self,
+            nodes: &[(String, String, String)],
+            edges: &[(String, String, String)],
+        ) -> anyhow::Result<()> {
+            let arena = Bump::new();
+            let mut txn = self.storage.graph_env.write_txn()?;
+            let mut ids: std::collections::HashMap<&str, u128> = std::collections::HashMap::new();
+            for (key, kind, label) in nodes {
+                let id = self.upsert_in(&mut txn, &arena, key, kind, label)?;
+                ids.insert(key.as_str(), id);
+            }
+            for (from, rel, to) in edges {
+                let mut resolve = |k: &str| ids.get(k).copied().or_else(|| self.find_id(&txn, &arena, k));
+                let (Some(f), Some(t)) = (resolve(from), resolve(to)) else {
+                    anyhow::bail!("write_batch: edge {from} -{rel}-> {to} names an unknown node");
+                };
+                match G::new_mut(&self.storage, &arena, &mut txn)
+                    .add_edge(arena.alloc_str(rel), None, f, t, false, true)
+                    .collect_to_obj()
+                {
+                    Ok(_) => {}
+                    // Unique edges: an existing (from, rel, to) is the idempotence we want.
+                    Err(e) if format!("{e:?}").contains("DuplicateKey") => {}
+                    Err(e) => anyhow::bail!("write_batch: {from} -{rel}-> {to}: {e:?}"),
+                }
+            }
             txn.commit()?;
             Ok(())
         }
@@ -1505,6 +1554,32 @@ pub mod embedded {
                 let kept = now.iter().find(|n| n.order == old.order).expect("the key survives");
                 assert_eq!(kept.text, old.text, "key {} now names other code", old.order);
             }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        // #46: a batch is one transaction -- its edges may name nodes it writes, and a
+        // bad edge aborts all of it rather than leaving half a trace.
+        #[test]
+        fn a_batch_writes_whole_or_not_at_all() {
+            let dir = scratch_dir("batch");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+            let n = |id: &str, kind: &str| (id.to_string(), kind.to_string(), id.to_string());
+            let e = |f: &str, rel: &str, t: &str| (f.to_string(), rel.to_string(), t.to_string());
+            store
+                .write_batch(
+                    &[n("task:1", "task"), n("note:task:1#0", "asserted"), n("file:a.rs", "source_file")],
+                    &[e("note:task:1#0", "noted_by", "task:1"), e("note:task:1#0", "about", "file:a.rs")],
+                )
+                .unwrap();
+            let around = store.neighbors("note:task:1#0").unwrap();
+            assert!(around.iter().any(|v| v.id == "task:1") && around.iter().any(|v| v.id == "file:a.rs"), "{around:?}");
+            // Writing the same edge again is a no-op, not an error.
+            store.write_batch(&[], &[e("note:task:1#0", "noted_by", "task:1")]).unwrap();
+
+            let bad = store.write_batch(&[n("task:2", "task")], &[e("task:2", "about", "file:missing.rs")]);
+            assert!(bad.is_err());
+            assert_eq!(store.node_label("task:2").unwrap(), None, "the aborted batch wrote nothing");
             std::fs::remove_dir_all(&dir).ok();
         }
 
