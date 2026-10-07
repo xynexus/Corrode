@@ -351,6 +351,9 @@ pub struct WireUsage {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct CallStat {
     pub wall_ms: u64,
+    /// The request body's size, which with `input_tokens` gives what a byte of this
+    /// conversation costs in tokens (see [`bytes_per_token`]).
+    pub request_bytes: usize,
     pub input_tokens: u64,
     pub cached_tokens: u64,
     pub output_tokens: u64,
@@ -474,7 +477,13 @@ fn chat_usage(reply: &serde_json::Value) -> Usage {
 /// Add one request's usage, and its profile line, to the running scope, if any.
 /// `started` is when the client began waiting for it; `timings` is hipfire's own
 /// account of the request, when the reply carries one.
-fn record_call(u: Usage, remote: bool, started: std::time::Instant, timings: Option<&serde_json::Value>) {
+fn record_call(
+    u: Usage,
+    remote: bool,
+    started: std::time::Instant,
+    request_bytes: usize,
+    timings: Option<&serde_json::Value>,
+) {
     let _ = CALLS.try_with(|c| {
         c.usage.lock().unwrap().add(u);
         if remote {
@@ -482,6 +491,7 @@ fn record_call(u: Usage, remote: bool, started: std::time::Instant, timings: Opt
         }
         c.calls.lock().unwrap().push(CallStat {
             wall_ms: started.elapsed().as_millis() as u64,
+            request_bytes,
             input_tokens: u.input_tokens,
             cached_tokens: u.cached_tokens,
             output_tokens: u.output_tokens,
@@ -489,6 +499,23 @@ fn record_call(u: Usage, remote: bool, started: std::time::Instant, timings: Opt
             decode_tok_s: timings.and_then(|t| t["decode_tok_s"].as_f64()),
         });
     });
+}
+
+/// Request bytes per input token on the running scope's latest call that reports
+/// both: how the current conversation tokenizes, measured rather than assumed.
+pub fn bytes_per_token() -> Option<f64> {
+    CALLS
+        .try_with(|c| {
+            c.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|c| c.input_tokens > 0 && c.request_bytes > 0)
+                .map(|c| c.request_bytes as f64 / c.input_tokens as f64)
+        })
+        .ok()
+        .flatten()
 }
 
 /// Fold one Responses-style input item onto a Chat Completions message list. A call
@@ -887,7 +914,13 @@ impl Client {
             let _permit = self.inflight.acquire().await?;
             self.post_responses(&body, owner_token).await?
         };
-        record_call(responses_usage(reply.usage.as_ref()), false, started, reply.timings.as_ref());
+        record_call(
+            responses_usage(reply.usage.as_ref()),
+            false,
+            started,
+            body.to_string().len(),
+            reply.timings.as_ref(),
+        );
         let reasoning = reply.reasoning().to_string();
         if reply.status == "incomplete" {
             let reason = reply
@@ -1030,7 +1063,7 @@ impl Client {
         let _permit = self.inflight.acquire().await?;
         let url = format!("{}/chat/completions", self.base_url);
         let reply: serde_json::Value = self.post(&url, &body, self.api_key.as_deref()).await?;
-        record_call(chat_usage(&reply), true, started, None);
+        record_call(chat_usage(&reply), true, started, body.to_string().len(), None);
         let choice = &reply["choices"][0];
         let message = &choice["message"];
         let text = message["content"].as_str().unwrap_or_default().to_string();
@@ -1160,7 +1193,7 @@ impl Client {
                 apply(parse_sse_event(&block), &mut text, &mut reasoning);
             }
         }
-        record_call(responses_usage(usage.as_ref()), false, started, None);
+        record_call(responses_usage(usage.as_ref()), false, started, body.to_string().len(), None);
         let answer = answer_or_reasoning(text, &reasoning);
         if let Some(reason) = cut_off {
             return Err(Truncated { partial: answer, reason }.into());
@@ -1471,11 +1504,13 @@ mod tests {
         let client = Client::new(url, None);
 
         let scope = CallScope::new("plan-3/7");
-        CALLS
+        let per_token = CALLS
             .scope(scope.clone(), async {
+                assert_eq!(bytes_per_token(), None, "nothing measured yet");
                 for _ in 0..2 {
                     client.respond("m", "p", Priority::Default, None, None).await.unwrap();
                 }
+                bytes_per_token()
             })
             .await;
         client.respond("m", "p", Priority::Default, None, None).await.unwrap();
@@ -1496,6 +1531,9 @@ mod tests {
             (100, 64, 7)
         );
         assert_eq!((calls[1].ttft_ms, calls[1].decode_tok_s), (Some(12.5), Some(40.0)));
+        // The request's size against its tokens: what a byte costs in this conversation.
+        assert!(calls[1].request_bytes > 0);
+        assert_eq!(per_token, Some(calls[1].request_bytes as f64 / 100.0));
     }
 
     // A streamed reply's tokens count: the final `response.completed` carries the
