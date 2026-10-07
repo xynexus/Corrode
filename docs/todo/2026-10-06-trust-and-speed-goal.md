@@ -25,3 +25,42 @@ Corrode
    - embedding metadata.
 
 Done: all merged with tests; both daemons restarted on merged code; GPU gates proven to catch an injected bug; one full unattended CAE swarm turn (sandbox + AUTO_APPROVE on) completing with files written, nothing hanging, memory flat, and its temperature-0 planner output identical warm and cold. Report changes, measurements and deferrals.
+
+## Status (2026-10-07)
+
+Items 1-8 and 10-15 are merged with tests: hipfire #444-#453, Corrode #53-#58. Corrode #59 is also merged, found while driving item 12 live. Asked to "explain this crate, do not change any file", the swarm rewrote `is_prime`: only the planner had seen the request. Every task now sees it, and a `NEXT: none` no longer queues a task.
+
+Final check: both daemons were restarted on merged code (hipfire `4d2e18f73`, Corrode `af66ac6`). One unattended CAE crate-map turn then ran with the sandbox on and auto-approve on:
+- 910 s, 52 subagent outputs, 76 tool calls, no errors, nothing left running.
+- `docs/crate-map.md` written with all 15 crates; no other file changed.
+- 748k prompt tokens over 53 sessions, 86.2% of them from a cached prefix. The prefix cache had 51 hits in 58 lookups, demoted 45 superseded tails and made 31 evictions.
+- MemAvailable 118 GB idle. Both models (34.7 GB) loaded by 400 s, and GTT rose 37.5 → 42.9 GiB as KV and checkpoints filled. It then held level for the last 4 minutes: a low of 76.0 GB, 76.3 GB after. The watchdog never fired.
+- Planner, temperature 0, run alone (`hipfire_deterministic`): the turn's cold plan and two warm replays after the turn are identical (2446 chars).
+
+Measurements:
+- 1: an injected overlay-correction bug fails the serving-shape gate and the coherence battery, and the pre-commit hook blocks the commit. Clean master passes.
+- 2: the cause is batch composition, not prefix reuse. Deterministic requests run alone, and the planner's calls are deterministic.
+- 3: A3B prefill tok/s, master → #446:
+
+  | sessions | master | #446 | change |
+  |---|---|---|---|
+  | 1 | 900 | 948 | +5% |
+  | 8 | 451 | 469 | +4% |
+  | 64 | 642 | 736 | +15% |
+
+- 7: `hipfire bench` through serve measures pp512 at 512.8 t/s and tg128 at 59.7 t/s. The eval smoke and speed batteries pass 5/5.
+- 8: over a CAE turn, before → after:
+  - prompt tokens reused: 87.0% → 86.2%
+  - GTT max: 41.7 → 43.0 GiB
+  - MemAvailable min: 76.1 → 74.9 GB
+
+  Neutral on this workload.
+- 11: at effort `none` the 27B's streamed answer used to arrive entirely as reasoning; now it arrives as the answer.
+- 12: in Chrome, restarting corrode-web mid-turn rebuilt the console from the replay and live events resumed (after #58; before it, nothing replayed).
+
+Deferred:
+- 9: decode width 9-16 rows is still open. Four lanes per group (64 weights per lane) halves the epilogue per MAC but was slower on 3 of 4 shapes, because the doubled activation tile halves occupancy. The table is in hipfire's `docs/todo/2026-10-01-decode-width-opus-gemm.md` (#454).
+- 16: the graph store, deferred by decision until the daemon runs with `--features helix`.
+- Read-only turns enforced by the harness: decided against; #59's prompt-level fix stands.
+- hipfire: on the batched path a non-streamed request's `timings` carry token counts only, no rates. The tools stream to get them.
+- Web UI: a reload with auth on replays nothing until the user signs in and acts. Reconnects, and reloads with auth off, replay at once.
