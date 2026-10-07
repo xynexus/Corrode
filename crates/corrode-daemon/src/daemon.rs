@@ -1889,10 +1889,33 @@ fn context_estimate(
     let bytes = prompt.len()
         + turns.iter().map(|t| t.to_string().len()).sum::<usize>()
         + tools.map_or(0, |t| t.to_string().len());
-    let per_token = crate::hipfire::bytes_per_token().unwrap_or(3.0).clamp(3.0, 4.0);
     // Keep a whole output cap free: hipfire clamps a reply to the KV capacity left, so
     // a 4096-token reserve under an 8192-token cap cut long final answers short.
-    (bytes as f64 / per_token) as usize + crate::hipfire::max_output_tokens() as usize
+    tokens_for(bytes) + crate::hipfire::max_output_tokens() as usize
+}
+
+/// `bytes` of this conversation in tokens: see [`over_context_budget`].
+fn tokens_for(bytes: usize) -> usize {
+    let per_token = crate::hipfire::bytes_per_token().unwrap_or(3.0).clamp(3.0, 4.0);
+    (bytes as f64 / per_token) as usize
+}
+
+/// Whether a step's next read is put off: its results so far (`step_bytes`) already
+/// take three quarters of the `room` the prompt and output cap leave, so more would be
+/// elided before the model ever saw them (the rest of the room is the step's calls and
+/// whatever older turns cannot be elided). A review reading 15 crate sources in two steps had them
+/// elided unseen, re-read them from the turn's cache, and spent its whole budget doing
+/// so -- no verdict. A step's first call always runs, and a mutating one is never put
+/// off (it is the work itself).
+fn defer_read(call: &crate::toolcall::ToolCall, step_bytes: usize, room: usize) -> Option<String> {
+    (step_bytes > 0 && !crate::tools::is_mutating(call) && tokens_for(step_bytes) > room * 3 / 4).then(|| {
+        format!(
+            "not run: this step's results already fill the context. Note what you found in \
+             them in your reply, then {} in a later step -- older results are dropped as the \
+             context fills.",
+            crate::tools::describe(call)
+        )
+    })
 }
 
 const ELIDED: &str = "[observation elided";
@@ -2012,6 +2035,11 @@ pub(crate) fn max_tool_steps_for(role: Role) -> usize {
 /// Appended when a task spends its step budget: one more generation that asks for no more calls, so
 /// the task ends on an answer rather than on whatever it said before its last call
 /// (usually nothing — a model calling a tool rarely writes prose with it).
+/// The last request of a task that would not stop calling tools.
+const ANSWER_NOW: &str = "No more tools will run. Answer now, in plain text, from what you \
+have found so far. If you are reviewing, give your verdict, and if something is wrong, end \
+with its NEXT: line.";
+
 const FINAL_ANSWER_NUDGE: &str = "You have used all your tool calls. Do not call any more tools. \
 Give your final answer now from what you have gathered, and say plainly what you did not get to.";
 
@@ -2287,15 +2315,25 @@ async fn turn_diff(seen: &std::sync::Mutex<SeenCalls>, vfs: &dyn Vfs) -> Option<
 
 const REVIEW_DIFF_CAP: usize = 24 * 1024;
 
-/// A review task's prompt: its own, then the turn's diff so far when there is one.
+/// A review task's prompt: its own, its step budget, then the turn's diff so far when
+/// there is one. The budget is stated up front: a CAE plan review checking 15 crate
+/// summaries read two files a step, spent its 6 steps, and kept calling tools through
+/// both requests for its verdict -- it answered nothing.
 async fn review_prompt(prompt: String, seen: &std::sync::Mutex<SeenCalls>, vfs: &dyn Vfs) -> String {
+    let budget = format!(
+        "You have {} tool steps. Read what you need together -- one reply may make up to \
+         {MAX_CALLS_PER_STEP} calls -- and write down what each batch showed before reading \
+         the next: older tool results are dropped as the context fills. Check a sample if there \
+         is more than that covers, and end with your verdict.",
+        max_tool_steps_for(Role::Review)
+    );
     match turn_diff(seen, vfs).await {
         Some(d) => format!(
-            "{prompt}\n\nWhat this turn changed so far -- each written file against its \
-             content before the turn. This is the written files' current content: check it \
-             against the sources rather than re-reading it.\n{d}"
+            "{prompt}\n\n{budget}\n\nWhat this turn changed so far -- each written file \
+             against its content before the turn. This is the written files' current content: \
+             check it against the sources rather than re-reading it.\n{d}"
         ),
-        None => prompt,
+        None => format!("{prompt}\n\n{budget}"),
     }
 }
 
@@ -2468,6 +2506,30 @@ impl TaskCtx<'_> {
             .await
     }
 
+    /// The same conversation with no tools declared: the one request a model that keeps
+    /// calling tools can only answer. Costs a re-prefill -- the tools render into the
+    /// system turn -- so it is the last resort, not the final step.
+    async fn respond_without_tools(
+        &self,
+        prompt: &str,
+        turns: &[serde_json::Value],
+    ) -> anyhow::Result<String> {
+        let effort = crate::roles::effort_for(self.role);
+        let (text, _reasoning, _calls) = self
+            .client
+            .respond_turns(
+                self.model,
+                prompt,
+                turns,
+                self.band,
+                self.toolbox.owner_token(),
+                None,
+                Some(&effort),
+            )
+            .await?;
+        Ok(text)
+    }
+
     /// One step of a native conversation (see `Client::respond_turns`).
     async fn respond_turns(
         &self,
@@ -2611,6 +2673,12 @@ async fn run_native_tool_loop(
     let mut touched: Vec<String> = Vec::new();
     let max_steps = max_tool_steps_for(role);
     let mut reminded = false;
+    // Every call this task has run, and whether it went round again: a step of nothing
+    // but calls it already made brings nothing new. A CAE review re-read 15 crate
+    // sources three times as fit_context elided each batch -- served from the turn's
+    // cache, elided again -- and spent its budget without a verdict.
+    let mut made: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut circling = false;
     for step in 0..max_steps {
         // Stop gathering while the answer still fits the model's context: several
         // reads per step can outgrow it -- a CAE research conversation passed the
@@ -2702,8 +2770,19 @@ async fn run_native_tool_loop(
         // spent 16 generations on what parallel calls do in a few. Sequential is
         // enough: the generation, not the call, is the cost.
         let batch = &calls[..calls.len().min(MAX_CALLS_PER_STEP)];
-        let mut observations = Vec::with_capacity(batch.len());
+        if batch.iter().all(|c| made.contains(&SeenCalls::key(c))) {
+            circling = true;
+            break;
+        }
+        made.extend(batch.iter().map(SeenCalls::key));
+        let mut observations: Vec<String> = Vec::with_capacity(batch.len());
+        let room = context_tokens().saturating_sub(context_estimate(&prompt, &[], Some(&tools)));
         for call in batch {
+            let step_bytes = observations.iter().map(String::len).sum();
+            if let Some(deferred) = defer_read(call, step_bytes, room) {
+                observations.push(deferred);
+                continue;
+            }
             calls_made += 1;
             note_touched(&mut touched, call);
             let observation = ctx.gate(call, written).await;
@@ -2761,7 +2840,11 @@ async fn run_native_tool_loop(
             "task {id}'s prompt with its tools"
         )));
     }
-    let (mut text, _reasoning, calls) = ctx.respond_turns(&prompt, &turns, &tools).await?;
+    let (mut text, _reasoning, calls) = if circling {
+        (String::new(), String::new(), Vec::new())
+    } else {
+        ctx.respond_turns(&prompt, &turns, &tools).await?
+    };
     ctx.say(&text).await;
     // A reply that still calls tools is not an answer: a CAE research task asked
     // for "one more" read on its final call, and its report became the preamble in
@@ -2810,10 +2893,26 @@ async fn run_native_tool_loop(
             text = again;
         }
     }
-    Ok(NativeOutcome::Answered(if text.trim().is_empty() {
-        last
+    // Still nothing: the model calls tools however it is asked (hipfire has no
+    // tool_choice "none"), the CAE reviews through both nudges above. Ask once with
+    // none declared, as a user message: this request re-prefills the conversation
+    // anyway, and a nudge inside a tool result was not enough -- with no tools
+    // declared a CAE review still answered only with a call.
+    if text.trim().is_empty() {
+        turns.push(serde_json::json!({"type": "message", "role": "user", "content": ANSWER_NOW}));
+    }
+    if text.trim().is_empty() && fit_context(&prompt, &mut turns, None) {
+        let bare = ctx.respond_without_tools(&prompt, &turns).await?;
+        ctx.say(&bare).await;
+        text = bare;
+    }
+    // Nothing said at all reads as a clean, empty pass downstream -- a review with no
+    // verdict emits no fix. Say what happened instead.
+    let answer = if text.trim().is_empty() { last } else { text };
+    Ok(NativeOutcome::Answered(if answer.trim().is_empty() {
+        format!("(no answer: task {id} spent its {max_steps} tool steps without giving one)")
     } else {
-        text
+        answer
     }))
 }
 
@@ -3351,6 +3450,18 @@ mod tests {
         assert!(!elided(&turns[5]), "the newest is kept");
         let huge = "x".repeat(200_000);
         assert!(!super::fit_context(&huge, &mut turns, None), "the prompt alone does not fit");
+    }
+
+    // A step's reads stop at 3/4 of the room: the rest are put off with a note, not run
+    // and then elided unseen. The first call and any mutating one always run.
+    #[test]
+    fn a_step_puts_off_reads_that_would_not_fit() {
+        let call = |name: &str| crate::toolcall::ToolCall { name: name.into(), arguments: serde_json::json!({"path": "a.rs"}) };
+        assert!(super::defer_read(&call("read_file"), 0, 10).is_none(), "the first call runs");
+        assert!(super::defer_read(&call("read_file"), 3_000, 10_000).is_none(), "room left");
+        let note = super::defer_read(&call("read_file"), 30_000, 10_000).expect("past 3/4 of the room");
+        assert!(note.starts_with("not run:") && note.contains("read_file a.rs"), "{note}");
+        assert!(super::defer_read(&call("write_file"), 30_000, 10_000).is_none(), "a write is the work");
     }
 
     // Past the limit it elides in one batch, leaving room: the next steps' requests
@@ -4220,7 +4331,8 @@ mod tests {
         let (etx, _erx) = mpsc::channel(64);
         let seen = std::sync::Mutex::new(SeenCalls::default());
         let mut written = Vec::new();
-        assert_eq!(review_prompt("Review.".into(), &seen, &*vfs).await, "Review.", "nothing written");
+        let unchanged = review_prompt("Review.".into(), &seen, &*vfs).await;
+        assert!(!unchanged.contains("What this turn changed"), "nothing written: {unchanged}");
 
         let write = |path: &str, contents: &str| crate::toolcall::ToolCall {
             name: "write_file".to_string(),
@@ -4236,7 +4348,8 @@ mod tests {
             assert!(!obs.starts_with("error"), "{obs}");
         }
         let prompt = review_prompt("Review.".into(), &seen, &*vfs).await;
-        assert!(prompt.starts_with("Review.\n\nWhat this turn changed"), "{prompt}");
+        assert!(prompt.starts_with("Review.\n\nYou have 6 tool steps."), "{prompt}");
+        assert!(prompt.contains("What this turn changed"), "{prompt}");
         assert!(prompt.contains("--- a/lib.rs\n+++ b/lib.rs\n@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn c() {}\n"), "{prompt}");
         assert!(!prompt.contains("b2"), "diffed against the file before the turn: {prompt}");
         assert!(prompt.contains("--- /dev/null\n+++ b/map.md\n@@ -0,0 +1,1 @@\n+## a\n"), "{prompt}");
@@ -5343,6 +5456,56 @@ mod tests {
             bodies[2]["input"].to_string().contains("alpha"),
             "the read's result was replayed"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A model that goes round again -- a step of nothing but calls it already made --
+    // is stopped and asked for its answer with no tools declared, the one request it
+    // cannot answer with another call.
+    #[tokio::test]
+    async fn a_task_going_round_in_circles_is_asked_for_its_answer_without_tools() {
+        let dir = two_file_repo("circling");
+        let (url, bodies) = recording_hipfire(|body, _| {
+            if body["tools"].is_null() {
+                text_reply("a.txt says alpha")
+            } else {
+                call_reply("read_file", serde_json::json!({"path": "a.txt"}))
+            }
+        })
+        .await;
+        let client = Client::new(url, None);
+        let (etx, _erx) = mpsc::channel(64);
+        let seen = Mutex::new(SeenCalls::default());
+        let prefix = format!("repo context{}", crate::hipfire::PREFIX_END);
+        let mut written = Vec::new();
+        let out = run_task(
+            &TaskCtx {
+                client: &client,
+                model: "Qwen3.5-9B--oq4.25++",
+                band: Priority::Default,
+                dialects: &Dialects::default(),
+                tool_caller: None,
+                toolbox: repo_toolbox(&dir),
+                approvals: &ApprovalGate::default(),
+                prefix: &prefix,
+                role: Role::Review,
+                events: &etx,
+                id: 1,
+                read_only: false,
+                seen: &seen,
+                deadline: None,
+            },
+            "check a.txt",
+            &mut written,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "a.txt says alpha");
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3, "the read, its repeat, then the answer: {bodies:?}");
+        assert!(bodies[2]["tools"].is_null(), "the answer was asked for with no tools");
+        let last = bodies[2]["input"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!((last["role"].as_str(), last["content"].as_str()), (Some("user"), Some(ANSWER_NOW)));
         std::fs::remove_dir_all(&dir).ok();
     }
 
