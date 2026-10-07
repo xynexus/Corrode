@@ -45,11 +45,20 @@ pub async fn run() -> bool {
     match client.list_models().await {
         Ok(models) if !models.is_empty() => {
             ok(&format!("hipfire: {} model(s) at {base}", models.len()));
-            match roles::default_embedding_model(&models) {
-                Some(m) => ok(&format!("embedding model served: {m}")),
-                None => warn(
-                    "no embedding model served — DocQuery/skills fall back to BM25/manifest",
+            // Listed is not enough: a bf16 copy of an NPU-only model is listed and
+            // refuses every request, so ask it for one vector.
+            match roles::embedding_model(&models, roles::embed_model_env().as_deref()) {
+                Ok(Some(m)) => match client.embed(&m, "ping").await {
+                    Ok(v) => ok(&format!("embedding model {m} answers ({} dims)", v.len())),
+                    Err(e) => warn(&format!(
+                        "embedding model {m} does not embed ({e}) — DocQuery/skills fall back \
+                         to BM25/manifest; set CORRODE_EMBED_MODEL to one that does"
+                    )),
+                },
+                Ok(None) => warn(
+                    "no embedding model — DocQuery/skills fall back to BM25/manifest",
                 ),
+                Err(e) => warn(&format!("{e} — DocQuery/skills fall back to BM25/manifest")),
             }
             role_assignments(&models);
         }
