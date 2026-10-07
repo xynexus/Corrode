@@ -186,6 +186,23 @@ pub struct Node {
     pub text: String,
 }
 
+/// A node kind read back from the store as the `&'static str` the projection uses.
+/// The store holds it as a runtime string; mapping everything but `trivia` to "item"
+/// left no stored item equal to a freshly scanned one (`fn`, `use`, ...), so
+/// reconcile paired nodes by position and an insert re-keyed what followed it (#44).
+/// ponytail: each distinct kind is leaked once -- the set is the backends' fixed
+/// vocabulary, a few dozen strings; a per-store interner if kinds become user data.
+pub fn intern_kind(kind: &str) -> &'static str {
+    static KINDS: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut kinds = KINDS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(k) = kinds.iter().find(|k| **k == kind) {
+        return k;
+    }
+    let k: &'static str = Box::leak(kind.to_string().into_boxed_str());
+    kinds.push(k);
+    k
+}
+
 /// Decompose a file into nodes covering every byte.
 #[allow(dead_code)] // `ingest::file` uses the single-parse `spans` path instead
 pub fn scan(lang: &dyn Language, path: &str, src: &str) -> anyhow::Result<Vec<Node>> {
