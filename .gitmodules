@@ -23,3 +23,6 @@
 	path = fixtures/cae
 	url = git@github.com:xynexus/CAE.git
 	update = none
+[submodule "third_party/amd-skills"]
+	path = third_party/amd-skills
+	url = https://github.com/amd/skills.git
