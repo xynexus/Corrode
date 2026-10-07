@@ -97,12 +97,107 @@ fn toolchain_binds(cargo_home: Option<PathBuf>, rustup_home: Option<PathBuf>) ->
     a
 }
 
+/// What every spawned process gets, confined or not (review #30): build-job defaults
+/// and a memory cap. Measured 2026-10-07 with three cold CAE builds beside both swarm
+/// models: at cargo's default `-j32` the 27B lost 18% of its decode rate and the 35B
+/// 20% -- CPU and GPU share the APU's power budget, and the GPU clock fell to ~2.35
+/// GHz; at `-j8`, 11% and 3%. `nice`/`ionice` changed nothing: CPU time was never
+/// short. The cap keeps a runaway build or test from taking the host's RAM, which
+/// is also hipfire's.
+#[derive(Clone, Default)]
+pub struct SpawnPolicy {
+    /// `KEY=VALUE` defaults, each only where the daemon's own env leaves it unset.
+    env: Vec<String>,
+    /// `MemoryMax` of each command's systemd user scope (no swap); `None` = uncapped.
+    memory_max: Option<String>,
+    /// Why a cap that was asked for is not applied.
+    pub uncapped: Option<String>,
+}
+
+/// Build parallelism a spawned command gets unless the daemon's env sets its own.
+const JOB_DEFAULTS: &[(&str, &str)] = &[("CARGO_BUILD_JOBS", "8"), ("RUST_TEST_THREADS", "8")];
+/// `CORRODE_COMMAND_MEMORY_MAX` when unset: room for about three cold CAE builds.
+const MEMORY_MAX_DEFAULT: &str = "16G";
+
+impl SpawnPolicy {
+    /// From the env, with the cap dropped (and the reason kept) when a systemd user
+    /// scope cannot start here -- a resource cap is not a security boundary, so the
+    /// command runs uncapped rather than not at all; `doctor` warns.
+    pub fn from_env() -> Self {
+        let mut p = Self::with(|k| std::env::var(k).ok().filter(|v| !v.is_empty()));
+        if let Some(m) = p.memory_max.clone() {
+            let probe = std::process::Command::new("systemd-run")
+                .args(scope_argv(&m))
+                .arg("true")
+                .output();
+            let err = match probe {
+                Ok(o) if o.status.success() => None,
+                Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                Err(e) => Some(e.to_string()),
+            };
+            if let Some(e) = err {
+                p.memory_max = None;
+                p.uncapped = Some(format!("a systemd user scope cannot start: {e}"));
+            }
+        }
+        p
+    }
+
+    fn with(get: impl Fn(&str) -> Option<String>) -> Self {
+        let env = JOB_DEFAULTS
+            .iter()
+            .filter(|(k, _)| get(k).is_none())
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        let memory_max = match get("CORRODE_COMMAND_MEMORY_MAX") {
+            None => Some(MEMORY_MAX_DEFAULT.to_string()),
+            Some(v) if crate::knobs::parse_flag(&v) == Some(false) => None,
+            Some(v) => Some(v),
+        };
+        Self { env, memory_max, uncapped: None }
+    }
+
+    /// One line for the daemon's log and `doctor`.
+    pub fn describe(&self) -> String {
+        let env = if self.env.is_empty() { "none".to_string() } else { self.env.join(" ") };
+        let cap = match (&self.memory_max, &self.uncapped) {
+            (Some(m), _) => format!("{m} per command (systemd user scope, no swap)"),
+            (None, Some(why)) => format!("none -- {why}"),
+            (None, None) => "off (CORRODE_COMMAND_MEMORY_MAX)".to_string(),
+        };
+        format!("env defaults {env}; memory cap {cap}")
+    }
+}
+
+/// `systemd-run` arguments that start `--`-separated command in its own capped scope.
+/// `--scope` execs the command in place (same pid, so the tool loop's process-group
+/// kill still reaches it), and `--expand-environment=no` keeps systemd-run from
+/// rewriting `$` in it -- an agent's `sh -c 'echo $$'` arrived as `echo $`.
+fn scope_argv(memory_max: &str) -> Vec<String> {
+    [
+        "--user",
+        "--scope",
+        "--quiet",
+        "--expand-environment=no",
+        "-p",
+        &format!("MemoryMax={memory_max}"),
+        "-p",
+        "MemorySwapMax=0",
+        "--",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 #[derive(Clone)]
 pub struct Sandbox {
     enabled: bool,
     /// Share the host network into the sandbox. Off by default; needed for tools
     /// that fetch (cargo/pip/git clone). `CORRODE_SANDBOX_NET=on`.
     share_net: bool,
+    /// Applied to every spawn, confined or not.
+    policy: SpawnPolicy,
 }
 
 impl Sandbox {
@@ -112,6 +207,7 @@ impl Sandbox {
         let s = Self {
             enabled: crate::knobs::flag("CORRODE_SANDBOX", true),
             share_net: crate::knobs::flag("CORRODE_SANDBOX_NET", false),
+            policy: SpawnPolicy::from_env(),
         };
         if s.enabled {
             eprintln!(
@@ -119,28 +215,55 @@ impl Sandbox {
                 if s.share_net { "shared" } else { "denied" }
             );
         }
+        eprintln!("spawn policy: {}", s.policy.describe());
         s
     }
 
     pub fn disabled() -> Self {
-        Self { enabled: false, share_net: false }
+        Self { enabled: false, share_net: false, policy: SpawnPolicy::default() }
     }
 
-    /// Turn `argv` (program + args) into the argv actually spawned, confined to
-    /// `repo`. Disabled -> `argv` unchanged. Returns `(program, args)` so both
-    /// `tokio::process::Command` and portable-pty's `CommandBuilder` can consume it.
+    pub fn policy(&self) -> &SpawnPolicy {
+        &self.policy
+    }
+
+    /// Turn `argv` (program + args) into the argv actually spawned: the spawn policy's
+    /// env defaults just before the command, bwrap confinement to `repo` around it when
+    /// enabled, and the policy's capped scope outermost. Returns `(program, args)` so
+    /// both `tokio::process::Command` and portable-pty's `CommandBuilder` can consume it.
+    pub fn wrap(&self, repo: &Path, argv: &[&str]) -> (String, Vec<String>) {
+        debug_assert!(!argv.is_empty(), "wrap needs at least a program");
+        let mut cmd: Vec<String> = Vec::new();
+        if !self.policy.env.is_empty() {
+            cmd.push("env".to_string());
+            cmd.extend(self.policy.env.iter().cloned());
+        }
+        cmd.extend(argv.iter().map(|s| s.to_string()));
+        if self.enabled {
+            let mut b = vec!["bwrap".to_string()];
+            b.extend(self.bwrap_args(repo));
+            b.push("--".to_string());
+            b.extend(cmd);
+            cmd = b;
+        }
+        if let Some(m) = &self.policy.memory_max {
+            let mut s = vec!["systemd-run".to_string()];
+            s.extend(scope_argv(m));
+            s.extend(cmd);
+            cmd = s;
+        }
+        let prog = cmd.remove(0);
+        (prog, cmd)
+    }
+
+    /// bwrap's arguments, up to (not including) the `--` before the command.
     ///
     /// Note: we deliberately do NOT `--new-session`. It would guard against TIOCSTI
     /// keystroke injection, but it detaches the controlling tty and breaks the
     /// interactive shell's job control (`bash: cannot set terminal process group`).
     /// Modern kernels disallow TIOCSTI by default (`CONFIG_LEGACY_TIOCSTI=n`), so
     /// the guard is redundant; a paranoid deployment on an old kernel can revisit.
-    pub fn wrap(&self, repo: &Path, argv: &[&str]) -> (String, Vec<String>) {
-        debug_assert!(!argv.is_empty(), "wrap needs at least a program");
-        if !self.enabled {
-            return (argv[0].to_string(), argv[1..].iter().map(|s| s.to_string()).collect());
-        }
-
+    fn bwrap_args(&self, repo: &Path) -> Vec<String> {
         let repo = repo.to_string_lossy().into_owned();
         let mut a: Vec<String> = Vec::new();
         let mut push = |parts: &[&str]| a.extend(parts.iter().map(|s| s.to_string()));
@@ -197,10 +320,7 @@ impl Sandbox {
         }
         let mut push = |parts: &[&str]| a.extend(parts.iter().map(|s| s.to_string()));
         push(&["--chdir", &repo]);
-
-        push(&["--"]);
-        a.extend(argv.iter().map(|s| s.to_string()));
-        ("bwrap".to_string(), a)
+        a
     }
 }
 
@@ -208,6 +328,43 @@ impl Sandbox {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // The policy reaches a command whether or not it is confined: the scope outermost,
+    // bwrap inside it, the env defaults just before the command (inside bwrap, so the
+    // confined process sees them).
+    #[test]
+    fn the_spawn_policy_wraps_every_command() {
+        let policy = SpawnPolicy::with(|_| None);
+        let joined = |sb: &Sandbox| {
+            let (prog, args) = sb.wrap(&PathBuf::from("/repo"), &["sh", "-c", "cargo test"]);
+            format!("{prog} {}", args.join(" "))
+        };
+        let tail = "-- env CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=8 sh -c cargo test";
+        let bare = joined(&Sandbox { enabled: false, share_net: false, policy: policy.clone() });
+        assert!(bare.starts_with("systemd-run --user --scope"), "{bare}");
+        assert!(bare.contains("--expand-environment=no"), "{bare}");
+        assert!(bare.contains("-p MemoryMax=16G -p MemorySwapMax=0"), "{bare}");
+        assert!(bare.ends_with(tail), "{bare}");
+        let boxed = joined(&Sandbox { enabled: true, share_net: false, policy });
+        let bwrap = boxed.find(" -- bwrap ").expect(&boxed);
+        assert!(boxed.starts_with("systemd-run "), "{boxed}");
+        assert!(boxed[bwrap..].ends_with(tail), "{boxed}");
+    }
+
+    // The daemon's own env wins over a default, and the cap can be turned off.
+    #[test]
+    fn the_operator_overrides_the_spawn_defaults() {
+        let set = |pairs: &'static [(&'static str, &'static str)]| {
+            SpawnPolicy::with(move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string()))
+        };
+        let p = set(&[("CARGO_BUILD_JOBS", "32"), ("CORRODE_COMMAND_MEMORY_MAX", "off")]);
+        assert_eq!(p.env, vec!["RUST_TEST_THREADS=8".to_string()]);
+        assert_eq!(p.memory_max, None);
+        let (prog, args) = Sandbox { enabled: false, share_net: false, policy: p }
+            .wrap(&PathBuf::from("/repo"), &["sh"]);
+        assert_eq!((prog.as_str(), args), ("env", vec!["RUST_TEST_THREADS=8".to_string(), "sh".into()]));
+        assert_eq!(set(&[("CORRODE_COMMAND_MEMORY_MAX", "24G")]).memory_max.as_deref(), Some("24G"));
+    }
 
     #[test]
     fn disabled_is_a_passthrough() {
@@ -219,7 +376,7 @@ mod tests {
 
     #[test]
     fn enabled_binds_repo_and_appends_argv_after_dashdash() {
-        let sb = Sandbox { enabled: true, share_net: false };
+        let sb = Sandbox { enabled: true, share_net: false, policy: SpawnPolicy::default() };
         let (prog, args) = sb.wrap(&PathBuf::from("/home/u/proj"), &["sh", "-c", "ls"]);
         assert_eq!(prog, "bwrap");
         // repo bound read-write, its .corrode re-bound read-only, no net.
@@ -286,7 +443,7 @@ mod tests {
 
     #[test]
     fn net_flag_opts_in() {
-        let sb = Sandbox { enabled: true, share_net: true };
+        let sb = Sandbox { enabled: true, share_net: true, policy: SpawnPolicy::default() };
         let (_, args) = sb.wrap(&PathBuf::from("/r"), &["/bin/bash", "-i"]);
         assert!(args.join(" ").contains("--share-net"));
     }
@@ -302,7 +459,7 @@ mod tests {
             eprintln!("skipped: no git");
             return;
         }
-        let sb = Sandbox { enabled: true, share_net: false };
+        let sb = Sandbox { enabled: true, share_net: false, policy: SpawnPolicy::default() };
         let run = |script: &str| {
             let (prog, args) = sb.wrap(&repo, &["sh", "-c", script]);
             std::process::Command::new(prog).args(args).output()

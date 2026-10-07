@@ -137,6 +137,15 @@ contains them, and the file tools refuse them whether or not the sandbox is on; 
 `.git` and `.corrode` are read-only inside it -- a sandboxed command can read history but not
 commit, nor plant a `core.hooksPath`/`fsmonitor` that runs at the human's next `git status`), `CORRODE_SANDBOX_NET` (share the
 host network into the sandbox; off by default — needed for tools that fetch),
+`CORRODE_COMMAND_MEMORY_MAX` (the spawn policy's memory cap: every spawned process --
+`run_command`, `run_skill_script` and the web terminal, sandboxed or not -- runs in its own
+`systemd-run --user --scope` with this `MemoryMax` and no swap, so a runaway build is
+OOM-killed alone (exit 137) instead of taking the RAM hipfire serves from; default `16G`,
+a systemd size or `25%`-style share, `off` disables; when no user scope can start, commands
+run uncapped and `doctor` warns. The same policy sets `CARGO_BUILD_JOBS=8` and
+`RUST_TEST_THREADS=8` unless the daemon's env sets them: three concurrent `-j32` CAE builds
+cost the 27B 18% of its decode rate and the 35B 20%, `-j8` 11% and 3%; see
+`sandbox::SpawnPolicy`),
 `CORRODE_COMMAND_TIMEOUT_S` (wall-clock limit for one `run_command`/`run_skill_script`,
 default 1800; past it the command's whole process group is killed and the call returns
 `exit timeout` — output is capped at 512 KiB head + 512 KiB tail per stream either way),
