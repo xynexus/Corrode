@@ -571,7 +571,27 @@ where
             graph.set_output(id, text); // what the plan-level review pass reads
         }
         graph.set_artifacts(id, outcome.artifacts); // code nodes this task produced
+        // The roles the plan already hands this task's output to. An emission of one
+        // of them duplicates a planned task: two CAE research tasks each emitted "write
+        // docs/crate-map.md" beside the planned coder waiting on both, three coders
+        // overwrote one file, and two review rounds then rewrote it.
+        let routed: Vec<Role> = graph
+            .nodes
+            .iter()
+            .filter(|m| m.task.deps.contains(&id))
+            .map(|m| m.task.role)
+            .collect();
         for emit in outcome.emitted {
+            if routed.contains(&emit.role) {
+                eprintln!(
+                    "plan {}: task {id} already feeds a planned {:?} task, dropping its \
+                     emission ({:?})",
+                    graph.plan_id,
+                    emit.role,
+                    emit.prompt.chars().take(80).collect::<String>()
+                );
+                continue;
+            }
             if expired() {
                 summary.shed += 1;
                 continue;
@@ -908,6 +928,38 @@ mod tests {
             "emitted test runs after its emitter"
         );
         assert!(g.stuck().is_empty(), "everything scheduled");
+    }
+
+    // A task whose output the plan already hands to a planned task of some role does not
+    // also queue one of that role: research feeding a planned coder emitted "write the
+    // file" twice, and three coders wrote it. An emission of another role still runs.
+    #[tokio::test]
+    async fn an_emission_the_plan_already_routes_is_dropped() {
+        let mut g = PlanGraph::default();
+        let research = g.add(Role::Research, "read the crates", vec![]);
+        g.add(Role::Coder, "write the map", vec![research]);
+        let ran = Arc::new(Mutex::new(Vec::<String>::new()));
+        let rec = ran.clone();
+        run_reactive(&mut g, move |task: PlanTask| {
+            let rec = rec.clone();
+            async move {
+                rec.lock().unwrap().push(task.prompt.clone());
+                let emitted = if task.prompt.starts_with("read the crates") {
+                    vec![
+                        Emit { role: Role::Coder, prompt: "write the map yourself".into(), after_emitter: true },
+                        Emit { role: Role::Research, prompt: "read the docs too".into(), after_emitter: true },
+                    ]
+                } else {
+                    vec![]
+                };
+                Outcome { output: Ok("done".into()), emitted, artifacts: Vec::new() }
+            }
+        })
+        .await;
+        let ran = ran.lock().unwrap().clone();
+        assert!(!ran.iter().any(|p| p.contains("write the map yourself")), "{ran:?}");
+        assert!(ran.iter().any(|p| p.contains("read the docs too")), "{ran:?}");
+        assert_eq!(ran.len(), 3);
     }
 
     // The plan-level review round: after the first drive settles, the digest carries the
