@@ -171,7 +171,8 @@ also denied at once if the client disconnects), `CORRODE_VIEWS` (a turn works in
 `HEAD` instead of the working tree: file tools write to the view, sandboxed commands run in it
 mounted at the repo's path with a per-turn cargo target dir, and at the end it is committed to
 `refs/corrode/<plan>` -- recorded as `commit` in the turn journal -- leaving branches, index and
-working tree alone; off unless set on; needs `--features fuse` and `CORRODE_SANDBOX`, else the
+working tree alone; the view is a locked linked worktree, so `git status`/`diff`/`log` work inside
+the turn against a read-only git dir and `commit` does not; off unless set on; needs `--features fuse` and `CORRODE_SANDBOX`, else the
 turn says so and works in the working tree; `view.rs`, docs/vfs-branches-and-builds.md §8;
 `CORRODE_MOUNT_REV=<rev>` makes `CORRODE_MOUNT` mount a view of that commit), `CORRODE_AUTO_APPROVE` (auto-approve every mutating tool call instead of blocking on
 a human — for unattended/headless swarms that would otherwise fail closed; off unless

@@ -10,7 +10,7 @@
 //! history only changes when someone promotes that commit.
 
 use crate::vfs::{io_err, Vfs};
-use std::io::ErrorKind::{AlreadyExists, DirectoryNotEmpty, IsADirectory, NotADirectory, NotFound};
+use std::io::ErrorKind::{AlreadyExists, DirectoryNotEmpty, IsADirectory, NotADirectory, NotFound, PermissionDenied};
 use async_trait::async_trait;
 use corrode_core::FileNodeView;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -43,6 +43,9 @@ pub struct ViewVfs {
     /// Base directory -> the names directly in it.
     children: HashMap<String, BTreeSet<String>>,
     changes: Mutex<BTreeMap<String, Change>>,
+    /// The `.git` file a view serves at its root (`gitdir: ...`), making it a linked
+    /// worktree of the repository to stock git (see [`TurnView::start`]). Unset: no `.git`.
+    git_link: std::sync::OnceLock<String>,
 }
 
 fn git(root: &std::path::Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
@@ -85,17 +88,26 @@ fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(p, _)| p)
 }
 
-/// A view path: relative, no `..`, and not inside `.git` or `.corrode` (the same rule
-/// the passthrough VFS applies to writes; a view has no business there at all).
+/// A view path: relative, no `..`, and not inside `.git` or `.corrode` -- a view has no
+/// business there. The one exception is `.git` itself, the worktree link file.
 fn clean(path: &str) -> anyhow::Result<String> {
     let p = path.trim_matches('/');
     if p.split('/').any(|c| c == ".." || c == ".") {
-        anyhow::bail!("path escapes the view: {path}");
+        return Err(io_err(PermissionDenied, format!("path escapes the view: {path}")));
     }
-    if matches!(p.split('/').next(), Some(".git" | ".corrode")) {
-        anyhow::bail!("no such path in the view: {path}");
+    if p != ".git" && matches!(p.split('/').next(), Some(".git" | ".corrode")) {
+        return Err(io_err(NotFound, format!("no such path in the view: {path}")));
     }
     Ok(p.to_string())
+}
+
+/// [`clean`], for a change: the `.git` link is the daemon's, not the turn's.
+fn writable(path: &str) -> anyhow::Result<String> {
+    let p = clean(path)?;
+    if p == ".git" {
+        return Err(io_err(PermissionDenied, "the view's .git is read-only"));
+    }
+    Ok(p)
 }
 
 impl ViewVfs {
@@ -141,7 +153,13 @@ impl ViewVfs {
             tree,
             children,
             changes: Mutex::new(BTreeMap::new()),
+            git_link: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Serve `link` as the view's root `.git` file.
+    pub fn set_git_link(&self, link: String) {
+        let _ = self.git_link.set(link);
     }
 
     /// The commit this view starts from.
@@ -163,6 +181,9 @@ impl ViewVfs {
         if path.is_empty() {
             return Some(node(true, 0, self.base_mtime_ns, false));
         }
+        if path == ".git" {
+            return self.git_link.get().map(|l| node(false, l.len() as u64, self.base_mtime_ns, false));
+        }
         match changes.get(path) {
             Some(Change::Gone) => None,
             Some(Change::File { data, executable, mtime_ns }) => {
@@ -179,6 +200,9 @@ impl ViewVfs {
     /// Names directly under `dir`, the turn's changes applied.
     fn names_in(&self, dir: &str, changes: &BTreeMap<String, Change>) -> BTreeSet<String> {
         let mut names = self.children.get(dir).cloned().unwrap_or_default();
+        if dir.is_empty() && self.git_link.get().is_some() {
+            names.insert(".git".to_string());
+        }
         let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
         for (path, change) in changes.range(prefix.clone()..) {
             let Some(rest) = path.strip_prefix(&prefix) else { break };
@@ -218,7 +242,7 @@ impl ViewVfs {
 
     /// Delete a file, or an empty directory.
     fn remove_now(&self, path: &str) -> anyhow::Result<()> {
-        let path = clean(path)?;
+        let path = writable(path)?;
         let mut changes = self.changes.lock().unwrap();
         let Some(v) = self.view_of(&path, &changes) else { return Err(io_err(NotFound, format!("no such path: {path}"))) };
         if v.is_dir && !self.names_in(&path, &changes).is_empty() {
@@ -230,7 +254,7 @@ impl ViewVfs {
 
     /// Create an empty directory.
     fn mkdir_now(&self, path: &str) -> anyhow::Result<()> {
-        let path = clean(path)?;
+        let path = writable(path)?;
         let mut changes = self.changes.lock().unwrap();
         if self.view_of(&path, &changes).is_some() {
             return Err(io_err(AlreadyExists, format!("already exists: {path}")));
@@ -242,7 +266,7 @@ impl ViewVfs {
 
     /// Set or clear a file's executable bit.
     fn set_executable_now(&self, path: &str, executable: bool) -> anyhow::Result<()> {
-        let path = clean(path)?;
+        let path = writable(path)?;
         let data = self.read_now(&path)?;
         let mut changes = self.changes.lock().unwrap();
         changes.insert(path, Change::File { data, executable, mtime_ns: now_ns() });
@@ -251,7 +275,7 @@ impl ViewVfs {
 
     /// Move a file or directory (with everything under it), replacing a file at `to`.
     fn rename_now(&self, from: &str, to: &str) -> anyhow::Result<()> {
-        let (from, to) = (clean(from)?, clean(to)?);
+        let (from, to) = (writable(from)?, writable(to)?);
         if from == to {
             return Ok(());
         }
@@ -404,6 +428,11 @@ pub struct TurnView {
     pub vfs: Arc<ViewVfs>,
     pub mountpoint: PathBuf,
     pub target: PathBuf,
+    /// The repository's common git dir, which the sandbox binds read-only at
+    /// [`crate::sandbox::SANDBOX_GIT`] for the view's `.git` link to point into.
+    pub git_dir: PathBuf,
+    /// The view's linked-worktree admin dir, `<git dir>/worktrees/corrode-<plan>`.
+    admin: PathBuf,
     name: String,
     mount: fuse3::raw::MountHandle,
 }
@@ -423,8 +452,15 @@ impl TurnView {
             .join("corrode/targets")
             .join(&name);
         std::fs::create_dir_all(&target)?;
-        let mount = crate::fuse::mount_handle(vfs.clone(), &mountpoint).await?;
-        Ok(Self { vfs, mountpoint, target, name, mount })
+        let (git_dir, admin) = tokio::task::block_in_place(|| link_worktree(repo, &vfs, &name))?;
+        let mount = match crate::fuse::mount_handle(vfs.clone(), &mountpoint).await {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&admin);
+                return Err(e);
+            }
+        };
+        Ok(Self { vfs, mountpoint, target, git_dir, admin, name, mount })
     }
 
     /// Commit the view to `refs/corrode/<plan>` (`None`: nothing changed), unmount it
@@ -434,13 +470,46 @@ impl TurnView {
         if let Err(e) = self.mount.unmount().await {
             eprintln!("view: unmounting {}: {e}", self.mountpoint.display());
         }
-        let (mountpoint, target) = (self.mountpoint, self.target);
+        let (mountpoint, target, admin) = (self.mountpoint, self.target, self.admin);
         tokio::task::spawn_blocking(move || {
             let _ = std::fs::remove_dir(&mountpoint);
             let _ = std::fs::remove_dir_all(&target);
+            let _ = std::fs::remove_dir_all(&admin);
         });
         Ok(committed?.map(|c| format!("refs/corrode/{} {c}", self.name)))
     }
+}
+
+/// Make `vfs` a linked worktree of `repo` to stock git (docs/vfs-branches-and-builds.md
+/// §8): an admin dir under `<git dir>/worktrees/` -- `HEAD` detached at the view's base,
+/// `commondir`, `gitdir`, an index of the base tree, and `locked`, so a
+/// `git worktree prune` on the host leaves a view that exists only inside a sandbox
+/// alone -- and the view's own `.git` file pointing at it through the sandbox's
+/// read-only bind of the git dir. `git status`, `diff` and `log` then work inside a
+/// turn; committing does not (the git dir is read-only there), which is the point: the
+/// turn's commit is the daemon's, at the end.
+///
+/// The index carries no stat data, so `git status` hashes every file to compare it --
+/// correct, and cheap at CAE's size; it cannot save a refreshed index (read-only).
+/// Returns `(git dir, admin dir)`.
+#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+fn link_worktree(repo: &std::path::Path, vfs: &ViewVfs, name: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let git_dir = PathBuf::from(String::from_utf8(common)?.trim());
+    let wt = format!("corrode-{name}");
+    let admin = git_dir.join("worktrees").join(&wt);
+    std::fs::create_dir_all(&admin)?;
+    let repo_abs = std::fs::canonicalize(repo)?;
+    std::fs::write(admin.join("HEAD"), format!("{}\n", vfs.base))?;
+    std::fs::write(admin.join("commondir"), "../..\n")?;
+    // Where the worktree's `.git` sits as git inside the sandbox sees it: the view is
+    // mounted at the repository's own path.
+    std::fs::write(admin.join("gitdir"), format!("{}/.git\n", repo_abs.display()))?;
+    std::fs::write(admin.join("locked"), "a Corrode turn's VFS view; removed when the turn ends\n")?;
+    let index = admin.join("index");
+    git_stdin(repo, &["read-tree", &vfs.base], &[("GIT_INDEX_FILE", index.as_os_str())], b"")?;
+    vfs.set_git_link(format!("gitdir: {}/worktrees/{wt}\n", crate::sandbox::SANDBOX_GIT));
+    Ok((git_dir, admin))
 }
 
 /// Without the `fuse` feature a view cannot be mounted, so a turn cannot work in one.
@@ -449,6 +518,7 @@ pub struct TurnView {
     pub vfs: Arc<ViewVfs>,
     pub mountpoint: PathBuf,
     pub target: PathBuf,
+    pub git_dir: PathBuf,
 }
 
 #[cfg(not(feature = "fuse"))]
@@ -497,6 +567,9 @@ impl Vfs for ViewVfs {
 
     async fn read(&self, path: &str) -> anyhow::Result<Vec<u8>> {
         let path = clean(path)?;
+        if path == ".git" {
+            return self.git_link.get().map(|l| l.clone().into_bytes()).ok_or_else(|| io_err(NotFound, "no .git"));
+        }
         let oid = {
             let changes = self.changes.lock().unwrap();
             match changes.get(&path) {
@@ -516,7 +589,7 @@ impl Vfs for ViewVfs {
     }
 
     async fn write(&self, path: &str, contents: &[u8]) -> anyhow::Result<()> {
-        let path = clean(path)?;
+        let path = writable(path)?;
         if path.is_empty() {
             anyhow::bail!("cannot write the view's root");
         }
@@ -639,6 +712,43 @@ pub(crate) mod tests {
         v.rename("README.md.tmp", "README.md").await.unwrap();
         assert_eq!(v.read("README.md").await.unwrap(), b"saved\n");
         assert_eq!(v.tracked_files().await.unwrap(), ["README.md", "run.sh"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole loop: a turn's view, mounted, is a git worktree to a sandboxed shell --
+    /// `status` and `diff` see the turn's change, `commit` is refused -- and finishing the
+    /// turn commits it, unmounts, and leaves no worktree behind.
+    #[cfg(feature = "fuse")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mounted_view_is_a_git_worktree_inside_the_sandbox() {
+        let dir = repo("worktree");
+        let plan = format!("view-test-{}", std::process::id());
+        let view = match TurnView::start(&dir, &plan).await {
+            Ok(v) => v,
+            Err(e) => return eprintln!("skipped: cannot mount a view here ({e})"),
+        };
+        view.vfs.write("src/lib.rs", b"pub fn g() {}\n").await.unwrap();
+        let sb = crate::sandbox::Sandbox::from_env().with_view(view.mountpoint.clone(), view.target.clone(), view.git_dir.clone());
+        let run = |script: &str| {
+            let (prog, args) = sb.wrap(&std::fs::canonicalize(&dir).unwrap(), &["sh", "-c", script]);
+            std::process::Command::new(prog).args(args).output().unwrap()
+        };
+        if !sb.enabled() || !run("true").status.success() {
+            view.finish("skip").await.ok();
+            return eprintln!("skipped: bwrap cannot run here");
+        }
+        let status = run("git status --porcelain");
+        assert_eq!(String::from_utf8_lossy(&status.stdout), " M src/lib.rs\n", "{}", String::from_utf8_lossy(&status.stderr));
+        let diff = String::from_utf8_lossy(&run("git diff").stdout).into_owned();
+        assert!(diff.contains("-pub fn f() {}") && diff.contains("+pub fn g() {}"), "{diff}");
+        assert!(!run("git -c user.name=t -c user.email=t@t commit -qam x").status.success(), "commit must be refused");
+        // Seen from the host, the view is a locked worktree, gone once the turn ends.
+        let list = String::from_utf8(git(&dir, &["worktree", "list", "--porcelain"]).unwrap()).unwrap();
+        assert!(list.contains("locked"), "{list}");
+        let commit = view.finish("turn").await.unwrap().expect("a commit");
+        assert!(commit.starts_with(&format!("refs/corrode/{plan}")), "{commit}");
+        let list = String::from_utf8(git(&dir, &["worktree", "list"]).unwrap()).unwrap();
+        assert_eq!(list.lines().count(), 1, "{list}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

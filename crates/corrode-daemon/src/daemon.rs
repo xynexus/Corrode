@@ -625,7 +625,7 @@ impl Daemon {
                     None => Arc::clone(&session.vfs),
                 };
                 let turn_sandbox = match &turn_view {
-                    Some(v) => self.sandbox.clone().with_view(v.mountpoint.clone(), v.target.clone()),
+                    Some(v) => self.sandbox.clone().with_view(v.mountpoint.clone(), v.target.clone(), v.git_dir.clone()),
                     None => self.sandbox.clone(),
                 };
                 let turn_usage = Arc::new(std::sync::Mutex::new(crate::hipfire::Usage::default()));
