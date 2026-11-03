@@ -25,12 +25,18 @@ struct BaseEntry {
     size: u64,
     dir: bool,
     executable: bool,
+    /// A submodule (`160000`): shown as an empty directory the sandbox binds the host's
+    /// checkout over read-only (see [`ViewVfs::submodules`]); nothing writes inside it.
+    gitlink: bool,
+    /// A symlink (`120000`) and its target.
+    link: Option<String>,
 }
 
 /// What the view holds for a path the turn changed.
 #[derive(Clone)]
 enum Change {
     File { data: Arc<[u8]>, executable: bool, mtime_ns: u64 },
+    Link { target: String, mtime_ns: u64 },
     Dir { mtime_ns: u64 },
     Gone,
 }
@@ -111,6 +117,58 @@ fn writable(path: &str) -> anyhow::Result<String> {
 }
 
 impl ViewVfs {
+    /// [`writable`], and not a submodule or anything inside one: a submodule's content
+    /// is the host's checkout, bound read-only, and a file under a gitlink could not be
+    /// committed anyway.
+    fn writable(&self, path: &str) -> anyhow::Result<String> {
+        let p = writable(path)?;
+        let mut cur = p.as_str();
+        while !cur.is_empty() {
+            if self.tree.get(cur).is_some_and(|e| e.gitlink) {
+                return Err(io_err(PermissionDenied, format!("{cur} is a submodule, read-only in a view")));
+            }
+            cur = parent(cur);
+        }
+        Ok(p)
+    }
+
+    /// The submodules' paths, for the sandbox to bind the host's checkouts over.
+    pub fn submodules(&self) -> Vec<String> {
+        self.tree.iter().filter(|(_, e)| e.gitlink).map(|(p, _)| p.clone()).collect()
+    }
+
+    /// Where `path` leads, symlinks inside the view followed (at most 8): what a file
+    /// tool reads. A link out of the view, or absolute, leads nowhere.
+    fn resolve(&self, path: &str) -> anyhow::Result<String> {
+        let mut p = path.to_string();
+        for _ in 0..8 {
+            let target = {
+                let changes = self.changes.lock().unwrap();
+                match self.view_of(&p, &changes).and_then(|v| v.symlink) {
+                    Some(t) => t,
+                    None => return Ok(p),
+                }
+            };
+            if target.starts_with('/') {
+                return Err(io_err(NotFound, format!("{p} links outside the view: {target}")));
+            }
+            let mut parts: Vec<&str> = parent(&p).split('/').filter(|c| !c.is_empty()).collect();
+            for c in target.split('/') {
+                match c {
+                    "" | "." => {}
+                    ".." => {
+                        if parts.pop().is_none() {
+                            return Err(io_err(NotFound, format!("{p} links outside the view: {target}")));
+                        }
+                    }
+                    c => parts.push(c),
+                }
+            }
+            p = parts.join("/");
+        }
+        Err(io_err(NotFound, format!("too many links resolving {path}")))
+    }
+
     /// A view of `rev` in the repository at `root`, with no changes yet.
     pub fn open(root: impl Into<PathBuf>, rev: &str) -> anyhow::Result<Self> {
         let root = root.into();
@@ -127,15 +185,25 @@ impl ViewVfs {
             let Some((meta, path)) = rec.split_once('\t') else { continue };
             let f: Vec<&str> = meta.split_whitespace().collect();
             let [mode, _kind, oid, size] = f[..] else { continue };
-            // ponytail: symlinks (120000) and submodules (160000) are left out of the
-            // view; serve them once a project needs them inside a turn.
+            let dir_entry = |gitlink| BaseEntry {
+                oid: String::new(),
+                size: 0,
+                dir: true,
+                executable: false,
+                gitlink,
+                link: None,
+            };
             let entry = match mode {
-                "040000" => BaseEntry { oid: String::new(), size: 0, dir: true, executable: false },
-                "100644" | "100755" => BaseEntry {
+                "040000" => dir_entry(false),
+                "160000" => dir_entry(true),
+                "100644" | "100755" | "120000" => BaseEntry {
                     oid: oid.to_string(),
                     size: size.parse().unwrap_or(0),
                     dir: false,
                     executable: mode == "100755",
+                    gitlink: false,
+                    // Filled in below, in one `cat-file --batch` for all of them.
+                    link: (mode == "120000").then(String::new),
                 },
                 _ => continue,
             };
@@ -145,6 +213,21 @@ impl ViewVfs {
                 children.entry(path.to_string()).or_default();
             }
             tree.insert(path.to_string(), entry);
+        }
+        let links: Vec<String> = tree.iter().filter(|(_, e)| e.link.is_some()).map(|(p, _)| p.clone()).collect();
+        if !links.is_empty() {
+            let input: String = links.iter().map(|p| format!("{}\n", tree[p].oid)).collect();
+            let out = git_stdin(&root, &["cat-file", "--batch"], &[], input.as_bytes())?;
+            // `<oid> blob <size>\n<content>\n`, in input order.
+            let mut at = 0usize;
+            for p in &links {
+                let header_end = at + out[at..].iter().position(|&b| b == b'\n').ok_or_else(|| anyhow::anyhow!("short cat-file output"))?;
+                let header = String::from_utf8_lossy(&out[at..header_end]).into_owned();
+                let size: usize = header.rsplit(' ').next().and_then(|n| n.parse().ok()).ok_or_else(|| anyhow::anyhow!("cat-file: {header}"))?;
+                let body = &out[header_end + 1..header_end + 1 + size];
+                tree.get_mut(p).expect("listed").link = Some(String::from_utf8_lossy(body).into_owned());
+                at = header_end + 1 + size + 1;
+            }
         }
         Ok(Self {
             root,
@@ -177,6 +260,11 @@ impl ViewVfs {
             mode: None,
             mtime_ns: Some(mtime_ns),
             executable,
+            symlink: None,
+        };
+        let link = |target: &String, mtime_ns| FileNodeView {
+            symlink: Some(target.clone()),
+            ..node(false, target.len() as u64, mtime_ns, false)
         };
         if path.is_empty() {
             return Some(node(true, 0, self.base_mtime_ns, false));
@@ -190,10 +278,11 @@ impl ViewVfs {
                 Some(node(false, data.len() as u64, *mtime_ns, *executable))
             }
             Some(Change::Dir { mtime_ns }) => Some(node(true, 0, *mtime_ns, false)),
-            None => self
-                .tree
-                .get(path)
-                .map(|e| node(e.dir, e.size, self.base_mtime_ns, e.executable)),
+            Some(Change::Link { target, mtime_ns }) => Some(link(target, *mtime_ns)),
+            None => self.tree.get(path).map(|e| match &e.link {
+                Some(t) => link(t, self.base_mtime_ns),
+                None => node(e.dir, e.size, self.base_mtime_ns, e.executable),
+            }),
         }
     }
 
@@ -242,7 +331,7 @@ impl ViewVfs {
 
     /// Delete a file, or an empty directory.
     fn remove_now(&self, path: &str) -> anyhow::Result<()> {
-        let path = writable(path)?;
+        let path = self.writable(path)?;
         let mut changes = self.changes.lock().unwrap();
         let Some(v) = self.view_of(&path, &changes) else { return Err(io_err(NotFound, format!("no such path: {path}"))) };
         if v.is_dir && !self.names_in(&path, &changes).is_empty() {
@@ -254,7 +343,7 @@ impl ViewVfs {
 
     /// Create an empty directory.
     fn mkdir_now(&self, path: &str) -> anyhow::Result<()> {
-        let path = writable(path)?;
+        let path = self.writable(path)?;
         let mut changes = self.changes.lock().unwrap();
         if self.view_of(&path, &changes).is_some() {
             return Err(io_err(AlreadyExists, format!("already exists: {path}")));
@@ -266,7 +355,7 @@ impl ViewVfs {
 
     /// Set or clear a file's executable bit.
     fn set_executable_now(&self, path: &str, executable: bool) -> anyhow::Result<()> {
-        let path = writable(path)?;
+        let path = self.writable(path)?;
         let data = self.read_now(&path)?;
         let mut changes = self.changes.lock().unwrap();
         changes.insert(path, Change::File { data, executable, mtime_ns: now_ns() });
@@ -275,7 +364,7 @@ impl ViewVfs {
 
     /// Move a file or directory (with everything under it), replacing a file at `to`.
     fn rename_now(&self, from: &str, to: &str) -> anyhow::Result<()> {
-        let (from, to) = (writable(from)?, writable(to)?);
+        let (from, to) = (self.writable(from)?, self.writable(to)?);
         if from == to {
             return Ok(());
         }
@@ -304,7 +393,7 @@ impl ViewVfs {
         // Contents read outside the lock: a base blob is a git call.
         let mut files = Vec::new();
         for (p, v) in &moved {
-            if !v.is_dir {
+            if !v.is_dir && v.symlink.is_none() {
                 files.push((p.clone(), self.read_now(p)?, v.executable));
             }
         }
@@ -315,6 +404,9 @@ impl ViewVfs {
         for (p, v) in &moved {
             if v.is_dir {
                 changes.insert(target(p), Change::Dir { mtime_ns: t });
+            }
+            if let Some(link) = &v.symlink {
+                changes.insert(target(p), Change::Link { target: link.clone(), mtime_ns: t });
             }
         }
         for (p, data, executable) in files {
@@ -336,9 +428,9 @@ impl ViewVfs {
             let changes = self.changes.lock().unwrap();
             match changes.get(path) {
                 Some(Change::File { data, .. }) => return Ok(Arc::clone(data)),
-                Some(Change::Gone) | Some(Change::Dir { .. }) => anyhow::bail!("not a file: {path}"),
+                Some(Change::Gone | Change::Dir { .. } | Change::Link { .. }) => anyhow::bail!("not a file: {path}"),
                 None => match self.tree.get(path) {
-                    Some(e) if !e.dir => e.oid.clone(),
+                    Some(e) if !e.dir && e.link.is_none() => e.oid.clone(),
                     _ => anyhow::bail!("not a file: {path}"),
                 },
             }
@@ -388,6 +480,10 @@ impl ViewVfs {
                     let mode = if *executable { "100755" } else { "100644" };
                     info.extend(format!("{mode} {}\t{path}\n", String::from_utf8(oid)?.trim()).bytes());
                 }
+                Change::Link { target, .. } => {
+                    let oid = git_stdin(&self.root, &["hash-object", "-w", "--stdin"], &[], target.as_bytes())?;
+                    info.extend(format!("120000 {}\t{path}\n", String::from_utf8(oid)?.trim()).bytes());
+                }
                 Change::Gone if self.tree.get(path).is_some_and(|e| !e.dir) => {
                     info.extend(format!("0 {}\t{path}\n", "0".repeat(40)).bytes());
                 }
@@ -433,6 +529,8 @@ pub struct TurnView {
     pub git_dir: PathBuf,
     /// The view's linked-worktree admin dir, `<git dir>/worktrees/corrode-<plan>`.
     admin: PathBuf,
+    /// Git config the sandbox sets for commands in the view (see [`filter_overrides`]).
+    pub git_env: Vec<(String, String)>,
     name: String,
     mount: fuse3::raw::MountHandle,
 }
@@ -453,6 +551,7 @@ impl TurnView {
             .join(&name);
         std::fs::create_dir_all(&target)?;
         let (git_dir, admin) = tokio::task::block_in_place(|| link_worktree(repo, &vfs, &name))?;
+        let git_env = tokio::task::block_in_place(|| filter_overrides(repo));
         let mount = match crate::fuse::mount_handle(vfs.clone(), &mountpoint).await {
             Ok(m) => m,
             Err(e) => {
@@ -460,7 +559,7 @@ impl TurnView {
                 return Err(e);
             }
         };
-        Ok(Self { vfs, mountpoint, target, git_dir, admin, name, mount })
+        Ok(Self { vfs, mountpoint, target, git_dir, admin, git_env, name, mount })
     }
 
     /// Commit the view to `refs/corrode/<plan>` (`None`: nothing changed), unmount it
@@ -512,6 +611,41 @@ fn link_worktree(repo: &std::path::Path, vfs: &ViewVfs, name: &str) -> anyhow::R
     Ok((git_dir, admin))
 }
 
+/// `GIT_CONFIG_*` env that turns every configured filter driver (`filter.<name>.*`)
+/// into a pass-through, not required. A view serves blobs exactly as stored -- an LFS
+/// file is its pointer -- so there is nothing for a clean filter to convert, and the
+/// filter could not run against the read-only git dir anyway: in a view of Corrode,
+/// whose `*.safetensors` go through `git-lfs`, `git status` died with "external filter
+/// 'git-lfs filter-process' failed".
+#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+fn filter_overrides(repo: &std::path::Path) -> Vec<(String, String)> {
+    let names = git(repo, &["config", "--name-only", "--get-regexp", r"^filter\."]).unwrap_or_default();
+    let mut drivers: Vec<String> = String::from_utf8_lossy(&names)
+        .lines()
+        .filter_map(|k| k.strip_prefix("filter.")?.rsplit_once('.').map(|(d, _)| d.to_string()))
+        .collect();
+    drivers.sort();
+    drivers.dedup();
+    let pairs: Vec<(String, &str)> = drivers
+        .iter()
+        .flat_map(|d| {
+            ["process", "clean", "smudge"]
+                .into_iter()
+                .map(move |k| (format!("filter.{d}.{k}"), ""))
+                .chain([(format!("filter.{d}.required"), "false")])
+        })
+        .collect();
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let mut env = vec![("GIT_CONFIG_COUNT".to_string(), pairs.len().to_string())];
+    for (i, (k, v)) in pairs.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), k));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), v.to_string()));
+    }
+    env
+}
+
 /// Without the `fuse` feature a view cannot be mounted, so a turn cannot work in one.
 #[cfg(not(feature = "fuse"))]
 pub struct TurnView {
@@ -519,6 +653,7 @@ pub struct TurnView {
     pub mountpoint: PathBuf,
     pub target: PathBuf,
     pub git_dir: PathBuf,
+    pub git_env: Vec<(String, String)>,
 }
 
 #[cfg(not(feature = "fuse"))]
@@ -570,6 +705,7 @@ impl Vfs for ViewVfs {
         if path == ".git" {
             return self.git_link.get().map(|l| l.clone().into_bytes()).ok_or_else(|| io_err(NotFound, "no .git"));
         }
+        let path = self.resolve(&path)?;
         let oid = {
             let changes = self.changes.lock().unwrap();
             match changes.get(&path) {
@@ -589,7 +725,7 @@ impl Vfs for ViewVfs {
     }
 
     async fn write(&self, path: &str, contents: &[u8]) -> anyhow::Result<()> {
-        let path = writable(path)?;
+        let path = self.writable(path)?;
         if path.is_empty() {
             anyhow::bail!("cannot write the view's root");
         }
@@ -612,7 +748,7 @@ impl Vfs for ViewVfs {
         let mut files: BTreeSet<String> = self
             .tree
             .iter()
-            .filter(|(_, e)| !e.dir)
+            .filter(|(_, e)| !e.dir && e.link.is_none())
             .map(|(p, _)| p.clone())
             .collect();
         for (p, c) in changes.iter() {
@@ -641,8 +777,19 @@ impl Vfs for ViewVfs {
         tokio::task::block_in_place(|| self.set_executable_now(path, executable))
     }
 
+    async fn symlink(&self, path: &str, target: &str) -> anyhow::Result<()> {
+        let path = self.writable(path)?;
+        let mut changes = self.changes.lock().unwrap();
+        if self.view_of(&path, &changes).is_some() {
+            return Err(io_err(AlreadyExists, format!("already exists: {path}")));
+        }
+        self.ensure_parents(&path, &mut changes)?;
+        changes.insert(path, Change::Link { target: target.to_string(), mtime_ns: now_ns() });
+        Ok(())
+    }
+
     async fn touch(&self, path: &str) -> anyhow::Result<()> {
-        let path = writable(path)?;
+        let path = self.writable(path)?;
         tokio::task::block_in_place(|| {
             let changes = self.changes.lock().unwrap();
             match self.view_of(&path, &changes) {
@@ -718,6 +865,60 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// [`repo`] plus a symlink `link.md -> README.md` and a submodule `sub` whose host
+    /// checkout holds `sub/inner.txt`.
+    fn repo_with_links(name: &str) -> PathBuf {
+        let dir = repo(name);
+        // A filtered file whose driver cannot run, as git-lfs cannot in a view.
+        std::fs::write(dir.join(".gitattributes"), "*.bin filter=fake\n").unwrap();
+        std::fs::write(dir.join("model.bin"), "pointer\n").unwrap();
+        git(&dir, &["-c", "filter.fake.clean=cat", "add", ".gitattributes", "model.bin"]).unwrap();
+        std::os::unix::fs::symlink("README.md", dir.join("link.md")).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/inner.txt"), "from the submodule\n").unwrap();
+        let head = String::from_utf8(git(&dir, &["rev-parse", "HEAD"]).unwrap()).unwrap();
+        let gitlink = format!("160000,{},sub", head.trim());
+        for args in [
+            &["-c", "filter.fake.clean=cat", "add", "link.md"][..],
+            &["-c", "filter.fake.clean=cat", "update-index", "--add", "--cacheinfo", &gitlink],
+            &["-c", "filter.fake.clean=cat", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "links"],
+        ] {
+            git(&dir, args).unwrap();
+        }
+        for (k, v) in [("filter.fake.process", "false"), ("filter.fake.clean", "false"), ("filter.fake.required", "true")] {
+            git(&dir, &["config", k, v]).unwrap();
+        }
+        dir
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn symlinks_and_submodules_are_in_the_view() {
+        let dir = repo_with_links("links");
+        let v = ViewVfs::open(&dir, "HEAD").unwrap();
+        assert_eq!(v.stat("link.md").await.unwrap().symlink.as_deref(), Some("README.md"));
+        assert_eq!(v.read("link.md").await.unwrap(), b"hello\n", "a file tool follows the link");
+        let sub = v.stat("sub").await.unwrap();
+        assert!(sub.is_dir && v.list("sub").await.unwrap().is_empty(), "a submodule is an empty dir");
+        assert_eq!(v.submodules(), ["sub"]);
+        let refused = v.write("sub/new.txt", b"x").await.unwrap_err();
+        assert_eq!(refused.downcast_ref::<std::io::Error>().unwrap().kind(), PermissionDenied);
+        assert_eq!(v.tracked_files().await.unwrap(), [".gitattributes", "README.md", "model.bin", "run.sh", "src/lib.rs"], "links and submodules are not the corpus");
+
+        v.symlink("src/alias.rs", "lib.rs").await.unwrap();
+        assert_eq!(v.read("src/alias.rs").await.unwrap(), b"pub fn f() {}\n");
+        v.rename("link.md", "docs/link.md").await.unwrap();
+        assert_eq!(v.stat("docs/link.md").await.unwrap().symlink.as_deref(), Some("README.md"));
+        assert!(v.read("docs/link.md").await.is_err(), "now dangling: docs/README.md is not there");
+        v.symlink("out.md", "/etc/passwd").await.unwrap();
+        assert!(v.read("out.md").await.is_err(), "a link out of the view leads nowhere");
+
+        v.commit("links", "links").unwrap().expect("a commit");
+        let tree = String::from_utf8(git(&dir, &["ls-tree", "-r", "refs/corrode/links"]).unwrap()).unwrap();
+        assert!(tree.lines().any(|l| l.starts_with("120000") && l.ends_with("\tsrc/alias.rs")), "{tree}");
+        assert!(tree.lines().any(|l| l.starts_with("160000") && l.ends_with("\tsub")), "the submodule stays: {tree}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn rename_and_remove_move_whole_trees() {
         let dir = repo("rename");
@@ -745,14 +946,20 @@ pub(crate) mod tests {
     #[cfg(feature = "fuse")]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_mounted_view_is_a_git_worktree_inside_the_sandbox() {
-        let dir = repo("worktree");
+        let dir = repo_with_links("worktree");
         let plan = format!("view-test-{}", std::process::id());
         let view = match TurnView::start(&dir, &plan).await {
             Ok(v) => v,
             Err(e) => return eprintln!("skipped: cannot mount a view here ({e})"),
         };
         view.vfs.write("src/lib.rs", b"pub fn g() {}\n").await.unwrap();
-        let sb = crate::sandbox::Sandbox::from_env().with_view(view.mountpoint.clone(), view.target.clone(), view.git_dir.clone());
+        let sb = crate::sandbox::Sandbox::from_env().with_view(crate::sandbox::ViewMount {
+            mountpoint: view.mountpoint.clone(),
+            target: view.target.clone(),
+            git_dir: view.git_dir.clone(),
+            submodules: view.vfs.submodules(),
+            git_env: view.git_env.clone(),
+        });
         let run = |script: &str| {
             let (prog, args) = sb.wrap(&std::fs::canonicalize(&dir).unwrap(), &["sh", "-c", script]);
             std::process::Command::new(prog).args(args).output().unwrap()
@@ -761,6 +968,9 @@ pub(crate) mod tests {
             view.finish("skip").await.ok();
             return eprintln!("skipped: bwrap cannot run here");
         }
+        // The kernel follows a link through the mount; a submodule is the host checkout.
+        let through = run("cat link.md sub/inner.txt");
+        assert_eq!(String::from_utf8_lossy(&through.stdout), "hello\nfrom the submodule\n", "{}", String::from_utf8_lossy(&through.stderr));
         let status = run("git status --porcelain");
         assert_eq!(String::from_utf8_lossy(&status.stdout), " M src/lib.rs\n", "{}", String::from_utf8_lossy(&status.stderr));
         let diff = String::from_utf8_lossy(&run("git diff").stdout).into_owned();

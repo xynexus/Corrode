@@ -77,6 +77,10 @@ pub trait Vfs: Send + Sync {
     async fn touch(&self, path: &str) -> anyhow::Result<()> {
         anyhow::bail!("this VFS cannot touch {path}")
     }
+    /// Create a symbolic link at `path` pointing at `target`.
+    async fn symlink(&self, path: &str, _target: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this VFS cannot create symlink {path}")
+    }
 }
 
 /// An error whose kind a FUSE mount turns into an errno.
@@ -246,6 +250,7 @@ impl Vfs for PassthroughVfs {
                     mode: None,    // ponytail: passthrough can't know; set by the graph-backed VFS.
                     mtime_ns: mtime_ns(&meta),
                     executable: executable(&meta),
+                    symlink: None,
                 });
             }
             entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -269,6 +274,7 @@ impl Vfs for PassthroughVfs {
                 mode: None,
                 mtime_ns: mtime_ns(&meta),
                 executable: executable(&meta),
+                symlink: None,
             })
         })
         .await?
