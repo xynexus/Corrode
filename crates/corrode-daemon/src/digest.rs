@@ -81,8 +81,20 @@ fn test_digest(exit: i32, raw: &str) -> Option<String> {
         return Some(out.trim_end().to_string());
     }
     out.push_str(&format!("\n{} failing:\n", failed.len()));
-    for name in failed.iter().take(MAX_FAILED_TESTS) {
+    for (i, name) in failed.iter().take(MAX_FAILED_TESTS).enumerate() {
         out.push_str(&format!("  {name}\n"));
+        if i >= MAX_FAILURE_DETAILS {
+            continue;
+        }
+        // Why it failed: the test's own output section, which holds the panic and its
+        // `left`/`right`. Reporting only the name sent a coder through fifteen reruns of
+        // one failing test with `| head`, `| tail`, `| grep -A` -- each answered by this
+        // same digest, without the one thing it was looking for.
+        if let Some(why) = failure_output(raw, name) {
+            for line in why.lines() {
+                out.push_str(&format!("    {line}\n"));
+            }
+        }
     }
     if failed.len() > MAX_FAILED_TESTS {
         out.push_str(&format!(
@@ -91,6 +103,44 @@ fn test_digest(exit: i32, raw: &str) -> Option<String> {
         ));
     }
     Some(out.trim_end().to_string())
+}
+
+/// Failing tests whose output the digest carries; the rest are named only.
+const MAX_FAILURE_DETAILS: usize = 5;
+
+/// Cap on one failing test's output in the digest.
+const FAILURE_OUTPUT_CAP: usize = 1536;
+
+/// The body of `---- <name> stdout ----` in a libtest run, up to the next section, with
+/// the backtrace hint dropped and capped at [`FAILURE_OUTPUT_CAP`]. Under `--nocapture`
+/// there is no section and the panic is printed inline: then its `thread '<name>'
+/// panicked at` block, up to the first blank line.
+fn failure_output(raw: &str, name: &str) -> Option<String> {
+    let header = format!("---- {name} stdout ----");
+    let panic = format!("thread '{name}' panicked at");
+    let (start, inline) = match raw.lines().position(|l| l.trim() == header) {
+        Some(i) => (i + 1, false),
+        None => (raw.lines().position(|l| l.trim_start().starts_with(&panic))?, true),
+    };
+    let mut body = String::new();
+    for line in raw.lines().skip(start) {
+        let t = line.trim();
+        if t.starts_with("---- ") || t == "failures:" || (inline && t.is_empty()) {
+            break;
+        }
+        if t.starts_with("note: run with `RUST_BACKTRACE") {
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let end = crate::tools::floor_char_boundary(body, FAILURE_OUTPUT_CAP.min(body.len()));
+    let more = if end < body.len() { "\n[…]" } else { "" };
+    Some(format!("{}{more}", &body[..end]))
 }
 
 /// rustc/cargo diagnostics, grouped so one root cause repeated across call sites reads
@@ -279,6 +329,50 @@ mod tests {
         assert!(!obs.contains("Compiling crate-number-200"), "{obs}");
         // Cargo's own tail summary is dropped: we report the count ourselves.
         assert!(!obs.contains("could not compile"), "{obs}");
+    }
+
+    #[test]
+    fn a_failing_test_comes_with_its_panic() {
+        let raw = "\
+running 2 tests
+test tests::apostrophes ... FAILED
+test tests::basic ... ok
+
+failures:
+
+---- tests::apostrophes stdout ----
+
+thread 'tests::apostrophes' panicked at src/main.rs:88:9:
+assertion `left == right` failed
+  left: [(\"rock'n'roll\", 1)]
+ right: [(\"rock\", 1), (\"n'roll\", 1)]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::apostrophes
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+        let obs = command_observation(101, raw);
+        assert!(obs.contains("panicked at src/main.rs:88:9"), "{obs}");
+        assert!(obs.contains(r#"left: [("rock'n'roll", 1)]"#) && obs.contains("right:"), "{obs}");
+        assert!(!obs.contains("RUST_BACKTRACE"), "{obs}");
+        assert_eq!(failure_output(raw, "tests::basic"), None, "a passing test has no section");
+        // --nocapture: no section, the panic printed inline among the results.
+        let inline = "\
+running 1 test
+thread 'tests::apostrophes' panicked at src/main.rs:88:9:
+assertion `left == right` failed
+  left: 1
+ right: 2
+
+test tests::apostrophes ... FAILED
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+        let obs = command_observation(101, inline);
+        assert!(obs.contains("left: 1") && obs.contains("right: 2"), "{obs}");
     }
 
     #[test]
