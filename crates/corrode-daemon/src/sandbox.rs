@@ -201,10 +201,10 @@ pub struct Sandbox {
     /// Host directory bound as the sandbox's `/tmp` (see [`turn_tmp`]); `None` gives
     /// each command an empty tmpfs.
     tmp: Option<PathBuf>,
-    /// A turn's VFS view: `(mountpoint, target dir)`. The mounted view is bound at the
-    /// repo's own path instead of the working tree, and cargo builds into the target
-    /// dir (see [`Sandbox::with_view`]).
-    view: Option<(PathBuf, PathBuf)>,
+    /// A turn's VFS view: `(mountpoint, target dir, git dir)`. The mounted view is bound
+    /// at the repo's own path instead of the working tree, cargo builds into the target
+    /// dir, and the git dir is readable at [`SANDBOX_GIT`] (see [`Sandbox::with_view`]).
+    view: Option<(PathBuf, PathBuf, PathBuf)>,
 }
 
 /// The host directory a turn's sandboxed commands share as `/tmp`.
@@ -217,6 +217,9 @@ pub struct Sandbox {
 pub fn turn_tmp(plan_id: &str) -> PathBuf {
     runtime_dir("corrode-tmp").join(safe_name(plan_id))
 }
+
+/// Where a view's sandbox shows the repository's git dir, read-only.
+pub const SANDBOX_GIT: &str = "/corrode/git";
 
 /// `id` as one path component: anything but ASCII alphanumerics and `-` becomes `_`.
 pub fn safe_name(id: &str) -> String {
@@ -289,8 +292,12 @@ impl Sandbox {
     /// target dir. A shared one would be wrong, not just slow: cargo judges a path
     /// dependency fresh by mtime alone, so two views building into one target dir would
     /// each be handed the other's artifacts.
-    pub fn with_view(mut self, mountpoint: PathBuf, target: PathBuf) -> Self {
-        self.view = Some((mountpoint, target));
+    ///
+    /// `git_dir` (the repository's common git dir) is bound read-only at [`SANDBOX_GIT`],
+    /// where the view's `.git` link points, so git works inside the view but cannot
+    /// commit or plant a hook.
+    pub fn with_view(mut self, mountpoint: PathBuf, target: PathBuf, git_dir: PathBuf) -> Self {
+        self.view = Some((mountpoint, target, git_dir));
         self
     }
 
@@ -374,12 +381,14 @@ impl Sandbox {
         // <repo>/.corrode — re-bind that read-only on top (later bind wins) so a
         // shell can edit code but not corrupt provenance/vectors. The daemon writes
         // the store directly and is never sandboxed, so it keeps full access.
-        if let Some((mount, target)) = &self.view {
-            // A view holds no .git or .corrode to protect, and the working tree is not
-            // there at all.
-            let (mount, target) = (mount.to_string_lossy(), target.to_string_lossy());
+        if let Some((mount, target, git_dir)) = &self.view {
+            // The working tree is not there at all; the view's `.git` is a link file the
+            // view serves read-only, into the git dir bound read-only below.
+            let (mount, target, git_dir) =
+                (mount.to_string_lossy(), target.to_string_lossy(), git_dir.to_string_lossy());
             push(&["--bind", &mount, &repo]);
             push(&["--bind", &target, &target]);
+            push(&["--ro-bind", &git_dir, SANDBOX_GIT]);
             push(&["--setenv", "CARGO_TARGET_DIR", &target]);
             push(&["--chdir", &repo]);
             a.extend(toolchain_binds(

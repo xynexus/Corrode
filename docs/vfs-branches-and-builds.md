@@ -445,10 +445,18 @@ Decided along the way:
 - **fuse3 0.10**, not 0.9: 0.9's path API lost the moved inode on a rename over
   an existing file, so `sed -i` and editor saves left the file answering ENOENT.
 
-Still to do: the worktree `.git` file (step 4's first half), so `git status`
-works inside a view; byte-range reads (a view reads a whole blob per FUSE
-read); `touch` (explicit mtimes are ignored); symlinks and submodules (left
-out of a view).
+**Done (2026-11-03): step 4's worktree half.** A turn's view is a linked
+worktree: an admin dir `<git dir>/worktrees/corrode-<plan>` (`HEAD` detached at
+the base, `commondir`, `gitdir`, an index of the base tree, `locked`) and a
+read-only `.git` file the view serves, pointing into the git dir the sandbox
+binds read-only at `/corrode/git`. Inside a turn `git status`, `diff` and `log`
+work; `commit` is refused. The index has no stat data, so `status` hashes every
+file -- fine at CAE's size, and it cannot write a refreshed index back. The
+admin dir goes when the turn ends.
+
+Still to do: `touch` (explicit mtimes are ignored); symlinks and submodules
+(left out of a view); reusing a target dir across turns. A FUSE handle now
+reads its file once rather than once per 128 KiB piece, but still whole.
 
 ### Measurement: builds through the FUSE mount (2026-11-03)
 
