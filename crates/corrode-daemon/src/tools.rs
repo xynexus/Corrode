@@ -368,6 +368,14 @@ impl ToolBox {
         self
     }
 
+    /// The sandbox for one command: the turn's own `/tmp` when this box belongs to a turn.
+    fn turn_sandbox(&self) -> crate::sandbox::Sandbox {
+        match &self.plan {
+            Some(plan) => self.sandbox.clone().with_tmp(crate::sandbox::turn_tmp(plan)),
+            None => self.sandbox.clone(),
+        }
+    }
+
     /// The graph node id for a task in this turn. Must match `PlanGraph::node_ref`, or a
     /// note attaches to a second, disconnected task node instead of joining the plan.
     pub fn task_ref(&self, id: u64) -> String {
@@ -737,7 +745,7 @@ impl ToolBox {
 
     async fn run_command(&self, command: &str) -> String {
         // sandbox.wrap is a no-op when disabled: plain `sh -c <command>`.
-        let (prog, args) = self.sandbox.wrap(&self.root, &["sh", "-c", command]);
+        let (prog, args) = self.turn_sandbox().wrap(&self.root, &["sh", "-c", command]);
         let mut cmd = tokio::process::Command::new(prog);
         cmd.args(args).current_dir(&self.root);
         run_bounded(cmd, &format!("`{command}`"), command_timeout()).await
@@ -790,7 +798,7 @@ impl ToolBox {
             Some(interp) => vec![interp, &path_str],
             None => vec![&path_str],
         };
-        let (prog, args) = self.sandbox.wrap(&self.root, &argv);
+        let (prog, args) = self.turn_sandbox().wrap(&self.root, &argv);
         let mut cmd = tokio::process::Command::new(prog);
         cmd.args(args).current_dir(&self.root);
         run_bounded(cmd, &format!("skill script `{target}`"), command_timeout()).await

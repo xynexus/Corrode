@@ -215,7 +215,9 @@ bwrap \
   --new-session \                 # pty only: blocks TIOCSTI keystroke injection
   --ro-bind /usr /usr  --ro-bind-try /bin /bin  --ro-bind-try /lib /lib  --ro-bind-try /lib64 /lib64 \
   --ro-bind /etc /etc \
-  --proc /proc  --dev /dev  --tmpfs /tmp \
+  --proc /proc  --dev /dev \
+  --bind <turn tmp> /tmp \        # a turn's commands: $XDG_RUNTIME_DIR/corrode-tmp/<plan>, removed at turn end
+  --tmpfs /tmp \                  # the terminal, and anything outside a turn: empty per command
   --bind        <repo> <repo> \                    # the working tree: read-write
   --ro-bind-try <repo>/.corrode <repo>/.corrode \  # graph store: read-only to shells
   --chdir <repo> \

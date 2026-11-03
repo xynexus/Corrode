@@ -2178,6 +2178,8 @@ impl Drop for TurnEnd {
         }
         let events = self.events.clone();
         tokio::spawn(async move {
+            // The turn's shared /tmp goes with it (absent when nothing ran sandboxed).
+            let _ = tokio::fs::remove_dir_all(crate::sandbox::turn_tmp(&plan_id)).await;
             let _ = events.send(AgentEvent::TurnComplete { plan_id }).await;
         });
     }
