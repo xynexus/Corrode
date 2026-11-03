@@ -171,9 +171,7 @@ fn dir_attr(uid: u32, gid: u32) -> FileAttr {
 
 impl PathFilesystem for CorrodeFs {
     async fn init(&self, _req: Request) -> FuseResult<ReplyInit> {
-        Ok(ReplyInit {
-            max_write: NonZeroU32::new(128 * 1024).unwrap(),
-        })
+        Ok(ReplyInit::new(NonZeroU32::new(128 * 1024).unwrap()))
     }
 
     async fn destroy(&self, _req: Request) {}
