@@ -218,7 +218,9 @@ impl Vfs for PassthroughVfs {
                 // Skip VCS/build noise at every level — matches the path-enum walk and
                 // search_files prune, keeping both the explorer and agents' list_dir on
                 // source (agents were observed inventing `.git/revisions` paths).
-                if name == ".git" || name == "target" {
+                // `.corrode` is Corrode's own state: an architect in an empty repo spent
+                // 80 s listing it and reading the graph store's LMDB files as text.
+                if name == ".git" || name == "target" || name == ".corrode" {
                     continue;
                 }
                 // Credential stores are not listed either, not just unreadable.
