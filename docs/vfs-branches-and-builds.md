@@ -1,12 +1,11 @@
 # Corrode: per-branch VFS, overlays, and build reuse
 
-**Design note — exploratory, nothing decided.** How agents should see the
-repository when several of them work at once, and what that implies for the
-graph, the VFS, and their builds.
+**Design note.** How agents should see the repository when several of them
+work at once, and what that implies for the graph, the VFS, and their builds.
 
-- **Status:** discussion only, except §1 — the `search_files` corpus fix is
-  **implemented** (`Vfs::tracked_files` + the two property filters). Everything
-  from §2 on remains undecided.
+- **Status:** §1 is **implemented** (`Vfs::tracked_files` + the two property
+  filters). §2–§6 were the exploration; **§8 records the decision** (2026-11-03)
+  and the measurement it rests on.
 - **Date:** 2026-08-29
 - **Scope:** VFS presentation, per-branch isolation, build artefact handling
 - **Guiding principle:** *an agent must see a standard filesystem.* Corrode
@@ -340,3 +339,114 @@ their tools must see a normal filesystem.
   blocks nested user namespaces and bubblewrap 0.9.0 predates `--overlay`.
 - whether cargo actually reuses a base build through a stacked overlay, which is
   the whole premise of §4's reuse section.
+
+---
+
+## 8. Decision (2026-11-03)
+
+### Where agent work lives
+
+**In-flight work belongs to the VFS; project history only receives it on
+promotion.**
+
+- A running turn's changes live in a **VFS view**: a base tree OID plus a
+  changeset (`path -> new blob OID | deleted`). The file tools already write
+  through the VFS, so it already sees every edit. Views isolate concurrent
+  agents from each other and from the human's working tree.
+- The changeset's content is stored as **git objects** (blobs, trees) in the
+  repo's own object store — no working tree, no branch. That gives every
+  version an OID, which the graph is keyed on anyway (§2), and deduplicates
+  across agents for free.
+- At turn end the daemon commits the view to a private ref,
+  `refs/corrode/<plan_id>`. **Promotion** — merge, cherry-pick, PR — is what
+  turns it into project history, by a human or after review passes.
+
+Keeping work *only* in the VFS was rejected: Corrode would become a second VCS
+(history, merge, blame), and none of the human's tools — `git log`, PRs, CI —
+would see it.
+
+### Views live in the VFS; build output does not
+
+§4 preferred kernel overlayfs to COW inside the FUSE daemon. That argument is
+about write *volume*, and it splits by layer:
+
+- **Source: the VFS owns the overlay.** A view is a tiny structure (base OID +
+  changeset). Owning it means search, read and the graph see exactly what the
+  agent sees; the diff is already in hand at commit time; and the VFS can
+  present **content-derived mtimes**, which §4 says build reuse depends on and
+  a checkout cannot provide.
+- **`target/`: not the VFS.** Gigabytes of churn, no semantic value. Each view
+  gets a native per-agent target directory, optionally over a shared base
+  build (§4's second overlay).
+
+### Views as git worktrees
+
+A linked git worktree is just a directory whose `.git` is a *file*
+(`gitdir: <repo>/.git/worktrees/<name>`) plus an admin directory holding
+`HEAD`, `commondir`, `gitdir` and `index`. A VFS view can synthesize both, and
+then every view **is** a worktree to stock git:
+
+- `git status`, `git diff`, `git log` inside a view work unmodified — the
+  guiding principle (a standard filesystem) extended to version control.
+- The view's `HEAD` is `refs/corrode/<plan_id>`; the turn-end commit is an
+  ordinary commit in that worktree, not a hand-built tree.
+- `git worktree list` in the human's checkout shows every live agent view; a
+  view mounted on the host (say `~/corrode-views/<plan_id>`) can be inspected
+  or `cd`'d into like any worktree.
+
+What it requires:
+
+- **A valid index stat cache.** `git status` compares the index's
+  `(mtime, size, ino, dev)` with `lstat`; a mismatch forces a rehash of the
+  file (correct, slow at scale). Content-derived mtimes and stable inode
+  numbers from the VFS keep the cache valid; better still, the VFS writes the
+  view's index from the base tree with matching stat data.
+- **`git worktree prune` must not reap views.** A view mounted only inside an
+  agent's mount namespace does not exist on the host, so prune would delete its
+  admin dir. Each view's admin dir carries a `locked` file
+  (`git worktree lock`), which prune honours.
+- **Shared objects stay read-only in the sandbox** (as `.git` is today). Commits
+  are made by the daemon, outside the sandbox; inside, `git status` may fail to
+  rewrite the index, which git tolerates.
+- Views mounted at the *same* path in separate namespaces (for build reuse, §4)
+  give their admin dirs identical back-pointers; `git worktree list` then shows
+  one path several times. Cosmetic, but a host-side mount per view avoids it.
+
+### Order of work
+
+1. Measure builds through the FUSE mount (below) — gates everything after.
+2. `ViewVfs`: base OID + changeset over the git object store; content-derived
+   mtimes; `write_file`/read/search go through it.
+3. Mount each view at the repo path inside its sandbox; bind `target/` to a
+   per-view native directory. Needs FUSE create/mkdir/rename/unlink/setattr.
+4. Synthesize the worktree `.git` file + locked admin dir; commit at turn end
+   to `refs/corrode/<plan_id>`; promote by merge or PR.
+
+### Measurement: builds through the FUSE mount (2026-11-03)
+
+CAE (14 crates, ~119K lines) cloned to a scratch directory and mounted through
+`fuse.rs` over `PassthroughVfs` (`--features fuse`, `CORRODE_MOUNT`). Halo host
+(32 threads), `CARGO_BUILD_JOBS=8` (the spawn policy's default),
+`CARGO_INCREMENTAL=0`, dependencies prefetched, `CARGO_TARGET_DIR` on native
+disk outside the mount (step 3's layout). Native first, then the mount, so both
+read source from a warm page cache.
+
+| `cargo build --workspace` | native | through FUSE |
+|---|---|---|
+| cold | 60.7 s | 62.1 s (+2%) |
+| no-op | 0.1 s | 0.1 s |
+| after editing `cae-graph` (11 dependents) | 7.1 s | 7.3 s |
+| after editing a leaf crate | 3.2 s | 3.2 s |
+
+`rg fn` over the whole tree: 0.01 s native, 0.04 s through the mount.
+
+**FUSE is not the bottleneck for a build-and-test loop**, so §7's fallback
+(materialise a worktree for builds) is not needed. Not covered: several agents
+building at once through one daemon, `cargo test`, and a cold page cache.
+
+**Prerequisite found.** `fuse.rs` reports every timestamp as the Unix epoch.
+Through the unpatched mount, appending a syntax error to a source file and
+rebuilding gave `Finished` with nothing recompiled — cargo's freshness check
+never sees an edit. The table above used a temporary patch that reported the
+backing file's real mtime. A view must report content-derived mtimes (step 2)
+before any command builds through it.
