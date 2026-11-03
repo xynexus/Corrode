@@ -112,6 +112,21 @@ pub struct SpawnPolicy {
     memory_max: Option<String>,
     /// Why a cap that was asked for is not applied.
     pub uncapped: Option<String>,
+    /// The daemon's own configuration in its env ([`daemon_config_vars`]), removed from
+    /// every command's.
+    unset: Vec<String>,
+}
+
+/// Names in `vars` that are the daemon's configuration rather than the command's: every
+/// `CORRODE_*` and `HIPFIRE_*`, and `OPENAI_API_KEY`. A command used to inherit them.
+/// That handed a turn's commands the daemon's API keys, and a turn's own `cargo test`
+/// saw `CORRODE_VIEWS=1` and ran Corrode's tests as if they were the daemon: two failed.
+fn daemon_config_vars(vars: impl Iterator<Item = String>) -> Vec<String> {
+    let mut names: Vec<String> = vars
+        .filter(|k| k.starts_with("CORRODE_") || k.starts_with("HIPFIRE_") || k == "OPENAI_API_KEY")
+        .collect();
+    names.sort();
+    names
 }
 
 /// Build parallelism a spawned command gets unless the daemon's env sets its own.
@@ -125,6 +140,7 @@ impl SpawnPolicy {
     /// command runs uncapped rather than not at all; `doctor` warns.
     pub fn from_env() -> Self {
         let mut p = Self::with(|k| std::env::var(k).ok().filter(|v| !v.is_empty()));
+        p.unset = daemon_config_vars(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()));
         if let Some(m) = p.memory_max.clone() {
             let probe = std::process::Command::new("systemd-run")
                 .args(scope_argv(&m))
@@ -154,7 +170,7 @@ impl SpawnPolicy {
             Some(v) if crate::knobs::parse_flag(&v) == Some(false) => None,
             Some(v) => Some(v),
         };
-        Self { env, memory_max, uncapped: None }
+        Self { env, memory_max, uncapped: None, unset: Vec::new() }
     }
 
     /// One line for the daemon's log and `doctor`.
@@ -165,7 +181,8 @@ impl SpawnPolicy {
             (None, Some(why)) => format!("none -- {why}"),
             (None, None) => "off (CORRODE_COMMAND_MEMORY_MAX)".to_string(),
         };
-        format!("env defaults {env}; memory cap {cap}")
+        let unset = if self.unset.is_empty() { String::new() } else { format!("; unsets {}", self.unset.join(" ")) };
+        format!("env defaults {env}; memory cap {cap}{unset}")
     }
 }
 
@@ -312,8 +329,12 @@ impl Sandbox {
     pub fn wrap(&self, repo: &Path, argv: &[&str]) -> (String, Vec<String>) {
         debug_assert!(!argv.is_empty(), "wrap needs at least a program");
         let mut cmd: Vec<String> = Vec::new();
-        if !self.policy.env.is_empty() {
+        if !self.policy.env.is_empty() || !self.policy.unset.is_empty() {
             cmd.push("env".to_string());
+            for k in &self.policy.unset {
+                cmd.push("-u".to_string());
+                cmd.push(k.clone());
+            }
             cmd.extend(self.policy.env.iter().cloned());
         }
         cmd.extend(argv.iter().map(|s| s.to_string()));
@@ -553,6 +574,24 @@ mod tests {
 
     // For real, where bwrap can run: inside the sandbox git can read the repo but
     // cannot write its config (a hooksPath would run at the human's next `git status`).
+    #[test]
+    fn a_command_does_not_get_the_daemons_configuration() {
+        let unset = daemon_config_vars(
+            ["CORRODE_VIEWS", "HIPFIRE_API_KEY", "OPENAI_API_KEY", "PATH", "CARGO_HOME", "MY_CORRODE_X"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(unset, ["CORRODE_VIEWS", "HIPFIRE_API_KEY", "OPENAI_API_KEY"]);
+        let policy = SpawnPolicy { unset, ..SpawnPolicy::default() };
+        let sb = Sandbox { enabled: false, share_net: false, policy, tmp: None, view: None };
+        let (prog, args) = sb.wrap(Path::new("/r"), &["sh", "-c", "env"]);
+        assert_eq!(prog, "env");
+        assert_eq!(
+            args.join(" "),
+            "-u CORRODE_VIEWS -u HIPFIRE_API_KEY -u OPENAI_API_KEY sh -c env"
+        );
+    }
+
     #[test]
     fn a_turns_commands_share_its_tmp() {
         let plan = format!("proj/plan-test-{}", std::process::id());
