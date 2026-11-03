@@ -291,7 +291,9 @@ impl Vfs for PassthroughVfs {
         files.extend(
             untracked
                 .split('\0')
-                .filter(|p| !p.is_empty() && !p.ends_with('/'))
+                // `.corrode/` is Corrode's own state (graph store, turn journal), and
+                // untracked: the journal is text holding every past prompt and output.
+                .filter(|p| !p.is_empty() && !p.ends_with('/') && !p.starts_with(".corrode/"))
                 .filter(|p| {
                     std::fs::symlink_metadata(self.root.join(p)).is_ok_and(|m| m.is_file())
                 })
