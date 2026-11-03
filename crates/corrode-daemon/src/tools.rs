@@ -1599,6 +1599,9 @@ mod tests {
         std::fs::create_dir_all(dir.join("target")).unwrap();
         std::fs::write(dir.join("target/out.rs"), "frobnicate built\n").unwrap();
         std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
+        // Corrode's own untracked state: the turn journal quotes past prompts.
+        std::fs::create_dir_all(dir.join(".corrode")).unwrap();
+        std::fs::write(dir.join(".corrode/turns.jsonl"), "frobnicate journal\n").unwrap();
 
         // The corpus is git's answer, so the fixture has to be a repo. Staging is
         // enough — `ls-files` reads the index, no commit (or identity) required.
@@ -1644,6 +1647,7 @@ mod tests {
         // The corpus: git's answer, untracked-but-not-ignored included.
         assert!(hit.contains("untracked.rs:1:"), "new file not searched: {hit}");
         assert!(!hit.contains("target/out.rs"), "ignored file searched: {hit}");
+        assert!(!hit.contains(".corrode/"), "Corrode's own state searched: {hit}");
         // The property filters: both are tracked and both contain the query.
         assert!(!hit.contains("blob.bin"), "binary searched: {hit}");
         assert!(!hit.contains("min.js"), "minified searched: {hit}");
