@@ -49,6 +49,7 @@ mod trace;
 mod toolcall;
 mod tools;
 mod vfs;
+mod view;
 
 use daemon::Daemon;
 use hipfire::{Client, DEFAULT_BASE_URL};
@@ -186,7 +187,12 @@ async fn main() -> anyhow::Result<()> {
     // graph-backed VFS carries state the two must agree on.
     #[cfg(feature = "fuse")]
     if let Ok(mountpoint) = std::env::var("CORRODE_MOUNT") {
-        let mount_vfs = std::sync::Arc::new(PassthroughVfs::new(&repo_root));
+        // CORRODE_MOUNT_REV=<rev>: mount a VFS view of that commit instead of the working
+        // tree -- what a turn's commands will see; writes stay in the view.
+        let mount_vfs: std::sync::Arc<dyn vfs::Vfs> = match std::env::var("CORRODE_MOUNT_REV") {
+            Ok(rev) => std::sync::Arc::new(view::ViewVfs::open(&repo_root, &rev)?),
+            Err(_) => std::sync::Arc::new(PassthroughVfs::new(&repo_root)),
+        };
         tokio::spawn(async move {
             if let Err(e) = fuse::mount(mount_vfs, &mountpoint).await {
                 eprintln!("FUSE mount at {mountpoint} ended: {e}");

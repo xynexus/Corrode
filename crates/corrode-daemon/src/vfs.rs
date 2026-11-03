@@ -51,6 +51,43 @@ pub trait Vfs: Send + Sync {
     /// of what exists they cannot disagree, whereas a subprocess grep reading the
     /// filesystem directly would, the moment the VFS stops being a passthrough.
     async fn tracked_files(&self) -> anyhow::Result<Vec<String>>;
+
+    // The rest of a filesystem, for a FUSE mount that build tools and shells write
+    // through: a VFS view implements them; the passthrough leaves them to its real
+    // directory. A failure is an `std::io::Error` where its kind says what went wrong,
+    // so the mount can answer with the matching errno.
+    /// Delete a file, or an empty directory.
+    async fn remove(&self, path: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this VFS cannot remove {path}")
+    }
+    /// Create an empty directory.
+    async fn mkdir(&self, path: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this VFS cannot create directory {path}")
+    }
+    /// Move a file or directory, replacing a file at `to`.
+    async fn rename(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this VFS cannot move {from} to {to}")
+    }
+    /// Set or clear a file's executable bit.
+    async fn set_executable(&self, path: &str, _executable: bool) -> anyhow::Result<()> {
+        anyhow::bail!("this VFS cannot change the mode of {path}")
+    }
+}
+
+/// An error whose kind a FUSE mount turns into an errno.
+pub fn io_err(kind: std::io::ErrorKind, msg: impl std::fmt::Display) -> anyhow::Error {
+    std::io::Error::new(kind, msg.to_string()).into()
+}
+
+/// A file's modification time in nanoseconds since the epoch, as [`FileNodeView`] carries it.
+pub(crate) fn mtime_ns(meta: &std::fs::Metadata) -> Option<u64> {
+    let d = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(d.as_nanos()).ok()
+}
+
+fn executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.is_file() && meta.permissions().mode() & 0o100 != 0
 }
 
 /// Passthrough VFS over a real directory tree, rooted at `root`.
@@ -200,6 +237,8 @@ impl Vfs for PassthroughVfs {
                     bytes: if meta.is_file() { meta.len() } else { 0 },
                     node_id: None, // ponytail: set once entries are backed by graph nodes.
                     mode: None,    // ponytail: passthrough can't know; set by the graph-backed VFS.
+                    mtime_ns: mtime_ns(&meta),
+                    executable: executable(&meta),
                 });
             }
             entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -221,6 +260,8 @@ impl Vfs for PassthroughVfs {
                 bytes: if meta.is_file() { meta.len() } else { 0 },
                 node_id: None,
                 mode: None,
+                mtime_ns: mtime_ns(&meta),
+                executable: executable(&meta),
             })
         })
         .await?
