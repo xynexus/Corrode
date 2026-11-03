@@ -1,17 +1,21 @@
 # Corrode graph model
 
-**Status: design; store live, projectors pending.** The embedded HelixDB store is
-implemented and live under `--features helix` — `graph::embedded::HelixStore` does
-real LMDB writes (`upsert_node`/`add_edge`/`replace_doc`) and reads
-(`neighbors`/`doc_search`/`list_docs`/`code_nodes`), backing provenance persistence
-and doc GraphRAG. What's still pending is the graph-backed VFS *projection* itself:
-`vfs.rs` ships a filesystem `PassthroughVfs`, and the per-language projectors/composers
-(§4) that would materialize files *from* graph nodes (Composed/Overlay, §3) are not
-written — so files are still real on disk, not projected. The file→graph pivot
-(`FileNodeView.node_id`, §10) is wired: the daemon tags each listed file with its
-provenance `code` node so the explorer can jump a file to its lineage. The wire types
-(`FileNodeView.is_dir`/`.mode`/`.node_id`, `ProjectionMode`, `FallbackReason`) live in
-`corrode-core`.
+**Status (2026-11-03): store, projection and graph serving built; serving off by
+default.** The embedded HelixDB store is live under `--features helix`
+(`graph::embedded::HelixStore`: real LMDB writes and reads), backing provenance,
+doc GraphRAG and code search. The projection machinery (`projection/`) is written and
+language-agnostic: a backend reports spans (`rust.rs`, `c.rs`, and `text.rs` as the
+byte-exact fallback for everything else), nodes store verbatim text, and composition is
+measured exact both ways. Tracked files are ingested when a session opens, and what a
+turn wrote is re-ingested at its end. `graphvfs.rs` serves a file *from* the graph
+when the blob oid recorded at ingest still matches the file -- behind
+`CORRODE_VFS_GRAPH` (off), with `CORRODE_VFS_VERIFY` comparing every graph-served
+read against disk. `normalize.rs` checks that a repo is formatter-normal; the
+language-specific rebuilders this document describes for composed mode (§3, §4:
+regenerating text such as imports from edges) are not written, so composition is
+verbatim, not regenerated. The file→graph pivot (`FileNodeView.node_id`, §10) is wired.
+Per-turn isolation is a separate layer: a VFS view (base commit plus changes, committed
+to `refs/corrode/<plan>`), described in `vfs-branches-and-builds.md` §8.
 
 ---
 
