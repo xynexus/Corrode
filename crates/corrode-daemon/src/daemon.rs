@@ -1228,7 +1228,7 @@ impl Daemon {
             .unwrap_or_default()
             .to_string();
         let plan_task = Task {
-            prompt: planner::orchestration_prompt(&prefix, text),
+            prompt: planner::orchestration_prompt(&prefix, text, plan_review_enabled()),
             priority,
             model: orch_model,
             owner_token: session.owner_token.clone(),
@@ -1912,6 +1912,15 @@ pub(crate) fn max_tool_steps() -> usize {
 const NO_CALL_REMINDER: &str = "You replied without calling a tool. Changes to the repository only happen \
 through tool calls: to create or change a file, call write_file with its full contents -- do not paste \
 file contents as your reply. If the task truly needs no tool, repeat your final answer.";
+
+/// Sent once when a task that can write ends while its own last build/test is failing.
+fn failing_check_reminder(result: &str) -> String {
+    format!(
+        "Your last build/test failed ({result}) and you replied without a tool call, so nothing \
+was fixed. Make the fix with your tools and run it again -- or, if it cannot be fixed within \
+this task, say what is failing and why in your final answer."
+    )
+}
 
 const TRUNCATED_NOTE: &str = "Your last reply hit the output limit and was cut off, so none of it was \
 used -- not its text, not any tool call in it. Make this reply shorter: answer more concisely, or if you \
@@ -2766,6 +2775,11 @@ async fn run_native_tool_loop(
     let mut touched: Vec<String> = Vec::new();
     let max_steps = max_tool_steps_for(role);
     let mut reminded = false;
+    // This task's most recent build/test result when it failed (see `tools::is_check`):
+    // a coder that ended on "Let me fix it" after a failing test left the build broken
+    // and called it done. One reminder, as for a reply with no call at all.
+    let mut failing_check: Option<String> = None;
+    let mut reminded_failing = false;
     // Every call this task has run, and whether it went round again: a step of nothing
     // but calls it already made brings nothing new. A CAE review re-read 15 crate
     // sources three times as fit_context elided each batch -- served from the turn's
@@ -2834,6 +2848,16 @@ async fn run_native_tool_loop(
                 turns.push(serde_json::json!({"type": "message", "role": "user", "content": NO_CALL_REMINDER}));
                 continue;
             }
+            let can_fix = crate::tools::role_tools(role).iter().any(|t| t.name == "write_file");
+            if let Some(result) = failing_check.as_ref().filter(|_| can_fix && !reminded_failing && !ctx.read_only) {
+                reminded_failing = true;
+                let note = failing_check_reminder(result);
+                if !text.trim().is_empty() {
+                    turns.push(serde_json::json!({"type": "message", "role": "assistant", "content": text}));
+                }
+                turns.push(serde_json::json!({"type": "message", "role": "user", "content": note}));
+                continue;
+            }
             steps.push(crate::trace::Step {
                 said: text.clone(),
                 intent: None,
@@ -2887,6 +2911,12 @@ async fn run_native_tool_loop(
             calls_made += 1;
             note_touched(&mut touched, call);
             let observation = ctx.gate(call, written).await;
+            // Only a run counts: a repeat served from the turn's cache or a denied call
+            // says nothing new about whether the build passes.
+            let first = observation.lines().next().unwrap_or_default();
+            if crate::tools::is_check(call) && first.starts_with("exit ") {
+                failing_check = (!first.starts_with("exit 0")).then(|| first.to_string());
+            }
             steps.push(crate::trace::Step {
                 said: text.clone(),
                 intent: Some(crate::tools::describe(call)),
@@ -5707,6 +5737,59 @@ mod tests {
             .to_string();
         assert!(last_output.contains("fixed"), "the second build ran: {last_output}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A coder whose last test failed and who then answers in prose ("Let me fix it") is
+    // reminded once that nothing was fixed; a second prose answer is accepted.
+    #[tokio::test]
+    async fn ending_on_a_failing_test_gets_one_reminder() {
+        for (name, after_reminder, expect) in [
+            ("fixes", call_reply("run_command", serde_json::json!({"command": "true # cargo test"})), "fixed"),
+            ("explains", text_reply("cannot fix: needs network"), "cannot fix: needs network"),
+        ] {
+            let dir = two_file_repo(&format!("failing-{name}"));
+            let after = after_reminder.clone();
+            let (url, bodies) = recording_hipfire(move |_, n| match n {
+                0 => call_reply("run_command", serde_json::json!({"command": "false # cargo test"})),
+                1 => text_reply("Let me fix it."),
+                2 => after.clone(),
+                _ => text_reply("fixed"),
+            })
+            .await;
+            let client = Client::new(url, None);
+            let (etx, _erx) = mpsc::channel(64);
+            let seen = Mutex::new(SeenCalls::default());
+            let prefix = format!("repo context{}", crate::hipfire::PREFIX_END);
+            let mut written = Vec::new();
+            let out = run_task(
+                &TaskCtx {
+                    client: &client,
+                    model: "Qwen3.5-9B--oq4.25++",
+                    band: Priority::Default,
+                    dialects: &Dialects::default(),
+                    tool_caller: None,
+                    toolbox: repo_toolbox(&dir),
+                    approvals: &ApprovalGate::auto_approving(),
+                    prefix: &prefix,
+                    role: Role::Coder,
+                    events: &etx,
+                    id: 1,
+                    read_only: false,
+                    seen: &seen,
+                    deadline: None,
+                },
+                "make the tests pass",
+                &mut written,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out, expect, "{name}");
+            let bodies = bodies.lock().unwrap().clone();
+            let last = bodies[2]["input"].as_array().unwrap().last().unwrap().clone();
+            assert_eq!(last["role"], "user", "{name}");
+            assert!(last["content"].as_str().unwrap().starts_with("Your last build/test failed (exit 1"), "{name}: {last}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     // The same for the Needle loop: its scratchpad used to sit BEFORE the fixed
