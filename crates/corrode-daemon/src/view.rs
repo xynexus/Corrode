@@ -529,7 +529,7 @@ pub struct TurnView {
     pub git_dir: PathBuf,
     /// The view's linked-worktree admin dir, `<git dir>/worktrees/corrode-<plan>`.
     admin: PathBuf,
-    /// Git config the sandbox sets for commands in the view (see [`filter_overrides`]).
+    /// Git config the sandbox sets for commands in the view (see [`git_overrides`]).
     pub git_env: Vec<(String, String)>,
     name: String,
     mount: fuse3::raw::MountHandle,
@@ -551,7 +551,7 @@ impl TurnView {
             .join(&name);
         std::fs::create_dir_all(&target)?;
         let (git_dir, admin) = tokio::task::block_in_place(|| link_worktree(repo, &vfs, &name))?;
-        let git_env = tokio::task::block_in_place(|| filter_overrides(repo));
+        let git_env = tokio::task::block_in_place(|| git_overrides(repo, &vfs.base));
         let mount = match crate::fuse::mount_handle(vfs.clone(), &mountpoint).await {
             Ok(m) => m,
             Err(e) => {
@@ -617,8 +617,14 @@ fn link_worktree(repo: &std::path::Path, vfs: &ViewVfs, name: &str) -> anyhow::R
 /// filter could not run against the read-only git dir anyway: in a view of Corrode,
 /// whose `*.safetensors` go through `git-lfs`, `git status` died with "external filter
 /// 'git-lfs filter-process' failed".
+///
+/// And every submodule named in the base's `.gitmodules` is `ignore = all`: a submodule
+/// in a view is the host's checkout, read-only, and its `.git` file points through
+/// `../../.git/modules/...` -- but a view's `.git` is a file, so `git status`, which
+/// looks inside each submodule, died with "not a git repository". Nothing in a
+/// submodule can change in a view, so there is nothing for status to report there.
 #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
-fn filter_overrides(repo: &std::path::Path) -> Vec<(String, String)> {
+fn git_overrides(repo: &std::path::Path, base: &str) -> Vec<(String, String)> {
     let names = git(repo, &["config", "--name-only", "--get-regexp", r"^filter\."]).unwrap_or_default();
     let mut drivers: Vec<String> = String::from_utf8_lossy(&names)
         .lines()
@@ -626,7 +632,7 @@ fn filter_overrides(repo: &std::path::Path) -> Vec<(String, String)> {
         .collect();
     drivers.sort();
     drivers.dedup();
-    let pairs: Vec<(String, &str)> = drivers
+    let mut pairs: Vec<(String, &str)> = drivers
         .iter()
         .flat_map(|d| {
             ["process", "clean", "smudge"]
@@ -635,6 +641,14 @@ fn filter_overrides(repo: &std::path::Path) -> Vec<(String, String)> {
                 .chain([(format!("filter.{d}.required"), "false")])
         })
         .collect();
+    // `submodule.<name>.path` keys of the base commit's `.gitmodules`.
+    let gitmodules = format!("{base}:.gitmodules");
+    let subs = git(repo, &["config", "--blob", &gitmodules, "--name-only", "--get-regexp", r"^submodule\..*\.path$"]).unwrap_or_default();
+    for key in String::from_utf8_lossy(&subs).lines() {
+        if let Some(name) = key.strip_prefix("submodule.").and_then(|k| k.strip_suffix(".path")) {
+            pairs.push((format!("submodule.{name}.ignore"), "all"));
+        }
+    }
     if pairs.is_empty() {
         return Vec::new();
     }
@@ -876,10 +890,14 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink("README.md", dir.join("link.md")).unwrap();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/inner.txt"), "from the submodule\n").unwrap();
+        // As a checked-out submodule has it: a `.git` file into the parent's modules dir,
+        // which does not resolve inside a view.
+        std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        std::fs::write(dir.join(".gitmodules"), "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n").unwrap();
         let head = String::from_utf8(git(&dir, &["rev-parse", "HEAD"]).unwrap()).unwrap();
         let gitlink = format!("160000,{},sub", head.trim());
         for args in [
-            &["-c", "filter.fake.clean=cat", "add", "link.md"][..],
+            &["-c", "filter.fake.clean=cat", "add", "link.md", ".gitmodules"][..],
             &["-c", "filter.fake.clean=cat", "update-index", "--add", "--cacheinfo", &gitlink],
             &["-c", "filter.fake.clean=cat", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "links"],
         ] {
@@ -902,7 +920,7 @@ pub(crate) mod tests {
         assert_eq!(v.submodules(), ["sub"]);
         let refused = v.write("sub/new.txt", b"x").await.unwrap_err();
         assert_eq!(refused.downcast_ref::<std::io::Error>().unwrap().kind(), PermissionDenied);
-        assert_eq!(v.tracked_files().await.unwrap(), [".gitattributes", "README.md", "model.bin", "run.sh", "src/lib.rs"], "links and submodules are not the corpus");
+        assert_eq!(v.tracked_files().await.unwrap(), [".gitattributes", ".gitmodules", "README.md", "model.bin", "run.sh", "src/lib.rs"], "links and submodules are not the corpus");
 
         v.symlink("src/alias.rs", "lib.rs").await.unwrap();
         assert_eq!(v.read("src/alias.rs").await.unwrap(), b"pub fn f() {}\n");
