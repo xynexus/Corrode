@@ -18,8 +18,13 @@ use corrode_core::GraphNodeView;
 /// and its tests don't drag the (heavy, feature-gated) HelixDB compile in, and so
 /// the daemon can hold it as `Option<Arc<dyn GraphStore>>` (None until opened).
 /// The node recording the content (git blob oid) a file's nodes were ingested from.
+///
+/// `v2`: records written before node text was stored exactly (see `upsert_in`) belong
+/// to nodes that may have lost a leading or trailing `"`. A store holding only those is
+/// re-ingested file by file at its next session open, and until then the graph-backed
+/// VFS finds no record and reads from disk.
 pub fn oid_key(path: &str) -> String {
-    format!("oid:{path}")
+    format!("oid:v2:{path}")
 }
 
 /// Ingest `src` as `path`'s current content: reconcile it against the nodes the store
@@ -373,6 +378,11 @@ pub mod embedded {
         /// returns its engine id. The existing-node path goes through `upsert_n`
         /// (property + index + BM25 update); the create path uses `add_n` with the
         /// index written explicitly.
+        // Text goes in as `Value::String`, never `Value::from`: HelixDB's `From<String>`
+        // trims `"` from both ends (helix-db protocol/value.rs), so every node whose text
+        // opened or closed with a quote -- a Python module docstring, an item ending in a
+        // string literal -- came back short, and the graph served it that way. Keys keep
+        // `Value::from`: the index lookup converts with it too, and must match.
         fn upsert_in<'a>(
             &'a self,
             txn: &mut heed3::RwTxn<'a>,
@@ -393,7 +403,7 @@ pub mod embedded {
                             vec![
                                 ("key", Value::from(key.to_string())),
                                 ("kind", Value::from(kind.to_string())),
-                                ("label", Value::from(label.to_string())),
+                                ("label", Value::String(label.to_string())),
                             ],
                         )),
                         Some(&["key"]),
@@ -407,7 +417,7 @@ pub mod embedded {
                         &[
                             ("key", Value::from(key.to_string())),
                             ("kind", Value::from(kind.to_string())),
-                            ("label", Value::from(label.to_string())),
+                            ("label", Value::String(label.to_string())),
                         ],
                     )
                     .collect_to_obj()
@@ -907,7 +917,7 @@ pub mod embedded {
                             ("key", Value::from(key.to_string())),
                             // ponytail: text duplicated onto the vector so a hit
                             // needs no hop; dedupe if store size bites.
-                            ("text", Value::from(text.to_string())),
+                            ("text", Value::String(text.to_string())),
                         ],
                     )),
                 )
@@ -1128,6 +1138,21 @@ pub mod embedded {
 
             // And the file still projects byte-exactly from what the store now holds.
             assert_eq!(ingest::project(&fw2), v2);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A Python module docstring opens with `"""`. A CAE sweep through the graph-backed
+        /// VFS found all 15 such files composed three bytes short: the quotes were gone.
+        #[test]
+        fn a_file_that_opens_with_quotes_comes_back_whole() {
+            let dir = scratch_dir("quotes");
+            std::fs::remove_dir_all(&dir).ok();
+            let store = HelixStore::open(dir.to_str().unwrap()).expect("open");
+            let path = "pkg/diag.py";
+            let src = "\"\"\"Diagnostics.\n\nMore.\n\"\"\"\nimport os\n";
+            super::super::ingest_source(&store, path, src).unwrap();
+            let nodes = store.file_nodes(path).unwrap();
+            assert_eq!(crate::projection::project(&nodes).0, src, "{:?}", nodes.iter().map(|n| &n.text).collect::<Vec<_>>());
             std::fs::remove_dir_all(&dir).ok();
         }
 
