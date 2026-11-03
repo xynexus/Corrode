@@ -150,6 +150,20 @@ pub fn is_mutating(call: &ToolCall) -> bool {
         .is_none_or(|t| t.effect != Effect::Read)
 }
 
+/// Whether a call builds or tests the project: the commands whose last result says
+/// whether the turn's work holds (see the turn's `failed_check`).
+/// ponytail: a fixed list of common build/test commands; read the project's own from
+/// AGENTS.md once one goes unrecognised.
+pub fn is_check(call: &ToolCall) -> bool {
+    const CHECKS: &[&str] = &[
+        "cargo build", "cargo test", "cargo check", "cargo clippy", "cargo nextest",
+        "pytest", "npm test", "npm run build", "go test", "go build", "make",
+    ];
+    call.name == "run_tests"
+        || (call.name == "run_command"
+            && arg_str(call, "command").is_some_and(|c| CHECKS.iter().any(|k| c.contains(k))))
+}
+
 /// A one-line, human-readable description of what a call will do — shown in the approval
 /// prompt so a person knows exactly what they're authorizing.
 pub fn describe(call: &ToolCall) -> String {

@@ -917,6 +917,17 @@ impl Daemon {
                 };
                 let mut record = journal_record(session, &plan_id, &text, started, status);
                 record["tasks"] = graph.journal_tasks(JOURNAL_OUTPUT_CAP);
+                // "complete" means the scheduler settled, not that the work builds: say
+                // so when the turn's last build/test failed.
+                let failed_check = turn_seen.lock().unwrap().failed_check();
+                if let Some(f) = failed_check {
+                    record["unverified"] = serde_json::json!(f);
+                    let _ = events
+                        .send(AgentEvent::Error {
+                            message: format!("the turn's last build/test failed: {f}"),
+                        })
+                        .await;
+                }
                 let tasks = record["tasks"].as_array().map_or(0, Vec::len);
                 let failed = record["tasks"]
                     .as_array()
@@ -2212,6 +2223,9 @@ struct SeenCalls {
     /// Each file the turn wrote, as it was before the turn's first write to it (`None`:
     /// it did not exist) -- what [`turn_diff`] shows a reviewer. Survives `invalidate`.
     originals: std::collections::BTreeMap<String, Option<String>>,
+    /// The turn's most recent build/test command ([`crate::tools::is_check`]) and the
+    /// first line of its result. Survives `invalidate`.
+    last_check: Option<(String, String)>,
 }
 
 impl SeenCalls {
@@ -2252,6 +2266,21 @@ impl SeenCalls {
     /// `exit 0:` missed the digest's `exit 0 — test run` and every command that changed
     /// files and then failed, and a coder told "unchanged, do not repeat" rewrote a
     /// file from stale text.
+    /// Note a build/test command's result; any other call is ignored.
+    fn note_check(&mut self, call: &crate::toolcall::ToolCall, observation: &str) {
+        if crate::tools::is_check(call) {
+            let first = observation.lines().next().unwrap_or_default().to_string();
+            self.last_check = Some((crate::tools::describe(call), first));
+        }
+    }
+
+    /// The turn's last build/test command and its result, when it did not pass. A turn
+    /// ended `complete` with a failing test: nothing looked at how its last check went.
+    fn failed_check(&self) -> Option<String> {
+        let (cmd, result) = self.last_check.as_ref()?;
+        (!result.starts_with("exit 0")).then(|| format!("{cmd} -> {result}"))
+    }
+
     fn invalidate(&mut self) {
         self.seen.clear();
         self.log.clear();
@@ -2329,6 +2358,15 @@ async fn review_prompt(prompt: String, seen: &std::sync::Mutex<SeenCalls>, vfs: 
          is more than that covers, and end with your verdict.",
         max_tool_steps_for(Role::Review)
     );
+    // A failing build or test is the one thing a review must not miss: it is put
+    // first, ahead of the diff.
+    let budget = match seen.lock().unwrap().failed_check() {
+        Some(f) => format!(
+            "{budget}\n\nThe last build/test command this turn ran FAILED: {f}\nThe work is \
+             not done while it fails. Find the cause and make the fix your NEXT: line."
+        ),
+        None => budget,
+    };
     match turn_diff(seen, vfs).await {
         Some(d) => format!(
             "{prompt}\n\n{budget}\n\nWhat this turn changed so far -- each written file \
@@ -2434,6 +2472,7 @@ async fn gate_and_execute(
             }
         }
         let mut s = seen.lock().unwrap();
+        s.note_check(call, &observation);
         if crate::tools::is_mutating(call) {
             s.invalidate();
             s.record(call, &observation);
@@ -3436,6 +3475,24 @@ async fn emit_followups(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_last_build_or_test_decides_whether_the_turn_is_verified() {
+        let run = |cmd: &str| crate::toolcall::ToolCall {
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": cmd }),
+        };
+        let mut seen = SeenCalls::default();
+        assert_eq!(seen.failed_check(), None, "nothing ran");
+        seen.note_check(&run("cargo test"), "exit 101 — test run\n1 failed");
+        assert!(seen.failed_check().unwrap().contains("exit 101"));
+        // Not a build or test: it does not clear or replace the failure.
+        seen.note_check(&run("grep -r foo src"), "exit 1:\n");
+        seen.invalidate();
+        assert!(seen.failed_check().is_some(), "a later write does not hide it");
+        seen.note_check(&run("cargo test --workspace"), "exit 0 — test run\n");
+        assert_eq!(seen.failed_check(), None, "a later pass clears it");
+    }
+
     #[test]
     fn context_budget_trips_before_the_model_context_is_full() {
         // Default 32768-token context, 4096 reserved: ~85 KB of prompt + turns.
