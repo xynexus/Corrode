@@ -422,7 +422,39 @@ What it requires:
 4. Synthesize the worktree `.git` file + locked admin dir; commit at turn end
    to `refs/corrode/<plan_id>`; promote by merge or PR.
 
+**Done (2026-11-03): steps 2, 3 and the commit of step 4**, behind
+`CORRODE_VIEWS` (off by default; needs `--features fuse` and the sandbox).
+`view.rs` is the view; `fuse.rs` takes create/mkdir/unlink/rmdir/rename/
+truncate/chmod; a turn mounts its view under `$XDG_RUNTIME_DIR/corrode-views`,
+binds it at the repo path, gives cargo a fresh target dir under
+`~/.cache/corrode/targets`, and commits to `refs/corrode/<plan>` at the end,
+leaving out new files `.gitignore` excludes. A live wordfreq turn ran this way
+in 410 s: tests passed in the view, the working tree and branch were untouched,
+and the commit checked out and tested clean on its own.
+
+Decided along the way:
+- **Unchanged files report the base commit's time**, a written file its write
+  time. Pure content-derived times were rejected: a file reverted to an older
+  blob would report an older time than the build that used the newer one, and
+  cargo would keep that build.
+- **A target dir per turn, not shared.** Cargo judges a path dependency fresh
+  by mtime alone, so two views building into one target dir would each get
+  the other's artifacts. A turn's first build is therefore cold (CAE: 64 s).
+  Reuse needs a seeded copy whose mtimes the view can vouch for -- §4's
+  problem, still open.
+- **fuse3 0.10**, not 0.9: 0.9's path API lost the moved inode on a rename over
+  an existing file, so `sed -i` and editor saves left the file answering ENOENT.
+
+Still to do: the worktree `.git` file (step 4's first half), so `git status`
+works inside a view; byte-range reads (a view reads a whole blob per FUSE
+read); `touch` (explicit mtimes are ignored); symlinks and submodules (left
+out of a view).
+
 ### Measurement: builds through the FUSE mount (2026-11-03)
+
+Through a mounted **view** of the same commit (`CORRODE_MOUNT_REV=HEAD`): cold
+64.0 s, no-op 0.1 s, after editing `cae-graph` 7.3 s; a syntax error appended
+through the mount fails the build, and `sed -i` removing it builds again.
 
 CAE (14 crates, ~119K lines) cloned to a scratch directory and mounted through
 `fuse.rs` over `PassthroughVfs` (`--features fuse`, `CORRODE_MOUNT`). Halo host

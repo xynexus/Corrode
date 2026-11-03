@@ -484,17 +484,25 @@ impl PathFilesystem for CorrodeFs {
 /// Mount the VFS at `mountpoint` and serve until unmounted. Unprivileged mount
 /// (via `fusermount3`), so the daemon needn't run as root.
 pub async fn mount(vfs: Arc<dyn Vfs>, mountpoint: impl AsRef<Path>) -> anyhow::Result<()> {
+    mount_handle(vfs, mountpoint).await?.await?; // a MountHandle resolves on unmount
+    Ok(())
+}
+
+/// Mount the VFS at `mountpoint` and return the handle that unmounts it (dropping it
+/// unmounts in the background).
+pub async fn mount_handle(
+    vfs: Arc<dyn Vfs>,
+    mountpoint: impl AsRef<Path>,
+) -> anyhow::Result<fuse3::raw::MountHandle> {
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let mut opts = MountOptions::default();
     opts.fs_name("corrode")
         .force_readdir_plus(true)
         .uid(uid)
         .gid(gid);
-    let handle = Session::new(opts)
+    Ok(Session::new(opts)
         .mount_with_unprivileged(CorrodeFs::new(vfs), mountpoint.as_ref())
-        .await?;
-    handle.await?; // MountHandle is a Future that resolves on unmount
-    Ok(())
+        .await?)
 }
 
 #[cfg(test)]

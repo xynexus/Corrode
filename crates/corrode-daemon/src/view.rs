@@ -327,7 +327,33 @@ impl ViewVfs {
     /// Store the turn's changes as a commit on the base and point `refs/corrode/<name>`
     /// at it. `None` when the view is unchanged (empty directories are not content).
     pub fn commit(&self, name: &str, message: &str) -> anyhow::Result<Option<String>> {
-        let changes = self.changes.lock().unwrap().clone();
+        let mut changes = self.changes.lock().unwrap().clone();
+        // A new file that .gitignore excludes is build output or scratch a command left
+        // in the tree (`make` writes its objects beside the sources), not the turn's work.
+        let new: Vec<&String> = changes
+            .iter()
+            .filter(|(p, c)| matches!(c, Change::File { .. }) && !self.tree.contains_key(*p))
+            .map(|(p, _)| p)
+            .collect();
+        if !new.is_empty() {
+            let list: String = new.iter().map(|p| format!("{p}\n")).collect();
+            // Exit 1 = nothing ignored, which is not an error here.
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.root)
+                .args(["check-ignore", "--stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    use std::io::Write;
+                    c.stdin.take().expect("piped").write_all(list.as_bytes())?;
+                    c.wait_with_output()
+                })?;
+            for ignored in String::from_utf8_lossy(&out.stdout).lines() {
+                changes.remove(ignored);
+            }
+        }
         // Index lines for `update-index --index-info`: `<mode> <oid>\t<path>`, mode 0
         // removing the path.
         let mut info = Vec::new();
@@ -367,6 +393,72 @@ impl ViewVfs {
         })();
         let _ = std::fs::remove_file(&index);
         result
+    }
+}
+
+/// A turn's view, mounted where its sandboxed commands find it: the view's FUSE mount
+/// under the user's runtime dir, and a target dir of its own for cargo (see
+/// [`crate::sandbox::Sandbox::with_view`]). `finish` commits it and takes it down.
+#[cfg(feature = "fuse")]
+pub struct TurnView {
+    pub vfs: Arc<ViewVfs>,
+    pub mountpoint: PathBuf,
+    pub target: PathBuf,
+    name: String,
+    mount: fuse3::raw::MountHandle,
+}
+
+#[cfg(feature = "fuse")]
+impl TurnView {
+    /// A view of the repository's `HEAD`, mounted.
+    pub async fn start(repo: &std::path::Path, plan_id: &str) -> anyhow::Result<Self> {
+        let name = crate::sandbox::safe_name(plan_id);
+        let vfs = Arc::new(tokio::task::block_in_place(|| ViewVfs::open(repo, "HEAD"))?);
+        let mountpoint = crate::sandbox::runtime_dir("corrode-views").join(&name);
+        crate::sandbox::private_dir(&mountpoint)?;
+        // Build output is gigabytes: on disk, not under the (RAM-backed) runtime dir.
+        let target = crate::sandbox::home()
+            .map(|h| h.join(".cache"))
+            .unwrap_or_else(std::env::temp_dir)
+            .join("corrode/targets")
+            .join(&name);
+        std::fs::create_dir_all(&target)?;
+        let mount = crate::fuse::mount_handle(vfs.clone(), &mountpoint).await?;
+        Ok(Self { vfs, mountpoint, target, name, mount })
+    }
+
+    /// Commit the view to `refs/corrode/<plan>` (`None`: nothing changed), unmount it
+    /// and remove its target dir.
+    pub async fn finish(self, message: &str) -> anyhow::Result<Option<String>> {
+        let committed = tokio::task::block_in_place(|| self.vfs.commit(&self.name, message));
+        if let Err(e) = self.mount.unmount().await {
+            eprintln!("view: unmounting {}: {e}", self.mountpoint.display());
+        }
+        let (mountpoint, target) = (self.mountpoint, self.target);
+        tokio::task::spawn_blocking(move || {
+            let _ = std::fs::remove_dir(&mountpoint);
+            let _ = std::fs::remove_dir_all(&target);
+        });
+        Ok(committed?.map(|c| format!("refs/corrode/{} {c}", self.name)))
+    }
+}
+
+/// Without the `fuse` feature a view cannot be mounted, so a turn cannot work in one.
+#[cfg(not(feature = "fuse"))]
+pub struct TurnView {
+    pub vfs: Arc<ViewVfs>,
+    pub mountpoint: PathBuf,
+    pub target: PathBuf,
+}
+
+#[cfg(not(feature = "fuse"))]
+impl TurnView {
+    pub async fn start(_repo: &std::path::Path, _plan_id: &str) -> anyhow::Result<Self> {
+        anyhow::bail!("CORRODE_VIEWS needs a daemon built with --features fuse")
+    }
+
+    pub async fn finish(self, _message: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
     }
 }
 

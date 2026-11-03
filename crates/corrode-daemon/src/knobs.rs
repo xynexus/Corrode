@@ -35,6 +35,7 @@ const FLAGS: &[&str] = &[
     "CORRODE_VFS_GRAPH",
     "CORRODE_VFS_VERIFY",
     "CORRODE_PLANNER_DETERMINISTIC",
+    "CORRODE_VIEWS",
 ];
 
 /// Counts and whole seconds.
