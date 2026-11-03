@@ -715,6 +715,16 @@ impl ToolBox {
         if let Some(refused) = self.stale_write(path).await {
             return refused;
         }
+        // Said, not reported as a write: a coder "fixed" a compile error by writing the
+        // file back unchanged, read "wrote 3289 bytes", and called the task done.
+        if self.vfs.read(path).await.is_ok_and(|b| b == contents.as_bytes()) {
+            self.note_read(path).await;
+            return format!(
+                "unchanged: {path} already has exactly these {} bytes, so nothing was written. \
+                 If you meant to change it, your new contents are identical to the old.",
+                contents.len()
+            );
+        }
         match self.vfs.write(path, contents.as_bytes()).await {
             Ok(()) => {
                 let version = Some(content_version(contents.as_bytes()));
@@ -1380,6 +1390,11 @@ mod tests {
             .await;
         assert!(out.starts_with("wrote"), "{out}");
         assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), src);
+        // The same contents again is not reported as a write: it changed nothing.
+        let out = toolbox
+            .execute(&call("write_file", serde_json::json!({"path": "a.rs", "contents": src})))
+            .await;
+        assert!(out.starts_with("unchanged: a.rs"), "{out}");
 
         let call_json = call(
             "write_file",

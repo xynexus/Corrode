@@ -2770,7 +2770,15 @@ async fn run_native_tool_loop(
         // spent 16 generations on what parallel calls do in a few. Sequential is
         // enough: the generation, not the call, is the cost.
         let batch = &calls[..calls.len().min(MAX_CALLS_PER_STEP)];
-        if batch.iter().all(|c| made.contains(&SeenCalls::key(c))) {
+        // Only a repeat that cannot change anything is circling. A coder whose fix was
+        // a write identical to its last one was stopped here and asked for its answer
+        // -- "Let me fix it" became the task's output and the build stayed broken. A
+        // repeated mutating call goes to the gate, which serves it from the turn's
+        // cache with a note saying so, or runs it if a mutation has since cleared that.
+        if batch
+            .iter()
+            .all(|c| made.contains(&SeenCalls::key(c)) && !crate::tools::is_mutating(c))
+        {
             circling = true;
             break;
         }
@@ -2793,6 +2801,11 @@ async fn run_native_tool_loop(
                 observation: Some(observation.clone()),
             });
             observations.push(observation);
+        }
+        // A mutation can change what any call returns: re-reading a file after
+        // writing it, or rebuilding after an edit, is new information, not circling.
+        if batch.iter().any(crate::tools::is_mutating) {
+            made.clear();
         }
         if let Some(newest) = observations.last_mut() {
             warn_steps_left(newest, max_steps - step - 1);
@@ -5515,6 +5528,62 @@ mod tests {
         assert!(bodies[2]["tools"].is_null(), "the answer was asked for with no tools");
         let last = bodies[2]["input"].as_array().unwrap().last().unwrap().clone();
         assert_eq!((last["role"].as_str(), last["content"].as_str()), (Some("user"), Some(ANSWER_NOW)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Rebuilding after a fix repeats the first build exactly, and is not circling: a
+    // write since then means it can return something new. A coder that went
+    // write -> build -> write -> build used to be stopped at its second build.
+    #[tokio::test]
+    async fn the_same_build_after_a_fix_runs_again() {
+        let dir = two_file_repo("rebuild");
+        let (url, bodies) = recording_hipfire(|_, n| match n {
+            0 => call_reply("write_file", serde_json::json!({"path": "a.txt", "contents": "broken"})),
+            1 => call_reply("run_command", serde_json::json!({"command": "cat a.txt"})),
+            2 => call_reply("write_file", serde_json::json!({"path": "a.txt", "contents": "fixed"})),
+            3 => call_reply("run_command", serde_json::json!({"command": "cat a.txt"})),
+            _ => text_reply("done"),
+        })
+        .await;
+        let client = Client::new(url, None);
+        let (etx, _erx) = mpsc::channel(64);
+        let seen = Mutex::new(SeenCalls::default());
+        let prefix = format!("repo context{}", crate::hipfire::PREFIX_END);
+        let mut written = Vec::new();
+        let out = run_task(
+            &TaskCtx {
+                client: &client,
+                model: "Qwen3.5-9B--oq4.25++",
+                band: Priority::Default,
+                dialects: &Dialects::default(),
+                tool_caller: None,
+                toolbox: repo_toolbox(&dir),
+                approvals: &ApprovalGate::auto_approving(),
+                prefix: &prefix,
+                role: Role::Coder,
+                events: &etx,
+                id: 1,
+                read_only: false,
+                seen: &seen,
+                deadline: None,
+            },
+            "fix a.txt",
+            &mut written,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "done");
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 5, "four calls, then the answer: {bodies:?}");
+        let last_output = bodies[4]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|t| t["output"].as_str())
+            .unwrap()
+            .to_string();
+        assert!(last_output.contains("fixed"), "the second build ran: {last_output}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
