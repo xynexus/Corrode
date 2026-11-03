@@ -169,7 +169,8 @@ dependents are written off), `CORRODE_APPROVAL_TIMEOUT_S`
 (how long a mutating call waits for a human before it is denied, default 3600; it is
 also denied at once if the client disconnects), `CORRODE_VIEWS` (a turn works in a VFS view of
 `HEAD` instead of the working tree: file tools write to the view, sandboxed commands run in it
-mounted at the repo's path with a per-turn cargo target dir, and at the end it is committed to
+mounted at the repo's path with cargo's target dir at `/corrode/target` -- the repo's last finished
+turn's build, taken over and rebuilt only where the view marks files dirty -- and at the end it is committed to
 `refs/corrode/<plan>` -- recorded as `commit` in the turn journal -- leaving branches, index and
 working tree alone; the view is a locked linked worktree, so `git status`/`diff`/`log` work inside
 the turn against a read-only git dir and `commit` does not; off unless set on; needs `--features fuse` and `CORRODE_SANDBOX`, else the

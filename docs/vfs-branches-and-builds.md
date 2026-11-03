@@ -464,8 +464,20 @@ have); commands no longer inherit the daemon's `CORRODE_*`/`HIPFIRE_*` env. A vi
 9 submodules, 35 symlinks, an LFS filter -- runs `cargo check`, the whole
 workspace's tests and `git status`.
 
-Still to do: reusing a target dir across turns (a turn's first build is
-cold); a FUSE handle reads its file once per open, but whole.
+**Build reuse across turns (2026-11-03).** The last finished turn's target dir
+is kept per repository and the next turn takes it over whole, by rename -- no
+two turns ever share one. What makes that correct under cargo's mtime-only
+freshness is the view: an unchanged file reports one fixed old time (not the
+base commit's, which would make every file new after each commit), and every
+file that may differ from what the carried build compiled -- what the previous
+turn changed, plus `git diff` between the two bases -- reports the time the view
+opened. Cargo rebuilds exactly those. The sandbox shows the target at one fixed
+path, `/corrode/target`, so the absolute paths cargo records survive the move. A
+test runs three turns of a real crate: the second, at the same base, must
+rebuild and print the base's value, where a reuse without the dirty marking
+prints the first turn's (verified by disabling it); the third compiles nothing.
+
+Still to do: a FUSE handle reads its file once per open, but whole.
 
 ### Measurement: builds through the FUSE mount (2026-11-03)
 
