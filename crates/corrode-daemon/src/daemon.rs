@@ -593,6 +593,41 @@ impl Daemon {
                 // re-executing, and each launching task's tail carries a digest of
                 // what the swarm already did.
                 let turn_seen = Arc::new(std::sync::Mutex::new(SeenCalls::default()));
+                // CORRODE_VIEWS: the turn works in a VFS view of HEAD -- its file tools write
+                // to the view, its sandboxed commands run in the view mounted at the repo's
+                // path -- and at the end the view is committed to refs/corrode/<plan>.
+                // The working tree and the branches are not touched.
+                let turn_view = if crate::knobs::flag("CORRODE_VIEWS", false) {
+                    let started = if self.sandbox.enabled() {
+                        crate::view::TurnView::start(&session.repo_root, &plan_id).await
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "CORRODE_VIEWS needs CORRODE_SANDBOX: an unconfined command runs \
+                             in the working tree, not the view"
+                        ))
+                    };
+                    match started {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            let _ = events
+                                .send(AgentEvent::Error {
+                                    message: format!("no view for this turn ({e}); it works in the working tree"),
+                                })
+                                .await;
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let turn_vfs: Arc<dyn Vfs> = match &turn_view {
+                    Some(v) => v.vfs.clone(),
+                    None => Arc::clone(&session.vfs),
+                };
+                let turn_sandbox = match &turn_view {
+                    Some(v) => self.sandbox.clone().with_view(v.mountpoint.clone(), v.target.clone()),
+                    None => self.sandbox.clone(),
+                };
                 let turn_usage = Arc::new(std::sync::Mutex::new(crate::hipfire::Usage::default()));
                 // What the turn has spent on the remote endpoint, the planner included;
                 // past its budget every task stays on hipfire.
@@ -614,12 +649,12 @@ impl Daemon {
                     let prefix = prefix.clone();
                     let events = events.clone();
                     let tool_caller = self.tool_caller.clone();
-                    let vfs = Arc::clone(&session.vfs);
+                    let vfs = Arc::clone(&turn_vfs);
                     let approvals = Arc::clone(&session.approvals);
                     let root = session.repo_root.clone();
                     let skill_scripts = Arc::clone(&session.skill_scripts);
                     let owner_token = session.owner_token.clone();
-                    let sandbox = self.sandbox.clone();
+                    let sandbox = turn_sandbox.clone();
                     // The store gives `search_files` its soft half. `None` in the base
                     // build, where search stays literal-only.
                     let graph = session.graph.clone();
@@ -917,6 +952,23 @@ impl Daemon {
                 };
                 let mut record = journal_record(session, &plan_id, &text, started, status);
                 record["tasks"] = graph.journal_tasks(JOURNAL_OUTPUT_CAP);
+                if let Some(view) = turn_view {
+                    let subject = text.lines().next().unwrap_or_default().chars().take(72).collect::<String>();
+                    match view.finish(&format!("{subject}\n\nCorrode turn {plan_id}\n")).await {
+                        Ok(Some(commit)) => {
+                            eprintln!("view: turn {plan_id} committed to {commit}");
+                            record["commit"] = serde_json::json!(commit);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let _ = events
+                                .send(AgentEvent::Error {
+                                    message: format!("the turn's view could not be committed: {e}"),
+                                })
+                                .await;
+                        }
+                    }
+                }
                 // "complete" means the scheduler settled, not that the work builds: say
                 // so when the turn's last build/test failed.
                 let failed_check = turn_seen.lock().unwrap().failed_check();

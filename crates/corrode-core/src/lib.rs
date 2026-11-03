@@ -94,6 +94,14 @@ pub struct FileNodeView {
     /// silently dropped to overlay. `None` until the graph-backed VFS sets it
     /// (the filesystem passthrough can't know), mirroring `node_id`.
     pub mode: Option<ProjectionMode>,
+    /// Last modification, in nanoseconds since the Unix epoch. A FUSE mount hands it to
+    /// build tools, whose freshness checks compare it: reported as the epoch, an edit
+    /// is invisible to cargo, which then keeps a stale build. `None` = unknown.
+    #[serde(default)]
+    pub mtime_ns: Option<u64>,
+    /// Executable by its owner (`100755` in git): a script a shell runs by path.
+    #[serde(default)]
+    pub executable: bool,
 }
 
 /// One Prompt turn of the session (a row of `TurnList`): running, or finished and

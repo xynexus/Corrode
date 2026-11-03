@@ -160,11 +160,13 @@ pub fn is_mutating(call: &ToolCall) -> bool {
 /// in a Cargo project. A review gets this rather than a shell: one fixed command it
 /// cannot misuse, so it can see whether the work builds instead of judging by eye.
 /// ponytail: Cargo only; detect npm/pytest/go once a non-Rust target needs it.
-fn test_command(root: &std::path::Path) -> Option<String> {
+/// `cargo_project`: the VFS has a root `Cargo.toml` -- asked of the VFS, not the disk,
+/// since a turn working in a view creates its project there.
+fn test_command(cargo_project: bool) -> Option<String> {
     std::env::var("CORRODE_TEST_COMMAND")
         .ok()
         .filter(|c| !c.trim().is_empty())
-        .or_else(|| root.join("Cargo.toml").is_file().then(|| "cargo test --workspace".into()))
+        .or_else(|| cargo_project.then(|| "cargo test --workspace".into()))
 }
 
 /// Whether a call builds or tests the project: the commands whose last result says
@@ -535,7 +537,7 @@ impl ToolBox {
                 Some(target) => self.run_skill_script(target).await,
                 None => "error: run_skill_script needs a `target` argument".to_string(),
             },
-            "run_tests" => match test_command(&self.root) {
+            "run_tests" => match test_command(self.vfs.stat("Cargo.toml").await.is_ok()) {
                 Some(command) => self.run_command(&command).await,
                 None => "error: no test command is known for this project (it has no \
                          Cargo.toml and CORRODE_TEST_COMMAND is unset); say in your answer \
@@ -1931,7 +1933,7 @@ mod tests {
         let call = ToolCall { name: "run_tests".into(), arguments: json!({}) };
         assert!(tb.execute(&call).await.starts_with("error: no test command"));
         std::fs::write(dir.join("Cargo.toml"), "").unwrap();
-        assert_eq!(test_command(&dir).as_deref(), Some("cargo test --workspace"));
+        assert_eq!(test_command(tb.vfs.stat("Cargo.toml").await.is_ok()).as_deref(), Some("cargo test --workspace"));
         assert!(is_check(&call) && is_mutating(&call));
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -167,7 +167,13 @@ jitter, honouring Retry-After -- default 180, longer than a worker respawn; a 4x
 the client, and a task that still fails for a retryable reason runs once more before its
 dependents are written off), `CORRODE_APPROVAL_TIMEOUT_S`
 (how long a mutating call waits for a human before it is denied, default 3600; it is
-also denied at once if the client disconnects), `CORRODE_AUTO_APPROVE` (auto-approve every mutating tool call instead of blocking on
+also denied at once if the client disconnects), `CORRODE_VIEWS` (a turn works in a VFS view of
+`HEAD` instead of the working tree: file tools write to the view, sandboxed commands run in it
+mounted at the repo's path with a per-turn cargo target dir, and at the end it is committed to
+`refs/corrode/<plan>` -- recorded as `commit` in the turn journal -- leaving branches, index and
+working tree alone; off unless set on; needs `--features fuse` and `CORRODE_SANDBOX`, else the
+turn says so and works in the working tree; `view.rs`, docs/vfs-branches-and-builds.md §8;
+`CORRODE_MOUNT_REV=<rev>` makes `CORRODE_MOUNT` mount a view of that commit), `CORRODE_AUTO_APPROVE` (auto-approve every mutating tool call instead of blocking on
 a human — for unattended/headless swarms that would otherwise fail closed; off unless
 set on, and meant to be paired with `CORRODE_SANDBOX` so writes/commands stay
 confined — the daemon and `doctor` warn when it is not; each auto-approval is logged and the call still streams back as a

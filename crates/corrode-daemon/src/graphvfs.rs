@@ -129,12 +129,14 @@ impl Vfs for GraphVfs {
             // Size comes from the composed bytes, not from disk: a stat that disagrees
             // with the following read is worse than either answer alone, and FUSE will
             // truncate a read to the size stat promised.
+            // Time and mode stay the disk's: the composed bytes are those same bytes.
             Some(bytes) => Ok(FileNodeView {
                 path: path.to_string(),
                 is_dir: false,
                 bytes: bytes.len() as u64,
                 node_id: Some(format!("file:{path}")),
                 mode: Some(ProjectionMode::Composed),
+                ..self.inner.stat(path).await?
             }),
             None => self.inner.stat(path).await,
         }
