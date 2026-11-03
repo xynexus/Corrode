@@ -552,10 +552,18 @@ impl TurnView {
         std::fs::create_dir_all(&target)?;
         let (git_dir, admin) = tokio::task::block_in_place(|| link_worktree(repo, &vfs, &name))?;
         let git_env = tokio::task::block_in_place(|| git_overrides(repo, &vfs.base));
+        let record = ViewRecord {
+            pid: std::process::id(),
+            mountpoint: mountpoint.clone(),
+            target: target.clone(),
+            admin: admin.clone(),
+        };
+        std::fs::write(record_path(&name), serde_json::to_vec(&record)?)?;
         let mount = match crate::fuse::mount_handle(vfs.clone(), &mountpoint).await {
             Ok(m) => m,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&admin);
+                record.take_down();
+                let _ = std::fs::remove_file(record_path(&name));
                 return Err(e);
             }
         };
@@ -570,13 +578,75 @@ impl TurnView {
             eprintln!("view: unmounting {}: {e}", self.mountpoint.display());
         }
         let (mountpoint, target, admin) = (self.mountpoint, self.target, self.admin);
+        let record = record_path(&self.name);
         tokio::task::spawn_blocking(move || {
             let _ = std::fs::remove_dir(&mountpoint);
             let _ = std::fs::remove_dir_all(&target);
             let _ = std::fs::remove_dir_all(&admin);
+            let _ = std::fs::remove_file(&record);
         });
         Ok(committed?.map(|c| format!("refs/corrode/{} {c}", self.name)))
     }
+}
+
+/// What a turn's view holds on the host, recorded beside its mountpoint as
+/// `<runtime>/corrode-views/<name>.json` while it lives. A daemon that dies mid-turn
+/// cannot finish its views: the mount goes dead and the target dir (gigabytes) and the
+/// worktree admin dir stay. [`sweep_stale_views`] takes down a view whose daemon is gone.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ViewRecord {
+    pid: u32,
+    mountpoint: PathBuf,
+    target: PathBuf,
+    admin: PathBuf,
+}
+
+fn record_path(name: &str) -> PathBuf {
+    crate::sandbox::runtime_dir("corrode-views").join(format!("{name}.json"))
+}
+
+impl ViewRecord {
+    /// Unmount and remove what the record names -- each path only if it has the shape
+    /// this module gives it, so a corrupt record cannot point the sweep elsewhere.
+    fn take_down(&self) {
+        let views = crate::sandbox::runtime_dir("corrode-views");
+        if self.mountpoint.parent() == Some(views.as_path()) {
+            let _ = std::process::Command::new("fusermount3").arg("-uz").arg(&self.mountpoint).output();
+            let _ = std::fs::remove_dir(&self.mountpoint);
+        }
+        if self.target.parent().is_some_and(|p| p.ends_with("corrode/targets")) {
+            let _ = std::fs::remove_dir_all(&self.target);
+        }
+        let admin_named = self.admin.file_name().is_some_and(|n| n.to_string_lossy().starts_with("corrode-"));
+        if admin_named && self.admin.parent().is_some_and(|p| p.ends_with("worktrees")) {
+            let _ = std::fs::remove_dir_all(&self.admin);
+        }
+    }
+}
+
+/// Take down every view whose daemon is gone (see [`ViewRecord`]); run at startup.
+/// A record whose pid is alive is left, whether it is another daemon's live turn or a
+/// reused pid: removing a live view is worse than keeping a dead one. Returns how many.
+pub fn sweep_stale_views() -> usize {
+    let Ok(entries) = std::fs::read_dir(crate::sandbox::runtime_dir("corrode-views")) else {
+        return 0;
+    };
+    let mut swept = 0;
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Some(record) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<ViewRecord>(&b).ok()) else {
+            continue;
+        };
+        if std::path::Path::new(&format!("/proc/{}", record.pid)).exists() {
+            continue;
+        }
+        record.take_down();
+        let _ = std::fs::remove_file(&path);
+        swept += 1;
+    }
+    swept
 }
 
 /// Make `vfs` a linked worktree of `repo` to stock git (docs/vfs-branches-and-builds.md
@@ -1002,6 +1072,34 @@ pub(crate) mod tests {
         let list = String::from_utf8(git(&dir, &["worktree", "list"]).unwrap()).unwrap();
         assert_eq!(list.lines().count(), 1, "{list}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_view_whose_daemon_died_is_swept() {
+        let name = format!("sweep-test-{}", std::process::id());
+        let views = crate::sandbox::runtime_dir("corrode-views");
+        let scratch = std::env::temp_dir().join(&name);
+        let record = ViewRecord {
+            pid: u32::MAX - 1, // no such process
+            mountpoint: views.join(&name),
+            target: scratch.join("corrode/targets").join(&name),
+            admin: scratch.join("worktrees").join(format!("corrode-{name}")),
+        };
+        crate::sandbox::private_dir(&record.mountpoint).unwrap();
+        std::fs::create_dir_all(record.target.join("debug")).unwrap();
+        std::fs::create_dir_all(&record.admin).unwrap();
+        std::fs::write(record_path(&name), serde_json::to_vec(&record).unwrap()).unwrap();
+        // A live daemon's record (this process) is left alone.
+        let live = format!("{name}-live");
+        let alive = ViewRecord { pid: std::process::id(), mountpoint: views.join(&live), ..record.clone() };
+        std::fs::write(record_path(&live), serde_json::to_vec(&alive).unwrap()).unwrap();
+
+        assert!(sweep_stale_views() >= 1);
+        assert!(!record.mountpoint.exists() && !record.target.exists() && !record.admin.exists());
+        assert!(!record_path(&name).exists());
+        assert!(record_path(&live).exists(), "a live daemon's view is not swept");
+        std::fs::remove_file(record_path(&live)).unwrap();
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     #[tokio::test(flavor = "multi_thread")]
