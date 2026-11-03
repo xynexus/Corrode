@@ -186,6 +186,13 @@ async fn main() -> anyhow::Result<()> {
     // ponytail: share one Arc<dyn Vfs> between the loop and the mount once the
     // graph-backed VFS carries state the two must agree on.
     #[cfg(feature = "fuse")]
+    {
+        let swept = view::sweep_stale_views();
+        if swept > 0 {
+            eprintln!("views: took down {swept} view(s) left by a daemon that is gone");
+        }
+    }
+    #[cfg(feature = "fuse")]
     if let Ok(mountpoint) = std::env::var("CORRODE_MOUNT") {
         // CORRODE_MOUNT_REV=<rev>: mount a VFS view of that commit instead of the working
         // tree -- what a turn's commands will see; writes stay in the view.
