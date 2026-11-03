@@ -47,6 +47,10 @@ pub struct CorrodeFs {
     vfs: Arc<dyn Vfs>,
     next_fh: AtomicU64,
     writes: Mutex<HashMap<u64, WriteBuf>>,
+    /// A handle's file as its first read found it. The kernel reads in 128 KiB pieces
+    /// and the VFS answers whole files -- a view's base file is a `git cat-file` -- so
+    /// without this a large file cost one whole read per piece.
+    reads: Mutex<HashMap<u64, Arc<Vec<u8>>>>,
 }
 
 impl CorrodeFs {
@@ -55,6 +59,7 @@ impl CorrodeFs {
             vfs,
             next_fh: AtomicU64::new(0),
             writes: Mutex::new(HashMap::new()),
+            reads: Mutex::new(HashMap::new()),
         }
     }
 
@@ -90,6 +95,27 @@ impl CorrodeFs {
             view.bytes = b.data.len() as u64;
         }
         Ok(view)
+    }
+}
+
+const MODE_XATTR: &str = "user.corrode.mode";
+
+fn mode_value(v: &FileNodeView) -> Option<String> {
+    Some(match v.mode.as_ref()? {
+        corrode_core::ProjectionMode::Composed => "composed".to_string(),
+        corrode_core::ProjectionMode::Overlay => "overlay".to_string(),
+        corrode_core::ProjectionMode::OverlayFallback(why) => format!("overlay-fallback: {why:?}"),
+    })
+}
+
+/// An xattr reply: the size when asked for it (`size` 0), else the bytes if they fit.
+fn xattr_reply(bytes: Vec<u8>, size: u32) -> FuseResult<ReplyXAttr> {
+    if size == 0 {
+        Ok(ReplyXAttr::Size(bytes.len() as u32))
+    } else if (size as usize) < bytes.len() {
+        Err(Errno::from(libc::ERANGE))
+    } else {
+        Ok(ReplyXAttr::Data(Bytes::from(bytes)))
     }
 }
 
@@ -362,10 +388,14 @@ impl PathFilesystem for CorrodeFs {
         if let Some(b) = self.writes.lock().unwrap().get(&fh) {
             return Ok(slice(&b.data));
         }
+        if let Some(bytes) = self.reads.lock().unwrap().get(&fh) {
+            return Ok(slice(bytes));
+        }
         let p = os_str(path.ok_or_else(Errno::new_not_exist)?)?;
-        // ponytail: reads the whole file then slices — this is exactly where lazy
-        // graph materialization would fault in only the requested byte range.
-        let bytes = self.vfs.read(p).await.map_err(|e| errno(&e))?;
+        // ponytail: the whole file once per handle, then slices of it; lazy graph
+        // materialization would fault in only the requested range.
+        let bytes = Arc::new(self.vfs.read(p).await.map_err(|e| errno(&e))?);
+        self.reads.lock().unwrap().insert(fh, Arc::clone(&bytes));
         Ok(slice(&bytes))
     }
 
@@ -428,7 +458,27 @@ impl PathFilesystem for CorrodeFs {
     ) -> FuseResult<()> {
         let committed = self.commit(fh).await;
         self.writes.lock().unwrap().remove(&fh);
+        self.reads.lock().unwrap().remove(&fh);
         committed
+    }
+
+    /// `user.corrode.mode`: how the VFS backs the file (composed from the graph, overlay,
+    /// or overlay after a failed round-trip and why), so a shell can see which files
+    /// dropped to overlay. Absent where the VFS does not know (the passthrough, a view).
+    async fn getxattr(&self, _req: Request, path: &OsStr, name: &OsStr, size: u32) -> FuseResult<ReplyXAttr> {
+        if name != MODE_XATTR {
+            return Err(Errno::from(libc::ENODATA));
+        }
+        let value = mode_value(&self.stat(os_str(path)?).await?).ok_or_else(|| Errno::from(libc::ENODATA))?;
+        xattr_reply(value.into_bytes(), size)
+    }
+
+    async fn listxattr(&self, _req: Request, path: &OsStr, size: u32) -> FuseResult<ReplyXAttr> {
+        let names = match mode_value(&self.stat(os_str(path)?).await?) {
+            Some(_) => format!("{MODE_XATTR}\0").into_bytes(),
+            None => Vec::new(),
+        };
+        xattr_reply(names, size)
     }
 
     async fn readdirplus<'a>(
@@ -589,6 +639,30 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(feature = "fuse")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handle_reads_its_file_once_and_the_mode_is_an_xattr() {
+        let dir = crate::view::tests::repo("fuse-reads");
+        let view = Arc::new(crate::view::ViewVfs::open(&dir, "HEAD").unwrap());
+        let fs = CorrodeFs::new(view.clone());
+        let fh = fs.open(req(), OsStr::new("README.md"), libc::O_RDONLY as u32).await.unwrap().fh;
+        let first = fs.read(req(), Some(OsStr::new("README.md")), fh, 0, 3).await.unwrap();
+        // Changed underneath: the open handle goes on reading the file it opened.
+        view.write("README.md", b"other\n").await.unwrap();
+        let rest = fs.read(req(), Some(OsStr::new("README.md")), fh, 3, 100).await.unwrap();
+        assert_eq!([&first.data[..], &rest.data[..]].concat(), b"hello\n");
+        fs.release(req(), Some(OsStr::new("README.md")), fh, 0, 0, false).await.unwrap();
+
+        // A view does not know a projection mode, so there is no attribute.
+        assert_eq!(fs.getxattr(req(), OsStr::new("README.md"), OsStr::new(MODE_XATTR), 0).await.unwrap_err(), Errno::from(libc::ENODATA));
+        let composed = FileNodeView { mode: Some(corrode_core::ProjectionMode::Composed), ..view.stat("README.md").await.unwrap() };
+        let value = mode_value(&composed).unwrap().into_bytes();
+        assert!(matches!(xattr_reply(value.clone(), 0), Ok(ReplyXAttr::Size(8))));
+        assert_eq!(xattr_reply(value.clone(), 4).unwrap_err(), Errno::from(libc::ERANGE));
+        assert!(matches!(xattr_reply(value, 64), Ok(ReplyXAttr::Data(d)) if &d[..] == b"composed"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // What shells, editors and build tools do to a mounted VFS view: append, truncate,
