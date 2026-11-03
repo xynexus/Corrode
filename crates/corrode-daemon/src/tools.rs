@@ -81,6 +81,12 @@ to locate code without reading whole files.",
         }],
     },
     Tool {
+        name: "run_tests",
+        effect: Effect::Exec,
+        description: "Build the project and run its tests, and return the result. Takes no arguments.",
+        params: &[],
+    },
+    Tool {
         name: "write_file",
         effect: Effect::Mutate,
         description: "Create or overwrite a file with the given contents.",
@@ -115,16 +121,16 @@ to locate code without reading whole files.",
 /// The exec tools a role may use. Harness-enforced, not suggested: the declared set
 /// is all the grammar (native path) or the rendered schema (Needle path) can ever
 /// produce, so an out-of-role call is unreachable rather than discouraged.
-/// Research/architect observe; review verifies through skills — `run_command` was
-/// its measured misuse (docs/todo/tool-call-judgement.md item 3) — and only the
-/// coder gets the full set. Costs cross-role KV sharing: the tools JSON renders
+/// Research/architect observe; review verifies through skills and `run_tests` — a
+/// fixed command, because `run_command` was its measured misuse
+/// (docs/todo/tool-call-judgement.md item 3) — and only the coder gets the full set. Costs cross-role KV sharing: the tools JSON renders
 /// ahead of the shared prefix, so roles with different sets no longer prefix-share
 /// on a common model (within-role sharing, including fan-out attempts, is intact).
 pub fn role_tools(role: crate::roles::Role) -> &'static [Tool] {
     use crate::roles::Role;
     match role {
         Role::Coder => EXEC_TOOLS,
-        Role::Review => &EXEC_TOOLS[..4],
+        Role::Review => &EXEC_TOOLS[..5],
         // read_file, list_dir, search_files — read-only observation for the roles
         // that must never mutate.
         Role::Research | Role::Architect | Role::Orchestration => &EXEC_TOOLS[..3],
@@ -148,6 +154,17 @@ pub fn is_mutating(call: &ToolCall) -> bool {
         .iter()
         .find(|t| t.name == call.name)
         .is_none_or(|t| t.effect != Effect::Read)
+}
+
+/// The command `run_tests` runs: `CORRODE_TEST_COMMAND`, else `cargo test --workspace`
+/// in a Cargo project. A review gets this rather than a shell: one fixed command it
+/// cannot misuse, so it can see whether the work builds instead of judging by eye.
+/// ponytail: Cargo only; detect npm/pytest/go once a non-Rust target needs it.
+fn test_command(root: &std::path::Path) -> Option<String> {
+    std::env::var("CORRODE_TEST_COMMAND")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+        .or_else(|| root.join("Cargo.toml").is_file().then(|| "cargo test --workspace".into()))
 }
 
 /// Whether a call builds or tests the project: the commands whose last result says
@@ -193,6 +210,7 @@ pub fn describe(call: &ToolCall) -> String {
             "run_skill_script {}",
             arg_str(call, "target").unwrap_or("<missing target>")
         ),
+        "run_tests" => "run_tests (CORRODE_TEST_COMMAND, else `cargo test --workspace`)".to_string(),
         other => format!("{other}({})", call.arguments),
     }
 }
@@ -516,6 +534,13 @@ impl ToolBox {
             "run_skill_script" => match arg_str(call, "target") {
                 Some(target) => self.run_skill_script(target).await,
                 None => "error: run_skill_script needs a `target` argument".to_string(),
+            },
+            "run_tests" => match test_command(&self.root) {
+                Some(command) => self.run_command(&command).await,
+                None => "error: no test command is known for this project (it has no \
+                         Cargo.toml and CORRODE_TEST_COMMAND is unset); say in your answer \
+                         what should be checked"
+                    .to_string(),
             },
             other => format!("error: unknown tool `{other}`"),
         }
@@ -1652,7 +1677,7 @@ mod tests {
         assert_eq!(names(Role::Coder).len(), EXEC_TOOLS.len());
         assert_eq!(
             names(Role::Review),
-            vec!["read_file", "list_dir", "search_files", "run_skill_script"]
+            vec!["read_file", "list_dir", "search_files", "run_skill_script", "run_tests"]
         );
         // Read-only roles get the observation trio (incl. search) and nothing mutating.
         assert_eq!(names(Role::Research), vec!["read_file", "list_dir", "search_files"]);
@@ -1888,6 +1913,22 @@ mod tests {
         );
         assert!(broken.param_values().await.is_empty());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_tests_runs_the_projects_test_command_or_says_there_is_none() {
+        if std::env::var_os("CORRODE_TEST_COMMAND").is_some() {
+            return; // the operator's command wins; detection is what this pins
+        }
+        let dir = std::env::temp_dir().join(format!("corrode-runtests-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tb = ToolBox::new(Arc::new(PassthroughVfs::new(&dir)), dir.clone(), Arc::new(HashMap::new()));
+        let call = ToolCall { name: "run_tests".into(), arguments: json!({}) };
+        assert!(tb.execute(&call).await.starts_with("error: no test command"));
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        assert_eq!(test_command(&dir).as_deref(), Some("cargo test --workspace"));
+        assert!(is_check(&call) && is_mutating(&call));
         std::fs::remove_dir_all(&dir).ok();
     }
 

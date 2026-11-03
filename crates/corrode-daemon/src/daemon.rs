@@ -5144,7 +5144,7 @@ mod tests {
         let executed_mutating = tool_results
             .iter()
             .filter(|(call, obs)| {
-                ["write_file", "run_command", "run_skill_script"]
+                ["write_file", "run_command", "run_skill_script", "run_tests"]
                     .iter()
                     .any(|m| call.starts_with(m))
                     && !obs.starts_with("note: this exact call was already tried")
