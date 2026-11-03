@@ -454,9 +454,18 @@ work; `commit` is refused. The index has no stat data, so `status` hashes every
 file -- fine at CAE's size, and it cannot write a refreshed index back. The
 admin dir goes when the turn ends.
 
-Still to do: `touch` (explicit mtimes are ignored); symlinks and submodules
-(left out of a view); reusing a target dir across turns. A FUSE handle now
-reads its file once rather than once per 128 KiB piece, but still whole.
+Since then (2026-11-03): `touch` marks a file modified now; symlinks are served
+(readlink/symlink, followed within the view by the file tools, committed as
+`120000`); a submodule is an empty read-only directory the sandbox binds the
+host's checkout over; configured git filter drivers (git-lfs) are pass-through
+inside a view, whose blobs are stored bytes, and submodules are `ignore = all`
+for git there (their `.git` files point into a modules dir a view does not
+have); commands no longer inherit the daemon's `CORRODE_*`/`HIPFIRE_*` env. A view of the Corrode repo itself --
+9 submodules, 35 symlinks, an LFS filter -- runs `cargo check`, the whole
+workspace's tests and `git status`.
+
+Still to do: reusing a target dir across turns (a turn's first build is
+cold); a FUSE handle reads its file once per open, but whole.
 
 ### Measurement: builds through the FUSE mount (2026-11-03)
 
