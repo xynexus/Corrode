@@ -1546,8 +1546,12 @@ mod tests {
             format!("var a=1;{} frobnicate;\n", "x".repeat(2000)),
         )
         .unwrap();
-        // Untracked: present on disk, absent from the corpus, must never be searched.
+        // Untracked but not ignored: an agent's new file, which must be searchable.
         std::fs::write(dir.join("untracked.rs"), "frobnicate untracked\n").unwrap();
+        // Ignored: present on disk, matching, and never searched.
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("target/out.rs"), "frobnicate built\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
 
         // The corpus is git's answer, so the fixture has to be a repo. Staging is
         // enough — `ls-files` reads the index, no commit (or identity) required.
@@ -1590,8 +1594,9 @@ mod tests {
             "both tracked sources should match: {hit}"
         );
         assert!(!hit.contains("a.rs:2:"), "non-matching line excluded: {hit}");
-        // The corpus fix: on disk and matching, but not tracked, so not searched.
-        assert!(!hit.contains("untracked.rs"), "untracked file searched: {hit}");
+        // The corpus: git's answer, untracked-but-not-ignored included.
+        assert!(hit.contains("untracked.rs:1:"), "new file not searched: {hit}");
+        assert!(!hit.contains("target/out.rs"), "ignored file searched: {hit}");
         // The property filters: both are tracked and both contain the query.
         assert!(!hit.contains("blob.bin"), "binary searched: {hit}");
         assert!(!hit.contains("min.js"), "minified searched: {hit}");
