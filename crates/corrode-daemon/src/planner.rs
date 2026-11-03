@@ -26,7 +26,21 @@ const MAX_SUBTASKS: usize = 8;
 /// prefix (see [`to_tasks`]) — lets hipfire batch the planning call and the
 /// subagents prefix-shared and reuse their KV cache, when they land on the same
 /// model. Only the tail (instructions, then the user request) diverges.
-pub fn orchestration_prompt(context_prefix: &str, user_prompt: &str) -> String {
+///
+/// It asks for the fewest subtasks. Every planned task is a model writing at the serving
+/// model's decode rate, and the plans it got without this were the same five steps
+/// whatever the request: a wordfreq program (one file, ~100 lines) planned an architect
+/// whose 1.9K-token "design" was the program, then the coder writing it again, a review,
+/// and a coder to "apply the reviewer's fixes" -- the last two duplicating the plan-level
+/// review the daemon appends anyway (`plan_review`). Those three were ~230 s of a 410 s
+/// turn.
+pub fn orchestration_prompt(context_prefix: &str, user_prompt: &str, plan_review: bool) -> String {
+    let review = if plan_review {
+        " Do not plan review or fix-up tasks: when the plan's tasks finish, a reviewer checks \
+the work against the repository, runs its tests, and schedules any fix."
+    } else {
+        ""
+    };
     format!(
         "{context_prefix}\n\n\
 You are the orchestrator of a coding-agent swarm. Decompose the user's request \
@@ -35,7 +49,11 @@ coder, review. Reply with ONLY a JSON array, no prose, each element \
 {{\"role\": <role>, \"task\": <self-contained instruction>, \"after\": [<indices>]}}. \
 \"after\" lists the 0-based indices of EARLIER subtasks whose results this one needs \
 (it runs once they finish and is given their output); omit it for work that can start \
-at once. Use at most {MAX_SUBTASKS} subtasks.\n\nUser request:\n{user_prompt}"
+at once. Use at most {MAX_SUBTASKS} subtasks, and the fewest that do the job: a small, \
+self-contained change (one program, one or two files) is a single coder task, which \
+designs as it writes. Plan an architect only when the design is genuinely open across \
+several components, and research only for what the repository and the request do not \
+already say.{review}\n\nUser request:\n{user_prompt}"
     )
 }
 

@@ -267,8 +267,12 @@ impl PathFilesystem for CorrodeFs {
                 self.vfs.set_executable(&path, executable).await.map_err(|e| errno(&e))?;
             }
         }
-        // ponytail: an explicit atime/mtime (`touch`) is ignored -- the VFS keeps its own
-        // times. A `touch` meant to force a rebuild does not; add `Vfs::touch` if needed.
+        // An explicit time (`touch`) marks the file modified now: the VFS keeps its own
+        // clock, so a set to some other time is taken as "now" -- what a `touch` meant to
+        // force a rebuild needs. Setting a time in the past is not supported.
+        if set_attr.mtime.is_some() && set_attr.size.is_none() {
+            self.vfs.touch(&path).await.map_err(|e| errno(&e))?;
+        }
         Ok(ReplyAttr {
             ttl: TTL,
             attr: attr_for(&self.stat(&path).await?, req.uid, req.gid),
@@ -702,6 +706,13 @@ mod tests {
         assert_eq!(fs.setattr(req(), p("src/lib.rs"), None, size).await.unwrap().attr.size, 3);
         let mode = SetAttr { mode: Some(0o755), ..Default::default() };
         assert_eq!(fs.setattr(req(), p("src/lib.rs"), None, mode).await.unwrap().attr.perm, 0o755);
+        // `touch` makes a base file newer than the base, so a build sees it changed.
+        let base_time = fs.getattr(req(), p("run.sh"), None, 0).await.unwrap().attr.mtime;
+        let touch = SetAttr { mtime: Some(fuse3::Timestamp::new(0, 0)), ..Default::default() };
+        let touched = fs.setattr(req(), p("run.sh"), None, touch).await.unwrap().attr;
+        assert!(touched.mtime > base_time, "{:?} vs {base_time:?}", touched.mtime);
+        assert_eq!(touched.perm, 0o755, "touch keeps the mode");
+        assert_eq!(view.read("run.sh").await.unwrap(), b"#!/bin/sh\n", "and the content");
         fs.mkdir(req(), OsStr::new(""), OsStr::new("out"), 0o755, 0).await.unwrap();
         assert_eq!(fs.mkdir(req(), OsStr::new(""), OsStr::new("out"), 0o755, 0).await.unwrap_err(), Errno::from(libc::EEXIST));
         assert_eq!(fs.rmdir(req(), OsStr::new(""), OsStr::new("src")).await.unwrap_err(), Errno::from(libc::ENOTEMPTY));

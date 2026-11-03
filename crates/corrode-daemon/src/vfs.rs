@@ -72,6 +72,11 @@ pub trait Vfs: Send + Sync {
     async fn set_executable(&self, path: &str, _executable: bool) -> anyhow::Result<()> {
         anyhow::bail!("this VFS cannot change the mode of {path}")
     }
+    /// Mark a file modified now (`touch`), so a build tool sees it as newer than its
+    /// last build.
+    async fn touch(&self, path: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this VFS cannot touch {path}")
+    }
 }
 
 /// An error whose kind a FUSE mount turns into an errno.
@@ -343,6 +348,22 @@ impl Vfs for PassthroughVfs {
                 .map(str::to_string),
         );
         Ok(files)
+    }
+
+    async fn touch(&self, path: &str) -> anyhow::Result<()> {
+        let full = self.resolve(path)?;
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            use std::os::unix::fs::OpenOptionsExt;
+            let real = confine_write(&root, &full)?;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&real)?;
+            file.set_modified(std::time::SystemTime::now())?;
+            Ok(())
+        })
+        .await?
     }
 
     async fn write(&self, path: &str, contents: &[u8]) -> anyhow::Result<()> {
