@@ -640,6 +640,30 @@ impl Vfs for ViewVfs {
     async fn set_executable(&self, path: &str, executable: bool) -> anyhow::Result<()> {
         tokio::task::block_in_place(|| self.set_executable_now(path, executable))
     }
+
+    async fn touch(&self, path: &str) -> anyhow::Result<()> {
+        let path = writable(path)?;
+        tokio::task::block_in_place(|| {
+            let changes = self.changes.lock().unwrap();
+            match self.view_of(&path, &changes) {
+                None => return Err(io_err(NotFound, format!("no such path: {path}"))),
+                Some(v) if v.is_dir => {
+                    drop(changes);
+                    self.changes.lock().unwrap().insert(path.clone(), Change::Dir { mtime_ns: now_ns() });
+                    return Ok(());
+                }
+                Some(v) => {
+                    drop(changes);
+                    let data = self.read_now(&path)?;
+                    self.changes
+                        .lock()
+                        .unwrap()
+                        .insert(path.clone(), Change::File { data, executable: v.executable, mtime_ns: now_ns() });
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
