@@ -416,7 +416,10 @@ refuses any call outside the task's role set before approval or execution. (The 
 set alone is a hard limit only where hipfire builds a grammar for the model -- MiniCPM;
 the Qwen models can emit undeclared tools.)
 Research/architect observe (read-only — never block on approval); review adds
-`run_skill_script` but has no raw shell; only the coder gets the full set.
+`run_skill_script` and `run_tests` (`CORRODE_TEST_COMMAND`, else `cargo test --workspace` in a
+Cargo project -- one fixed command, so it can see whether the work builds) but has no raw shell;
+only the coder gets the full set. A turn whose last build/test command failed is reported
+`unverified` in the journal and to the client, and its review is told first.
 Tools: `read_file`, `list_dir` (read-only) run straight through; `write_file`,
 `run_command`, and `run_skill_script` (run a skill's bundled `scripts/`, resolved by a
 `skill/script` or bare-script `target`) are **mutating/executing** (`tools::is_mutating`)

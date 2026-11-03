@@ -252,32 +252,52 @@ impl Vfs for PassthroughVfs {
     /// the mode, and only `100644`/`100755` (regular blobs) are kept — dropping
     /// `160000` gitlinks and `120000` symlinks, the latter because following them
     /// re-enters the tree by another name.
+    ///
+    /// Untracked files that `.gitignore` does not exclude are part of the corpus too.
+    /// An agent's new file is untracked until someone commits it, and leaving it out
+    /// made a reviewer's search report "no matches" in a test file the coder had just
+    /// written. Ignore rules still keep build output out; an untracked nested repo
+    /// (listed as `dir/`) and untracked symlinks are dropped for the reasons above.
     async fn tracked_files(&self) -> anyhow::Result<Vec<String>> {
         let root = self.root.clone();
-        let out = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(["ls-files", "-s", "-z"])
-                .output()
-        })
-        .await??;
-        if !out.status.success() {
-            anyhow::bail!(
-                "git ls-files failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+        let git = |args: &'static [&'static str]| {
+            let root = root.clone();
+            async move {
+                let out = tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("git").arg("-C").arg(&root).args(args).output()
+                })
+                .await??;
+                if !out.status.success() {
+                    anyhow::bail!(
+                        "git ls-files failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                }
+                anyhow::Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            }
+        };
         // `-s` entries are `<mode> <oid> <stage>\t<path>`, NUL-separated by `-z` so a
         // path containing a newline can't split one record into two.
-        Ok(String::from_utf8_lossy(&out.stdout)
+        let mut files: Vec<String> = git(&["ls-files", "-s", "-z"])
+            .await?
             .split('\0')
             .filter_map(|rec| {
                 let (meta, path) = rec.split_once('\t')?;
                 let mode = meta.split_whitespace().next()?;
                 matches!(mode, "100644" | "100755").then(|| path.to_string())
             })
-            .collect())
+            .collect();
+        let untracked = git(&["ls-files", "-z", "--others", "--exclude-standard"]).await?;
+        files.extend(
+            untracked
+                .split('\0')
+                .filter(|p| !p.is_empty() && !p.ends_with('/'))
+                .filter(|p| {
+                    std::fs::symlink_metadata(self.root.join(p)).is_ok_and(|m| m.is_file())
+                })
+                .map(str::to_string),
+        );
+        Ok(files)
     }
 
     async fn write(&self, path: &str, contents: &[u8]) -> anyhow::Result<()> {

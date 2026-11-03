@@ -198,6 +198,49 @@ pub struct Sandbox {
     share_net: bool,
     /// Applied to every spawn, confined or not.
     policy: SpawnPolicy,
+    /// Host directory bound as the sandbox's `/tmp` (see [`turn_tmp`]); `None` gives
+    /// each command an empty tmpfs.
+    tmp: Option<PathBuf>,
+}
+
+/// The host directory a turn's sandboxed commands share as `/tmp`.
+///
+/// Each command used to get an empty tmpfs, so a file one command wrote to `/tmp` was
+/// gone for the next: a coder spent ~15 steps writing debug files there and finding
+/// them missing. One directory per turn keeps them across the turn's commands, and
+/// removing it when the turn ends keeps turns apart. It lives under the user's
+/// private runtime dir, not a predictable name in the shared `/tmp`.
+pub fn turn_tmp(plan_id: &str) -> PathBuf {
+    let name: String = plan_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    tmp_base().join(name)
+}
+
+fn tmp_base() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(d) => PathBuf::from(d).join("corrode-tmp"),
+        None => std::env::temp_dir().join(format!("corrode-tmp-{}", unsafe { libc::getuid() })),
+    }
+}
+
+/// Create `dir` (and the base above it) as directories only this user can enter, and
+/// refuse one that is a symlink or someone else's -- in the shared-`/tmp` fallback
+/// another user could have made the name first.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    for d in [tmp_base().as_path(), dir] {
+        match std::fs::DirBuilder::new().mode(0o700).create(d) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
+        }
+        let m = std::fs::symlink_metadata(d)?;
+        if !m.is_dir() || m.uid() != unsafe { libc::getuid() } || m.mode() & 0o077 != 0 {
+            return Err(std::io::Error::other(format!("{} is not a private directory", d.display())));
+        }
+    }
+    Ok(())
 }
 
 impl Sandbox {
@@ -208,6 +251,7 @@ impl Sandbox {
             enabled: crate::knobs::flag("CORRODE_SANDBOX", true),
             share_net: crate::knobs::flag("CORRODE_SANDBOX_NET", false),
             policy: SpawnPolicy::from_env(),
+            tmp: None,
         };
         if s.enabled {
             eprintln!(
@@ -220,7 +264,13 @@ impl Sandbox {
     }
 
     pub fn disabled() -> Self {
-        Self { enabled: false, share_net: false, policy: SpawnPolicy::default() }
+        Self { enabled: false, share_net: false, policy: SpawnPolicy::default(), tmp: None }
+    }
+
+    /// Bind `dir` as `/tmp` for confined commands instead of an empty tmpfs.
+    pub fn with_tmp(mut self, dir: PathBuf) -> Self {
+        self.tmp = Some(dir);
+        self
     }
 
     /// Turn `argv` (program + args) into the argv actually spawned: the spawn policy's
@@ -284,7 +334,16 @@ impl Sandbox {
         // daemon's device.
         push(&["--proc", "/proc"]);
         push(&["--dev", "/dev"]);
-        push(&["--tmpfs", "/tmp"]);
+        match &self.tmp {
+            Some(t) if private_dir(t).is_ok() => {
+                push(&["--bind", &t.to_string_lossy(), "/tmp"]);
+            }
+            Some(t) => {
+                eprintln!("sandbox: cannot use {} as /tmp; this command gets an empty one", t.display());
+                push(&["--tmpfs", "/tmp"]);
+            }
+            None => push(&["--tmpfs", "/tmp"]),
+        }
 
         // The working tree: read-write. The graph store lives inside it at
         // <repo>/.corrode — re-bind that read-only on top (later bind wins) so a
@@ -336,12 +395,12 @@ mod tests {
             format!("{prog} {}", args.join(" "))
         };
         let tail = "-- env CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=8 sh -c cargo test";
-        let bare = joined(&Sandbox { enabled: false, share_net: false, policy: policy.clone() });
+        let bare = joined(&Sandbox { enabled: false, share_net: false, policy: policy.clone(), tmp: None });
         assert!(bare.starts_with("systemd-run --user --scope"), "{bare}");
         assert!(bare.contains("--expand-environment=no"), "{bare}");
         assert!(bare.contains("-p MemoryMax=16G -p MemorySwapMax=0"), "{bare}");
         assert!(bare.ends_with(tail), "{bare}");
-        let boxed = joined(&Sandbox { enabled: true, share_net: false, policy });
+        let boxed = joined(&Sandbox { enabled: true, share_net: false, policy, tmp: None });
         let bwrap = boxed.find(" -- bwrap ").expect(&boxed);
         assert!(boxed.starts_with("systemd-run "), "{boxed}");
         assert!(boxed[bwrap..].ends_with(tail), "{boxed}");
@@ -356,7 +415,7 @@ mod tests {
         let p = set(&[("CARGO_BUILD_JOBS", "32"), ("CORRODE_COMMAND_MEMORY_MAX", "off")]);
         assert_eq!(p.env, vec!["RUST_TEST_THREADS=8".to_string()]);
         assert_eq!(p.memory_max, None);
-        let (prog, args) = Sandbox { enabled: false, share_net: false, policy: p }
+        let (prog, args) = Sandbox { enabled: false, share_net: false, policy: p, tmp: None }
             .wrap(&PathBuf::from("/repo"), &["sh"]);
         assert_eq!((prog.as_str(), args), ("env", vec!["RUST_TEST_THREADS=8".to_string(), "sh".into()]));
         assert_eq!(set(&[("CORRODE_COMMAND_MEMORY_MAX", "24G")]).memory_max.as_deref(), Some("24G"));
@@ -372,7 +431,7 @@ mod tests {
 
     #[test]
     fn enabled_binds_repo_and_appends_argv_after_dashdash() {
-        let sb = Sandbox { enabled: true, share_net: false, policy: SpawnPolicy::default() };
+        let sb = Sandbox { enabled: true, share_net: false, policy: SpawnPolicy::default(), tmp: None };
         let (prog, args) = sb.wrap(&PathBuf::from("/home/u/proj"), &["sh", "-c", "ls"]);
         assert_eq!(prog, "bwrap");
         // repo bound read-write, its .corrode re-bound read-only, no net.
@@ -439,13 +498,35 @@ mod tests {
 
     #[test]
     fn net_flag_opts_in() {
-        let sb = Sandbox { enabled: true, share_net: true, policy: SpawnPolicy::default() };
+        let sb = Sandbox { enabled: true, share_net: true, policy: SpawnPolicy::default(), tmp: None };
         let (_, args) = sb.wrap(&PathBuf::from("/r"), &["/bin/bash", "-i"]);
         assert!(args.join(" ").contains("--share-net"));
     }
 
     // For real, where bwrap can run: inside the sandbox git can read the repo but
     // cannot write its config (a hooksPath would run at the human's next `git status`).
+    #[test]
+    fn a_turns_commands_share_its_tmp() {
+        let plan = format!("proj/plan-test-{}", std::process::id());
+        let dir = turn_tmp(&plan);
+        let base = Sandbox { enabled: true, share_net: false, policy: SpawnPolicy::default(), tmp: None };
+        let run = |sb: &Sandbox, script: &str| {
+            let (prog, args) = sb.wrap(&std::env::current_dir().unwrap(), &["sh", "-c", script]);
+            std::process::Command::new(prog).args(args).output()
+        };
+        if !run(&base, "true").is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: bwrap cannot run here");
+            return;
+        }
+        let turn = base.clone().with_tmp(dir.clone());
+        assert!(run(&turn, "echo kept > /tmp/note").unwrap().status.success());
+        let out = run(&turn, "cat /tmp/note").unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "kept");
+        // Without a turn directory each command still starts from an empty /tmp.
+        assert!(!run(&base, "cat /tmp/note").unwrap().status.success());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn git_metadata_is_read_only_inside_the_sandbox() {
         let repo = std::env::temp_dir().join(format!("corrode-sbgit-{}", std::process::id()));
@@ -455,7 +536,7 @@ mod tests {
             eprintln!("skipped: no git");
             return;
         }
-        let sb = Sandbox { enabled: true, share_net: false, policy: SpawnPolicy::default() };
+        let sb = Sandbox { enabled: true, share_net: false, policy: SpawnPolicy::default(), tmp: None };
         let run = |script: &str| {
             let (prog, args) = sb.wrap(&repo, &["sh", "-c", script]);
             std::process::Command::new(prog).args(args).output()

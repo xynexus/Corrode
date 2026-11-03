@@ -917,6 +917,17 @@ impl Daemon {
                 };
                 let mut record = journal_record(session, &plan_id, &text, started, status);
                 record["tasks"] = graph.journal_tasks(JOURNAL_OUTPUT_CAP);
+                // "complete" means the scheduler settled, not that the work builds: say
+                // so when the turn's last build/test failed.
+                let failed_check = turn_seen.lock().unwrap().failed_check();
+                if let Some(f) = failed_check {
+                    record["unverified"] = serde_json::json!(f);
+                    let _ = events
+                        .send(AgentEvent::Error {
+                            message: format!("the turn's last build/test failed: {f}"),
+                        })
+                        .await;
+                }
                 let tasks = record["tasks"].as_array().map_or(0, Vec::len);
                 let failed = record["tasks"]
                     .as_array()
@@ -2178,6 +2189,8 @@ impl Drop for TurnEnd {
         }
         let events = self.events.clone();
         tokio::spawn(async move {
+            // The turn's shared /tmp goes with it (absent when nothing ran sandboxed).
+            let _ = tokio::fs::remove_dir_all(crate::sandbox::turn_tmp(&plan_id)).await;
             let _ = events.send(AgentEvent::TurnComplete { plan_id }).await;
         });
     }
@@ -2210,6 +2223,9 @@ struct SeenCalls {
     /// Each file the turn wrote, as it was before the turn's first write to it (`None`:
     /// it did not exist) -- what [`turn_diff`] shows a reviewer. Survives `invalidate`.
     originals: std::collections::BTreeMap<String, Option<String>>,
+    /// The turn's most recent build/test command ([`crate::tools::is_check`]) and the
+    /// first line of its result. Survives `invalidate`.
+    last_check: Option<(String, String)>,
 }
 
 impl SeenCalls {
@@ -2250,6 +2266,21 @@ impl SeenCalls {
     /// `exit 0:` missed the digest's `exit 0 — test run` and every command that changed
     /// files and then failed, and a coder told "unchanged, do not repeat" rewrote a
     /// file from stale text.
+    /// Note a build/test command's result; any other call is ignored.
+    fn note_check(&mut self, call: &crate::toolcall::ToolCall, observation: &str) {
+        if crate::tools::is_check(call) {
+            let first = observation.lines().next().unwrap_or_default().to_string();
+            self.last_check = Some((crate::tools::describe(call), first));
+        }
+    }
+
+    /// The turn's last build/test command and its result, when it did not pass. A turn
+    /// ended `complete` with a failing test: nothing looked at how its last check went.
+    fn failed_check(&self) -> Option<String> {
+        let (cmd, result) = self.last_check.as_ref()?;
+        (!result.starts_with("exit 0")).then(|| format!("{cmd} -> {result}"))
+    }
+
     fn invalidate(&mut self) {
         self.seen.clear();
         self.log.clear();
@@ -2327,6 +2358,15 @@ async fn review_prompt(prompt: String, seen: &std::sync::Mutex<SeenCalls>, vfs: 
          is more than that covers, and end with your verdict.",
         max_tool_steps_for(Role::Review)
     );
+    // A failing build or test is the one thing a review must not miss: it is put
+    // first, ahead of the diff.
+    let budget = match seen.lock().unwrap().failed_check() {
+        Some(f) => format!(
+            "{budget}\n\nThe last build/test command this turn ran FAILED: {f}\nThe work is \
+             not done while it fails. Find the cause and make the fix your NEXT: line."
+        ),
+        None => budget,
+    };
     match turn_diff(seen, vfs).await {
         Some(d) => format!(
             "{prompt}\n\n{budget}\n\nWhat this turn changed so far -- each written file \
@@ -2432,6 +2472,7 @@ async fn gate_and_execute(
             }
         }
         let mut s = seen.lock().unwrap();
+        s.note_check(call, &observation);
         if crate::tools::is_mutating(call) {
             s.invalidate();
             s.record(call, &observation);
@@ -3434,6 +3475,24 @@ async fn emit_followups(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_last_build_or_test_decides_whether_the_turn_is_verified() {
+        let run = |cmd: &str| crate::toolcall::ToolCall {
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": cmd }),
+        };
+        let mut seen = SeenCalls::default();
+        assert_eq!(seen.failed_check(), None, "nothing ran");
+        seen.note_check(&run("cargo test"), "exit 101 — test run\n1 failed");
+        assert!(seen.failed_check().unwrap().contains("exit 101"));
+        // Not a build or test: it does not clear or replace the failure.
+        seen.note_check(&run("grep -r foo src"), "exit 1:\n");
+        seen.invalidate();
+        assert!(seen.failed_check().is_some(), "a later write does not hide it");
+        seen.note_check(&run("cargo test --workspace"), "exit 0 — test run\n");
+        assert_eq!(seen.failed_check(), None, "a later pass clears it");
+    }
+
     #[test]
     fn context_budget_trips_before_the_model_context_is_full() {
         // Default 32768-token context, 4096 reserved: ~85 KB of prompt + turns.
@@ -4937,11 +4996,22 @@ mod tests {
         );
         // A note that is written but unreachable is the failure this asserts against:
         // `record_trace` counting a successful write says nothing about whether the edge
-        // naming it points at a node that exists.
-        assert!(
-            !notes.is_empty(),
-            "notes were written but none is reachable from the plan"
-        );
+        // naming it points at a node that exists. A turn that wrote no note at all is a
+        // different failure (nothing extractable in the steps) with a different fix, so
+        // look the notes up by id, past the lineage, before saying which it is.
+        if notes.is_empty() {
+            let written = (0..64)
+                .filter(|i| {
+                    store.node_label(&format!("note:{plan_id}:task:{i}#0")).ok().flatten().is_some()
+                })
+                .count();
+            assert!(
+                written > 0,
+                "the turn wrote no notes: no task's steps held an extractable claim \
+                 (see the `trace:` lines above)"
+            );
+            panic!("{written} task(s) wrote notes, but none is reachable from plan {plan_id}");
+        }
         for (k, t) in notes.iter().take(6) {
             eprintln!(
                 "  [{k}] {}",
@@ -5085,7 +5155,7 @@ mod tests {
         let executed_mutating = tool_results
             .iter()
             .filter(|(call, obs)| {
-                ["write_file", "run_command", "run_skill_script"]
+                ["write_file", "run_command", "run_skill_script", "run_tests"]
                     .iter()
                     .any(|m| call.starts_with(m))
                     && !obs.starts_with("note: this exact call was already tried")
