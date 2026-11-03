@@ -4867,7 +4867,10 @@ mod tests {
         let mut turn_plan: Option<String> = None;
         tokio::spawn(Arc::clone(&daemon).run(crx, etx));
         ctx.send(AgentCommand::Prompt {
-            text: "Report which functions src/lib.rs defines.".into(),
+            // The TODO is what makes a note: `trace::extract` keeps only finding lines
+            // ("todo", "error", ...), and a bare function list (Qwen3.6-35B-A3B's answer
+            // to the old prompt) has none, so no note was written at all.
+            text: "Report which functions src/lib.rs defines, and quote any TODO in it.".into(),
             priority: Priority::Default,
         })
         .await
@@ -5144,7 +5147,7 @@ mod tests {
 
         // Thinking off: the model deliberates itself out of calling when it is on, and
         // a direct imperative is what the tool loop should be issuing anyway.
-        let (answer, reasoning, _calls) = client
+        let (answer, reasoning, server_calls) = client
             .respond_full(
                 &model,
                 "Read the file src/lib.rs.",
@@ -5162,7 +5165,13 @@ mod tests {
             ParseFormat::MiniCpmXml,
             std::collections::HashMap::new(),
         );
-        let calls = dialect.parse(&answer).expect("parse");
+        // As the native loop does: hipfire's parsed `function_call` items first (Qwen
+        // with jinja_chat leaves the text empty), the dialect only when there are none.
+        let calls = if server_calls.is_empty() {
+            dialect.parse(&answer).expect("parse")
+        } else {
+            server_calls
+        };
         eprintln!("calls: {calls:?}");
         let call = calls.first().expect("the model emitted a tool call");
         assert_eq!(call.name, "read_file");
