@@ -4996,11 +4996,22 @@ mod tests {
         );
         // A note that is written but unreachable is the failure this asserts against:
         // `record_trace` counting a successful write says nothing about whether the edge
-        // naming it points at a node that exists.
-        assert!(
-            !notes.is_empty(),
-            "notes were written but none is reachable from the plan"
-        );
+        // naming it points at a node that exists. A turn that wrote no note at all is a
+        // different failure (nothing extractable in the steps) with a different fix, so
+        // look the notes up by id, past the lineage, before saying which it is.
+        if notes.is_empty() {
+            let written = (0..64)
+                .filter(|i| {
+                    store.node_label(&format!("note:{plan_id}:task:{i}#0")).ok().flatten().is_some()
+                })
+                .count();
+            assert!(
+                written > 0,
+                "the turn wrote no notes: no task's steps held an extractable claim \
+                 (see the `trace:` lines above)"
+            );
+            panic!("{written} task(s) wrote notes, but none is reachable from plan {plan_id}");
+        }
         for (k, t) in notes.iter().take(6) {
             eprintln!(
                 "  [{k}] {}",
