@@ -166,10 +166,18 @@ fn attr_for(v: &FileNodeView, uid: u32, gid: u32) -> FileAttr {
         ctime: t,
         kind: if v.is_dir {
             FileType::Directory
+        } else if v.symlink.is_some() {
+            FileType::Symlink
         } else {
             FileType::RegularFile
         },
-        perm: if v.is_dir || v.executable { 0o755 } else { 0o644 },
+        perm: if v.symlink.is_some() {
+            0o777
+        } else if v.is_dir || v.executable {
+            0o755
+        } else {
+            0o644
+        },
         nlink: if v.is_dir { 2 } else { 1 },
         uid,
         gid,
@@ -189,6 +197,7 @@ fn dir_attr(uid: u32, gid: u32) -> FileAttr {
             mode: None,
             mtime_ns: None,
             executable: false,
+            symlink: None,
         },
         uid,
         gid,
@@ -292,6 +301,20 @@ impl PathFilesystem for CorrodeFs {
                 .insert(fh, WriteBuf { path, data: Vec::new(), dirty: true });
         }
         Ok(ReplyOpen { fh, flags: 0 })
+    }
+
+    async fn readlink(&self, _req: Request, path: &OsStr) -> FuseResult<ReplyData> {
+        let target = self.stat(os_str(path)?).await?.symlink.ok_or_else(|| Errno::from(libc::EINVAL))?;
+        Ok(ReplyData::from(Bytes::from(target.into_bytes())))
+    }
+
+    async fn symlink(&self, req: Request, parent: &OsStr, name: &OsStr, link_path: &OsStr) -> FuseResult<ReplyEntry> {
+        let path = join(parent, name)?;
+        self.vfs.symlink(&path, os_str(link_path)?).await.map_err(|e| errno(&e))?;
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr: attr_for(&self.stat(&path).await?, req.uid, req.gid),
+        })
     }
 
     async fn create(

@@ -102,6 +102,9 @@ pub struct FileNodeView {
     /// Executable by its owner (`100755` in git): a script a shell runs by path.
     #[serde(default)]
     pub executable: bool,
+    /// A symbolic link, and where it points (`120000` in git). `None`: not a link.
+    #[serde(default)]
+    pub symlink: Option<String>,
 }
 
 /// One Prompt turn of the session (a row of `TurnList`): running, or finished and
