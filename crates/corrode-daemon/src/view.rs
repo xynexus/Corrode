@@ -2,10 +2,11 @@
 //! the turn made, kept apart from the working tree and from every other view
 //! (docs/vfs-branches-and-builds.md §8).
 //!
-//! Unchanged files are read from git's object store and report the base commit's time,
-//! so the same file shows the same mtime in every view at that base (build reuse needs
-//! that). A changed file reports when it was written, so a build after the write sees
-//! it as newer. At the end of a turn [`ViewVfs::commit`] stores the changes as git
+//! Unchanged files are read from git's object store and report one fixed old time
+//! ([`STABLE_MTIME_NS`]), the same in every view whatever its base; a changed file
+//! reports when it was written, so a build after the write sees it as newer; and a file
+//! marked dirty ([`ViewVfs::mark_dirty`]) reports when the view opened -- what lets a
+//! turn reuse a previous turn's build (see `TurnView`). At the end of a turn [`ViewVfs::commit`] stores the changes as git
 //! objects and points `refs/corrode/<name>` at a commit on top of the base: project
 //! history only changes when someone promotes that commit.
 
@@ -41,10 +42,20 @@ enum Change {
     Gone,
 }
 
+/// What every unchanged file in a view reports as its mtime: 2000-01-01. Fixed, not the
+/// base commit's time, so a build carried from a view at one base to a view at another
+/// does not see every file as new; a file that may differ from what that build compiled
+/// is marked dirty instead.
+const STABLE_MTIME_NS: u64 = 946_684_800 * 1_000_000_000;
+
 pub struct ViewVfs {
     root: PathBuf,
     base: String,
     base_mtime_ns: u64,
+    /// When the view opened: the mtime of a dirty base file.
+    opened_ns: u64,
+    /// Base files whose content may differ from what a carried-over build compiled.
+    dirty: Mutex<BTreeSet<String>>,
     tree: HashMap<String, BaseEntry>,
     /// Base directory -> the names directly in it.
     children: HashMap<String, BTreeSet<String>>,
@@ -174,7 +185,6 @@ impl ViewVfs {
         let root = root.into();
         let spec = format!("{rev}^{{commit}}");
         let base = String::from_utf8(git(&root, &["rev-parse", "--verify", &spec])?)?.trim().to_string();
-        let secs: u64 = String::from_utf8(git(&root, &["show", "-s", "--format=%ct", &base])?)?.trim().parse()?;
         let mut tree = HashMap::new();
         let mut children: HashMap<String, BTreeSet<String>> = HashMap::new();
         children.entry(String::new()).or_default();
@@ -232,12 +242,26 @@ impl ViewVfs {
         Ok(Self {
             root,
             base,
-            base_mtime_ns: secs * 1_000_000_000,
+            base_mtime_ns: STABLE_MTIME_NS,
+            opened_ns: now_ns(),
+            dirty: Mutex::new(BTreeSet::new()),
             tree,
             children,
             changes: Mutex::new(BTreeMap::new()),
             git_link: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Report these base files as modified when the view opened: their content may differ
+    /// from what a build carried over from another view compiled.
+    pub fn mark_dirty(&self, paths: impl IntoIterator<Item = String>) {
+        self.dirty.lock().unwrap().extend(paths);
+    }
+
+    /// Every path the view changed -- written, created, moved, removed -- for the next
+    /// view that takes over this one's build.
+    pub fn changed_paths(&self) -> Vec<String> {
+        self.changes.lock().unwrap().keys().cloned().collect()
     }
 
     /// Serve `link` as the view's root `.git` file.
@@ -279,9 +303,12 @@ impl ViewVfs {
             }
             Some(Change::Dir { mtime_ns }) => Some(node(true, 0, *mtime_ns, false)),
             Some(Change::Link { target, mtime_ns }) => Some(link(target, *mtime_ns)),
-            None => self.tree.get(path).map(|e| match &e.link {
-                Some(t) => link(t, self.base_mtime_ns),
-                None => node(e.dir, e.size, self.base_mtime_ns, e.executable),
+            None => self.tree.get(path).map(|e| {
+                let t = if self.dirty.lock().unwrap().contains(path) { self.opened_ns } else { self.base_mtime_ns };
+                match &e.link {
+                    Some(l) => link(l, t),
+                    None => node(e.dir, e.size, t, e.executable),
+                }
             }),
         }
     }
@@ -531,6 +558,8 @@ pub struct TurnView {
     admin: PathBuf,
     /// Git config the sandbox sets for commands in the view (see [`git_overrides`]).
     pub git_env: Vec<(String, String)>,
+    /// The repository's warm target dir, which `finish` hands this one's build to.
+    warm: PathBuf,
     name: String,
     mount: fuse3::raw::MountHandle,
 }
@@ -544,12 +573,13 @@ impl TurnView {
         let mountpoint = crate::sandbox::runtime_dir("corrode-views").join(&name);
         crate::sandbox::private_dir(&mountpoint)?;
         // Build output is gigabytes: on disk, not under the (RAM-backed) runtime dir.
-        let target = crate::sandbox::home()
+        let targets = crate::sandbox::home()
             .map(|h| h.join(".cache"))
             .unwrap_or_else(std::env::temp_dir)
-            .join("corrode/targets")
-            .join(&name);
-        std::fs::create_dir_all(&target)?;
+            .join("corrode/targets");
+        let target = targets.join(&name);
+        let warm = targets.join(format!("warm-{}", crate::sandbox::safe_name(&std::fs::canonicalize(repo)?.to_string_lossy())));
+        tokio::task::block_in_place(|| take_warm(repo, &vfs, &warm, &target))?;
         let (git_dir, admin) = tokio::task::block_in_place(|| link_worktree(repo, &vfs, &name))?;
         let git_env = tokio::task::block_in_place(|| git_overrides(repo, &vfs.base));
         let record = ViewRecord {
@@ -567,7 +597,7 @@ impl TurnView {
                 return Err(e);
             }
         };
-        Ok(Self { vfs, mountpoint, target, git_dir, admin, git_env, name, mount })
+        Ok(Self { vfs, mountpoint, target, git_dir, admin, git_env, warm, name, mount })
     }
 
     /// Commit the view to `refs/corrode/<plan>` (`None`: nothing changed), unmount it
@@ -577,15 +607,84 @@ impl TurnView {
         if let Err(e) = self.mount.unmount().await {
             eprintln!("view: unmounting {}: {e}", self.mountpoint.display());
         }
-        let (mountpoint, target, admin) = (self.mountpoint, self.target, self.admin);
+        let (mountpoint, target, admin, warm) = (self.mountpoint, self.target, self.admin, self.warm);
         let record = record_path(&self.name);
+        let manifest = WarmManifest { base: self.vfs.base.clone(), changed: self.vfs.changed_paths() };
         tokio::task::spawn_blocking(move || {
             let _ = std::fs::remove_dir(&mountpoint);
-            let _ = std::fs::remove_dir_all(&target);
+            hand_over_warm(&target, &warm, &manifest);
             let _ = std::fs::remove_dir_all(&admin);
             let _ = std::fs::remove_file(&record);
         });
         Ok(committed?.map(|c| format!("refs/corrode/{} {c}", self.name)))
+    }
+}
+
+/// What a warm target dir was built from: the view's base and every path the view
+/// changed. Stored inside the target dir (`.corrode-warm.json`), so the dir and its
+/// manifest move together in one rename and two turns racing cannot pair one's dir with
+/// the other's manifest.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WarmManifest {
+    base: String,
+    changed: Vec<String>,
+}
+
+const WARM_MANIFEST: &str = ".corrode-warm.json";
+
+/// Start the turn's target dir from the repository's warm one when there is one.
+///
+/// A turn used to start every build cold -- a minute of CAE before its first test --
+/// and a shared target dir is not the fix: cargo judges a path dependency fresh by mtime
+/// alone, so two views building into one would each get the other's artifacts. Instead
+/// the last finished turn's target dir is kept (`finish`), and the next turn takes it
+/// over whole, by rename, so no two turns ever share one. What makes it correct is the
+/// view's mtimes: an unchanged file reports one fixed old time, and every file that may
+/// differ from what that build compiled -- what the previous turn changed, and what
+/// differs between its base and this one -- is marked dirty, reporting the time this
+/// view opened, which is newer than anything in the carried build. Cargo rebuilds
+/// exactly those. A manifest that cannot be read, or a base git no longer has, means a
+/// cold start. The sandbox shows the dir at one fixed path (`SANDBOX_TARGET`), so the
+/// absolute paths cargo records stay valid after the dir moves.
+#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+fn take_warm(repo: &std::path::Path, vfs: &ViewVfs, warm: &std::path::Path, target: &std::path::Path) -> anyhow::Result<()> {
+    if std::fs::rename(warm, target).is_ok() {
+        let dirty = std::fs::read(target.join(WARM_MANIFEST))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<WarmManifest>(&b).ok())
+            .and_then(|m| {
+                let diff = git(repo, &["diff", "--name-only", "-z", &m.base, &vfs.base]).ok()?;
+                let between = String::from_utf8_lossy(&diff).split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect::<Vec<_>>();
+                Some(m.changed.into_iter().chain(between).collect::<Vec<_>>())
+            });
+        match dirty {
+            Some(paths) => {
+                eprintln!("view: carrying a warm build ({} file(s) to rebuild from)", paths.len());
+                vfs.mark_dirty(paths);
+            }
+            None => {
+                let _ = std::fs::remove_dir_all(target);
+            }
+        }
+    }
+    std::fs::create_dir_all(target)?;
+    Ok(())
+}
+
+/// Keep `target` as the repository's warm build for the next turn, replacing the one
+/// there; if another turn's lands first, this one is dropped.
+#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+fn hand_over_warm(target: &std::path::Path, warm: &std::path::Path, manifest: &WarmManifest) {
+    let kept = serde_json::to_vec(manifest)
+        .ok()
+        .and_then(|b| std::fs::write(target.join(WARM_MANIFEST), b).ok())
+        .is_some()
+        && {
+            let _ = std::fs::remove_dir_all(warm);
+            std::fs::rename(target, warm).is_ok()
+        };
+    if !kept {
+        let _ = std::fs::remove_dir_all(target);
     }
 }
 
@@ -931,7 +1030,7 @@ pub(crate) mod tests {
         let names = |v: Vec<FileNodeView>| v.into_iter().map(|e| e.path).collect::<Vec<_>>();
         assert_eq!(names(a.list("").await.unwrap()), ["README.md", "run.sh", "src"]);
 
-        // An unchanged file reports the base commit's time, the same in every view.
+        // An unchanged file reports one fixed time, the same in every view.
         let before = a.stat("src/lib.rs").await.unwrap().mtime_ns;
         assert_eq!(before, b.stat("src/lib.rs").await.unwrap().mtime_ns);
         a.write("src/lib.rs", b"pub fn g() {}\n").await.unwrap();
@@ -1041,7 +1140,7 @@ pub(crate) mod tests {
             Err(e) => return eprintln!("skipped: cannot mount a view here ({e})"),
         };
         view.vfs.write("src/lib.rs", b"pub fn g() {}\n").await.unwrap();
-        let sb = crate::sandbox::Sandbox::from_env().with_view(crate::sandbox::ViewMount {
+        let sb = crate::sandbox::Sandbox::confined().with_view(crate::sandbox::ViewMount {
             mountpoint: view.mountpoint.clone(),
             target: view.target.clone(),
             git_dir: view.git_dir.clone(),
@@ -1052,9 +1151,13 @@ pub(crate) mod tests {
             let (prog, args) = sb.wrap(&std::fs::canonicalize(&dir).unwrap(), &["sh", "-c", script]);
             std::process::Command::new(prog).args(args).output().unwrap()
         };
-        if !sb.enabled() || !run("true").status.success() {
+        let probe = run("true");
+        if !probe.status.success() {
+            let warm = view.warm.clone();
             view.finish("skip").await.ok();
-            return eprintln!("skipped: bwrap cannot run here");
+            wait_for(&warm).await;
+            std::fs::remove_dir_all(&warm).ok();
+            return eprintln!("skipped: bwrap cannot run here ({})", String::from_utf8_lossy(&probe.stderr).trim());
         }
         // The kernel follows a link through the mount; a submodule is the host checkout.
         let through = run("cat link.md sub/inner.txt");
@@ -1067,11 +1170,97 @@ pub(crate) mod tests {
         // Seen from the host, the view is a locked worktree, gone once the turn ends.
         let list = String::from_utf8(git(&dir, &["worktree", "list", "--porcelain"]).unwrap()).unwrap();
         assert!(list.contains("locked"), "{list}");
+        let warm = view.warm.clone();
         let commit = view.finish("turn").await.unwrap().expect("a commit");
         assert!(commit.starts_with(&format!("refs/corrode/{plan}")), "{commit}");
         let list = String::from_utf8(git(&dir, &["worktree", "list"]).unwrap()).unwrap();
         assert_eq!(list.lines().count(), 1, "{list}");
+        wait_for(&warm).await;
+        std::fs::remove_dir_all(&warm).ok();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A build carried from turn to turn is reused and never stale. Turn 1 changes what
+    /// the program prints and runs it; turn 2, at the same base, takes over turn 1's
+    /// build but sees the base's source -- it must rebuild and print the base's value,
+    /// where an mtime-blind reuse would print turn 1's; turn 3 takes over turn 2's clean
+    /// build and compiles nothing.
+    #[cfg(feature = "fuse")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_warm_build_is_reused_and_never_stale() {
+        let dir = std::env::temp_dir().join(format!("corrode-view-warm-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"warm\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() { println!(\"1\"); }\n").unwrap();
+        for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"]] {
+            git(&dir, args).unwrap();
+        }
+        let repo = std::fs::canonicalize(&dir).unwrap();
+        let turn = |n: u32| {
+            let repo = repo.clone();
+            async move {
+                let view = TurnView::start(&repo, &format!("warm-test-{}-{n}", std::process::id())).await?;
+                let sb = crate::sandbox::Sandbox::confined().with_view(crate::sandbox::ViewMount {
+                    mountpoint: view.mountpoint.clone(),
+                    target: view.target.clone(),
+                    git_dir: view.git_dir.clone(),
+                    submodules: view.vfs.submodules(),
+                    git_env: view.git_env.clone(),
+                });
+                anyhow::Ok((view, sb))
+            }
+        };
+        let run = |sb: &crate::sandbox::Sandbox, script: &str| {
+            let (prog, args) = sb.wrap(&repo, &["sh", "-c", script]);
+            let out = std::process::Command::new(prog).args(args).output().unwrap();
+            (String::from_utf8_lossy(&out.stdout).trim().to_string(), String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+        let (v1, sb) = match turn(1).await {
+            Ok(t) => t,
+            Err(e) => return eprintln!("skipped: cannot mount a view here ({e})"),
+        };
+        let probe = run(&sb, "command -v cargo");
+        if !sb.enabled() || probe.0.is_empty() {
+            let warm = v1.warm.clone();
+            v1.finish("skip").await.ok();
+            wait_for(&warm).await;
+            std::fs::remove_dir_all(&warm).ok();
+            return eprintln!("skipped: no bwrap or cargo here ({})", probe.1.trim());
+        }
+        v1.vfs.write("src/main.rs", b"fn main() { println!(\"2\"); }\n").await.unwrap();
+        assert_eq!(run(&sb, "cargo run -q --offline").0, "2");
+        let warm = v1.warm.clone();
+        v1.finish("turn 1").await.unwrap();
+        wait_for(&warm).await;
+
+        let (v2, sb) = turn(2).await.unwrap();
+        let (out, err) = run(&sb, "cargo run --offline");
+        assert_eq!(out, "1", "turn 2 sees the base's source, not turn 1's build: {err}");
+        assert!(err.contains("Compiling warm"), "{err}");
+        v2.finish("turn 2").await.unwrap();
+        wait_for(&warm).await;
+
+        let (v3, sb) = turn(3).await.unwrap();
+        let (out, err) = run(&sb, "cargo run --offline");
+        assert_eq!(out, "1");
+        assert!(!err.contains("Compiling warm"), "an unchanged view reuses the build: {err}");
+        v3.finish("turn 3").await.unwrap();
+        wait_for(&warm).await;
+        std::fs::remove_dir_all(&warm).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `finish` hands the build over in the background; wait for it to land.
+    #[cfg(feature = "fuse")]
+    async fn wait_for(warm: &std::path::Path) {
+        for _ in 0..200 {
+            if warm.join(WARM_MANIFEST).exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("no warm build at {}", warm.display());
     }
 
     #[test]

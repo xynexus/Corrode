@@ -251,6 +251,11 @@ pub struct ViewMount {
 /// Where a view's sandbox shows the repository's git dir, read-only.
 pub const SANDBOX_GIT: &str = "/corrode/git";
 
+/// Where a view's sandbox shows the turn's target dir, cargo's `CARGO_TARGET_DIR`: one
+/// path whatever host dir backs it, so a build carried from turn to turn keeps the
+/// absolute paths cargo recorded in it.
+pub const SANDBOX_TARGET: &str = "/corrode/target";
+
 /// `id` as one path component: anything but ASCII alphanumerics and `-` becomes `_`.
 pub fn safe_name(id: &str) -> String {
     id.chars()
@@ -304,6 +309,13 @@ impl Sandbox {
         }
         eprintln!("spawn policy: {}", s.policy.describe());
         s
+    }
+
+    /// Confinement on, default policy -- for a test, which must not read
+    /// `CORRODE_SANDBOX` from an env other tests change.
+    #[cfg(test)]
+    pub fn confined() -> Self {
+        Self { enabled: true, share_net: false, policy: SpawnPolicy::default(), tmp: None, view: None }
     }
 
     pub fn disabled() -> Self {
@@ -425,12 +437,12 @@ impl Sandbox {
                 let at = format!("{repo}/{sub}");
                 push(&["--ro-bind-try", &at, &at]);
             }
-            push(&["--bind", &target, &target]);
+            push(&["--bind", &target, SANDBOX_TARGET]);
             push(&["--ro-bind", &git_dir, SANDBOX_GIT]);
             for (k, val) in &v.git_env {
                 push(&["--setenv", k, val]);
             }
-            push(&["--setenv", "CARGO_TARGET_DIR", &target]);
+            push(&["--setenv", "CARGO_TARGET_DIR", SANDBOX_TARGET]);
             push(&["--chdir", &repo]);
             a.extend(toolchain_binds(
                 std::env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| home().map(|h| h.join(".cargo"))),
