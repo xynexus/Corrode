@@ -529,6 +529,8 @@ pub struct TurnView {
     pub git_dir: PathBuf,
     /// The view's linked-worktree admin dir, `<git dir>/worktrees/corrode-<plan>`.
     admin: PathBuf,
+    /// Git config the sandbox sets for commands in the view (see [`filter_overrides`]).
+    pub git_env: Vec<(String, String)>,
     name: String,
     mount: fuse3::raw::MountHandle,
 }
@@ -549,6 +551,7 @@ impl TurnView {
             .join(&name);
         std::fs::create_dir_all(&target)?;
         let (git_dir, admin) = tokio::task::block_in_place(|| link_worktree(repo, &vfs, &name))?;
+        let git_env = tokio::task::block_in_place(|| filter_overrides(repo));
         let mount = match crate::fuse::mount_handle(vfs.clone(), &mountpoint).await {
             Ok(m) => m,
             Err(e) => {
@@ -556,7 +559,7 @@ impl TurnView {
                 return Err(e);
             }
         };
-        Ok(Self { vfs, mountpoint, target, git_dir, admin, name, mount })
+        Ok(Self { vfs, mountpoint, target, git_dir, admin, git_env, name, mount })
     }
 
     /// Commit the view to `refs/corrode/<plan>` (`None`: nothing changed), unmount it
@@ -608,6 +611,41 @@ fn link_worktree(repo: &std::path::Path, vfs: &ViewVfs, name: &str) -> anyhow::R
     Ok((git_dir, admin))
 }
 
+/// `GIT_CONFIG_*` env that turns every configured filter driver (`filter.<name>.*`)
+/// into a pass-through, not required. A view serves blobs exactly as stored -- an LFS
+/// file is its pointer -- so there is nothing for a clean filter to convert, and the
+/// filter could not run against the read-only git dir anyway: in a view of Corrode,
+/// whose `*.safetensors` go through `git-lfs`, `git status` died with "external filter
+/// 'git-lfs filter-process' failed".
+#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+fn filter_overrides(repo: &std::path::Path) -> Vec<(String, String)> {
+    let names = git(repo, &["config", "--name-only", "--get-regexp", r"^filter\."]).unwrap_or_default();
+    let mut drivers: Vec<String> = String::from_utf8_lossy(&names)
+        .lines()
+        .filter_map(|k| k.strip_prefix("filter.")?.rsplit_once('.').map(|(d, _)| d.to_string()))
+        .collect();
+    drivers.sort();
+    drivers.dedup();
+    let pairs: Vec<(String, &str)> = drivers
+        .iter()
+        .flat_map(|d| {
+            ["process", "clean", "smudge"]
+                .into_iter()
+                .map(move |k| (format!("filter.{d}.{k}"), ""))
+                .chain([(format!("filter.{d}.required"), "false")])
+        })
+        .collect();
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let mut env = vec![("GIT_CONFIG_COUNT".to_string(), pairs.len().to_string())];
+    for (i, (k, v)) in pairs.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), k));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), v.to_string()));
+    }
+    env
+}
+
 /// Without the `fuse` feature a view cannot be mounted, so a turn cannot work in one.
 #[cfg(not(feature = "fuse"))]
 pub struct TurnView {
@@ -615,6 +653,7 @@ pub struct TurnView {
     pub mountpoint: PathBuf,
     pub target: PathBuf,
     pub git_dir: PathBuf,
+    pub git_env: Vec<(String, String)>,
 }
 
 #[cfg(not(feature = "fuse"))]
@@ -830,17 +869,24 @@ pub(crate) mod tests {
     /// checkout holds `sub/inner.txt`.
     fn repo_with_links(name: &str) -> PathBuf {
         let dir = repo(name);
+        // A filtered file whose driver cannot run, as git-lfs cannot in a view.
+        std::fs::write(dir.join(".gitattributes"), "*.bin filter=fake\n").unwrap();
+        std::fs::write(dir.join("model.bin"), "pointer\n").unwrap();
+        git(&dir, &["-c", "filter.fake.clean=cat", "add", ".gitattributes", "model.bin"]).unwrap();
         std::os::unix::fs::symlink("README.md", dir.join("link.md")).unwrap();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/inner.txt"), "from the submodule\n").unwrap();
         let head = String::from_utf8(git(&dir, &["rev-parse", "HEAD"]).unwrap()).unwrap();
         let gitlink = format!("160000,{},sub", head.trim());
         for args in [
-            &["add", "link.md"][..],
-            &["update-index", "--add", "--cacheinfo", &gitlink],
-            &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "links"],
+            &["-c", "filter.fake.clean=cat", "add", "link.md"][..],
+            &["-c", "filter.fake.clean=cat", "update-index", "--add", "--cacheinfo", &gitlink],
+            &["-c", "filter.fake.clean=cat", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "links"],
         ] {
             git(&dir, args).unwrap();
+        }
+        for (k, v) in [("filter.fake.process", "false"), ("filter.fake.clean", "false"), ("filter.fake.required", "true")] {
+            git(&dir, &["config", k, v]).unwrap();
         }
         dir
     }
@@ -856,7 +902,7 @@ pub(crate) mod tests {
         assert_eq!(v.submodules(), ["sub"]);
         let refused = v.write("sub/new.txt", b"x").await.unwrap_err();
         assert_eq!(refused.downcast_ref::<std::io::Error>().unwrap().kind(), PermissionDenied);
-        assert_eq!(v.tracked_files().await.unwrap(), ["README.md", "run.sh", "src/lib.rs"], "links and submodules are not the corpus");
+        assert_eq!(v.tracked_files().await.unwrap(), [".gitattributes", "README.md", "model.bin", "run.sh", "src/lib.rs"], "links and submodules are not the corpus");
 
         v.symlink("src/alias.rs", "lib.rs").await.unwrap();
         assert_eq!(v.read("src/alias.rs").await.unwrap(), b"pub fn f() {}\n");
@@ -912,6 +958,7 @@ pub(crate) mod tests {
             target: view.target.clone(),
             git_dir: view.git_dir.clone(),
             submodules: view.vfs.submodules(),
+            git_env: view.git_env.clone(),
         });
         let run = |script: &str| {
             let (prog, args) = sb.wrap(&std::fs::canonicalize(&dir).unwrap(), &["sh", "-c", script]);
@@ -924,7 +971,7 @@ pub(crate) mod tests {
         // The kernel follows a link through the mount; a submodule is the host checkout.
         let through = run("cat link.md sub/inner.txt");
         assert_eq!(String::from_utf8_lossy(&through.stdout), "hello\nfrom the submodule\n", "{}", String::from_utf8_lossy(&through.stderr));
-        let status = run("git status --porcelain --ignore-submodules");
+        let status = run("git status --porcelain");
         assert_eq!(String::from_utf8_lossy(&status.stdout), " M src/lib.rs\n", "{}", String::from_utf8_lossy(&status.stderr));
         let diff = String::from_utf8_lossy(&run("git diff").stdout).into_owned();
         assert!(diff.contains("-pub fn f() {}") && diff.contains("+pub fn g() {}"), "{diff}");

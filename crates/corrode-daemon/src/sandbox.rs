@@ -227,6 +227,8 @@ pub struct ViewMount {
     pub target: PathBuf,
     pub git_dir: PathBuf,
     pub submodules: Vec<String>,
+    /// Env for git inside the view (filter drivers made pass-through).
+    pub git_env: Vec<(String, String)>,
 }
 
 /// Where a view's sandbox shows the repository's git dir, read-only.
@@ -404,6 +406,9 @@ impl Sandbox {
             }
             push(&["--bind", &target, &target]);
             push(&["--ro-bind", &git_dir, SANDBOX_GIT]);
+            for (k, val) in &v.git_env {
+                push(&["--setenv", k, val]);
+            }
             push(&["--setenv", "CARGO_TARGET_DIR", &target]);
             push(&["--chdir", &repo]);
             a.extend(toolchain_binds(

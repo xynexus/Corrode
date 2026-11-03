@@ -630,6 +630,7 @@ impl Daemon {
                         target: v.target.clone(),
                         git_dir: v.git_dir.clone(),
                         submodules: v.vfs.submodules(),
+                        git_env: v.git_env.clone(),
                     }),
                     None => self.sandbox.clone(),
                 };
