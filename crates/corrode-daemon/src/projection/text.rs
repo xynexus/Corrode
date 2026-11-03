@@ -199,6 +199,14 @@ mod tests {
     }
 
     #[test]
+    fn a_python_module_docstring_survives_the_round_trip() {
+        let lang = crate::projection::for_path("pkg/mod.py");
+        let src = "\"\"\"Diagnostics (not part of it).\n\nMore.\n\"\"\"\nimport os  # used\n";
+        let fw = crate::projection::ingest::file(lang.as_ref(), "pkg/mod.py", src).unwrap();
+        assert_eq!(crate::projection::ingest::project(&fw), src, "must stay byte-exact");
+    }
+
+    #[test]
     fn make_fragments_route_to_hash_not_to_c() {
         for name in [
             "Makefile", "Makefile.inc", "Makefile.am", "Makefile.in", "lib/Makefile.inc",
